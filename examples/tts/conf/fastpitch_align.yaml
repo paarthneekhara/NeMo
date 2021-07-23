@@ -13,6 +13,7 @@ model:
   pitch_embedding_kernel_size: 3
   n_window_size: 1024
   n_window_stride: 256
+  fmax : 8000
   pitch_fmin: 80
   pitch_fmax: 640
   pitch_avg: 211.27540199742586
@@ -88,7 +89,7 @@ model:
     dither: 0.0
     features: ${model.n_mel_channels}
     frame_splicing: 1
-    highfreq: null
+    highfreq: ${fmax}
     log: true
     log_zero_guard_type: add
     log_zero_guard_value: 1e-05
