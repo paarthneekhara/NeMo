@@ -17,7 +17,7 @@ import torch.nn as nn
 __all__ = ['Swish']
 
 
-class Swish(nn.SiLU):
+class Swish():
     """
     Swish activation function introduced in 'https://arxiv.org/abs/1710.05941'
     Mathematically identical to SiLU. See note in nn.SiLU for references.

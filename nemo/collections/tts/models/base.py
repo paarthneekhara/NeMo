@@ -160,7 +160,8 @@ class GlowVocoder(Vocoder):
                     x, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window,
                 )
                 self.istft = lambda x, y: istft_patch(
-                    torch.complex(x * torch.cos(y), x * torch.sin(y)),
+                    torch.stack((x * torch.cos(y), x * torch.sin(y)), -1),
+                    # torch.complex(x * torch.cos(y), x * torch.sin(y)),
                     n_fft=n_fft,
                     hop_length=hop_length,
                     win_length=win_length,
