@@ -87,9 +87,9 @@ mel_processor = AudioToMelSpectrogramPreprocessor(
 def main():
     parser = argparse.ArgumentParser(description='Process some integers.')
     parser.add_argument('--data_dir', type=str, default="/home/pneekhara/Datasets/78419/Hi_Fi_TTS_v_0_backup")
-    parser.add_argument('--experiment_base_dir', type=str, default="/home/pneekhara/ExperimentsAutomatedNewPitchStats/")
+    parser.add_argument('--experiment_base_dir', type=str, default="/home/pneekhara/ExperimentsAutomatedNewPitchStats2/")
     parser.add_argument('--num_val', type=int, default=10)
-    parser.add_argument('--out_dir', type=str, default="/home/pneekhara/synthesized_samples/")
+    parser.add_argument('--out_dir', type=str, default="/home/pneekhara/synthesized_samples2/")
     args = parser.parse_args()
 
     cfg = {'linvocoder':  {'_target_': 'nemo.collections.tts.models.two_stages.GriffinLimModel',
@@ -120,7 +120,7 @@ def main():
 
     full_data_ckpts = {
         92 : '/home/pneekhara/Checkpoints/FastPitchSpeaker92Epoch999.ckpt',
-        6097 : '/home/pneekhara/Checkpoints/FastPitch6097Epoch999.ckpt'
+        6097 : '/home/pneekhara/Checkpoints/FastPitch6097Epoch999FixedPitchmin.ckpt'
     }
 
     num_val = args.num_val
