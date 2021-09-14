@@ -76,8 +76,6 @@ class HifiGanModel(Vocoder, Exportable):
             self._cfg.optim, params=itertools.chain(self.msd.parameters(), self.mpd.parameters()),
         )
 
-        sch1_dict = None
-        sch2_dict = None
         if hasattr(self._cfg, 'sched'):
             self.scheduler_g = CosineAnnealing(
                 optimizer=self.optim_g,
