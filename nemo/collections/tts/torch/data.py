@@ -708,7 +708,6 @@ class TTSDataset(Dataset):
         return joined_data
 
 
-
 class MixerTTSXDataset(TTSDataset):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
