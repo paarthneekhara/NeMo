@@ -885,6 +885,7 @@ class SSLVocoderDataset(Dataset):
         self.trim = trim
 
         self.ssl_model = ssl_models.SpeechEncDecSelfSupervisedModel.from_pretrained(model_name='ssl_en_conformer_large').cpu()
+        self.ssl_model.eval()
         with open_dict(self.ssl_model.cfg):
             self.ssl_model.cfg.preprocessor.exact_pad = True
         self.ssl_model.preprocessor = hydra.utils.instantiate(self.ssl_model.cfg.preprocessor)
