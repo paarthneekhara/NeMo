@@ -178,7 +178,10 @@ class HifiGanModel(Vocoder, Exportable):
         speaker_embedding_repeated = speaker_embedding_projected[:, :, None].repeat(
             1, 1, content_embedding_projected.shape[2]
         )
+<<<<<<< HEAD
 
+=======
+>>>>>>> pitch conditioning
         if self.pitch_conditioning and pitch_contour is not None:
             pitch_contour_processed = self.pitch_contour_processor(pitch_contour[:, None, :])
             encoded = torch.cat(
@@ -194,7 +197,11 @@ class HifiGanModel(Vocoder, Exportable):
             audio, audio_len, encoded, encoded_len, pitch_contour = batch
             audio = batch['audio']
             audio_len = batch['audio_len']
+<<<<<<< HEAD
             encoded = batch['content_embedding']
+=======
+            encoded = batch['encoded']
+>>>>>>> pitch conditioning
             encoded_len = batch['encoded_len']
             pitch_contour = batch['pitch_contour']
         elif self.ssl_model_type == "conformer_multitask":
@@ -269,7 +276,11 @@ class HifiGanModel(Vocoder, Exportable):
             audio, audio_len, encoded, encoded_len, pitch_contour = batch
             audio = batch['audio']
             audio_len = batch['audio_len']
+<<<<<<< HEAD
             encoded = batch['content_embedding']
+=======
+            encoded = batch['encoded']
+>>>>>>> pitch conditioning
             encoded_len = batch['encoded_len']
             pitch_contour = batch['pitch_contour']
         elif self.ssl_model_type == "conformer_multitask":
@@ -280,7 +291,11 @@ class HifiGanModel(Vocoder, Exportable):
             speaker_embedding = batch['speaker_embedding']
             pitch_contour = batch['pitch_contour']
             encoded = self.compute_generator_input(content_embedding, speaker_embedding, pitch_contour)
+<<<<<<< HEAD
 
+=======
+        print("pc", pitch_contour)
+>>>>>>> pitch conditioning
         audio_trg_mel, _len_mel = self.trg_melspec_fn(audio, audio_len)
         audio_pred = self(spec=encoded)
 
