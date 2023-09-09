@@ -1,4 +1,7 @@
 name: p_tuning_squad_t5
+checkpoint_path: null
+nemo_path: null # Supply either checkpoint_path or nemo_path, not both
+
 mask_prob: 0.5
 trainer:
   devices: 1

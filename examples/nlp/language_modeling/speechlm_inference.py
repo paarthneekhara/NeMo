@@ -181,10 +181,16 @@ def main(cfg) -> None:
         cfg.model.precision = cfg.trainer.precision
 
     # checkpoint_path = "/datap/misc/DelayPatternExperimentsFinal/LocalRun/Step90k.ckpt"
-    checkpoint_path = "/datap/misc/Checkpoints/DPLinearStep140k.ckpt"
-    model = MegatronT5SpeechLMModel.load_from_checkpoint(
-        checkpoint_path=checkpoint_path, trainer=trainer, cfg=cfg.model
-    )
+    checkpoint_path = cfg.get('checkpoint_path', None)
+    nemo_path = cfg.get('nemo_path', None)
+    if nemo_path is not None:
+        assert checkpoint_path is None, "Please specify either checkpoint_path or nemo_path in the config file"
+        model = MegatronT5SpeechLMModel.restore_from(nemo_path, cfg.model, trainer=trainer, save_restore_connector=NLPSaveRestoreConnector())
+    else:
+        assert checkpoint_path is not None, "Please specify either checkpoint_path or nemo_path in the config file"
+        model = MegatronT5SpeechLMModel.load_from_checkpoint(
+            checkpoint_path=checkpoint_path, trainer=trainer, cfg=cfg.model
+        )
     model.eval()
     model = model.cuda()
     seq_pattern = cfg.model.get('seq_pattern', 'parallel')
