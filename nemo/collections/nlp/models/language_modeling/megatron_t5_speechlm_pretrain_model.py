@@ -329,13 +329,12 @@ class MegatronT5SpeechLMModel(MegatronSpeechLMBaseModel):
             Dataloader produces a global batch which is turned into a list of microbatches.
             The list of microbatches is then piped through the pipeline using megatron-core fwd/bwd functions.
         """
-        # Get seq length of batch
-        batch = next(dataloader_iter)
-        _, _, seq_length = batch['enc_input'].shape
-        _, _, dec_seq_length = batch['dec_input'].shape
-
+        seq_length = self.cfg.data.seq_length
+        dec_seq_length = seq_length
         tensor_shape = [seq_length, get_micro_batch_size(), self.hidden_size]
-        data_iter = get_iterator_k_split(batch, get_num_microbatches())
+        
+        # TODO: Pipeline parallelism is not supported yet (follow GPT implementation for it)
+        data_iter = dataloader_iter
 
         fwd_bwd_function = get_forward_backward_func()
 
@@ -575,8 +574,7 @@ class MegatronT5SpeechLMModel(MegatronSpeechLMBaseModel):
 
     def training_step(self, dataloader_iter, batch_idx):
         self._optimizer.zero_grad()
-        batch = next(dataloader_iter)
-        loss_mean = self.fwd_bwd_step(itertools.chain([batch]), batch_idx, forward_only=False)
+        loss_mean = self.fwd_bwd_step(dataloader_iter, batch_idx, forward_only=False)
         self.allreduce_gradients()
 
         ## logging
