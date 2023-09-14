@@ -838,6 +838,7 @@ def main():
     parser.add_argument('--hparams_file', type=str, default=None, help='Path to hparams file from PTL training')
     parser.add_argument('--tp_conversion_only', action='store_true', help='Only convert TP model to TP model')
     parser.add_argument('--speech_model', action='store_true', help='Speech Model or normal LLM model')
+    parser.add_argument('--tp1_language_model_path', type=str, default=None, help='Path to TP1 Language model for Speech Models')
     parser.add_argument('--model_extracted_dir', type=str, default=None, help='Path to pre-extracted model directory')
 
     args = parser.parse_args()
@@ -1155,6 +1156,8 @@ def main():
 
             # Remove Virtual Parallelism
             model.cfg.virtual_pipeline_model_parallel_size = None
+            if args.tp1_language_model_path is not None:
+                model.cfg.language_model_path = args.tp1_language_model_path
 
         logging.info(f"<<<<<<<< Building TP 1 PP 1 base model >>>>>>>>>")
         model = cls(model.cfg, trainer)  # type: nn.Module
