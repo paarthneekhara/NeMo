@@ -105,6 +105,7 @@ class MegatronT5SpeechLMModel(MegatronSpeechLMBaseModel):
         speech_codebook_size = cfg.data.get('speech_codebook_size', 1024)
         speech_offset = cfg.data.get('speech_offset', 30000)
         speech_head_type = cfg.get('speech_head_type', 'token_level')  # token_level, linear
+        self.log_encodec_audio = cfg.get('log_encodec_audio', False)
 
         self.speech_offset = speech_offset
         self.speech_codebook_size = speech_codebook_size
@@ -161,12 +162,12 @@ class MegatronT5SpeechLMModel(MegatronSpeechLMBaseModel):
                 self.frozen_model.enc_dec_model.decoder_cfg.hidden_size, speech_codebook_size
             )
 
-        encodec_model = EncodecModel.encodec_model_24khz()
-        encodec_model.set_target_bandwidth(6.0)
-        encodec_model.cuda()
-        encodec_model.eval()
-
-        self.additional_models = {'encodec': encodec_model}
+        if self.log_encodec_audio:
+            encodec_model = EncodecModel.encodec_model_24khz()
+            encodec_model.set_target_bandwidth(6.0)
+            encodec_model.cuda()
+            encodec_model.eval()
+            self.additional_models = {'encodec': encodec_model}
 
     def first_stage_of_pipeline(self):
         if self.frozen_model.enc_dec_model.pre_process and parallel_state.get_pipeline_model_parallel_rank() == 0:
@@ -419,7 +420,7 @@ class MegatronT5SpeechLMModel(MegatronSpeechLMBaseModel):
                 with torch.no_grad():
                     with torch.cuda.amp.autocast(enabled=False):
                         # Encodec does not work with fp16, so we disable autocast for logging audio
-                        if speech_mask[0].sum() != 0:
+                        if speech_mask[0].sum() != 0 and self.log_encodec_audio:
                             if self.cfg.seq_pattern in ["delay_parallel", "parallel"]:
                                 enc_input_example = self.convert_tokens_to_range(enc_input[0])
                                 dec_input_example = self.convert_tokens_to_range(dec_input[0], token_type="decoder")
