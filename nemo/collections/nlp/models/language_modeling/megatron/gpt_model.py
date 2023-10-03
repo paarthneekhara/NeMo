@@ -377,7 +377,7 @@ class GPTModel(MegatronModule):
                 self.parallel_output,
                 forward_method_parallel_output,
                 self.fp16_lm_cross_entropy,
-                return_logits=encoder_input is not None,
+                return_logits=True,
                 sequence_parallel=self.sequence_parallel,
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
                 speech_mask=speech_mask,
