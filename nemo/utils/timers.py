@@ -89,7 +89,8 @@ class NamedTimer(object):
         timer_data = self.timers.get(name, {})
 
         if "start" in timer_data:
-            raise RuntimeError(f"Cannot start timer = '{name}' since it is already active")
+            # raise RuntimeError(f"Cannot start timer = '{name}' since it is already active")
+            pass
 
         # synchronize pytorch cuda execution if supported
         if self._sync_cuda and torch.cuda.is_initialized():

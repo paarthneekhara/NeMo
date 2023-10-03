@@ -479,6 +479,7 @@ class GPTDataset(Dataset):
 
         if is_speech:
             loss_mask[labels[0] == -1] = 0.0
+            print("Data idx", idx)
         else:
             loss_mask[labels == -1] = 0.0
         if not is_speech:

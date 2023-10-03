@@ -73,6 +73,7 @@ class BaseMegatronSampler:
         self.drop_last = drop_last
         self.global_batch_size = global_batch_size
         self.pad_samples_to_global_batch_size = pad_samples_to_global_batch_size
+        self.data_parallel_size = data_parallel_size
 
         logging.info(
             f'Instantiating MegatronPretrainingSampler with total_samples: {total_samples} and consumed_samples: {consumed_samples}'

@@ -115,6 +115,7 @@ def post_language_model_processing(
         speech_logits = torch.zeros([*output.shape[:-1], 1024, speech_layers], device=output.device)  # [S, B, H, L]
         for i in range(speech_layers):
             # print(f"{i}: {num_speech_tokens - 1024 * (i + 1)} - {num_speech_tokens - 1024 * (i + 2) or None}")
+            print("i", i, output.shape[2]-(num_speech_tokens - 1024 * (i + 1)),  output.shape[2]-(num_speech_tokens - 1024 * (i + 2) ) )
             speech_logits[:, :, :, i] = output[
                 :, :, -(num_speech_tokens - 1024 * (i + 1)) : -(num_speech_tokens - 1024 * (i + 2)) or None
             ]
@@ -148,10 +149,10 @@ def post_language_model_processing(
                     first_layer_logits = output
                 else:
                     first_layer_logits = output[:, :, : text_size + 1024]
-                # print(f"loss: {first_layer_logits.shape} | {labels[0, :, :].shape}")
+                print(f"loss: {first_layer_logits.shape} | {labels[0, :, :].shape}")
                 loss += vocab_parallel_cross_entropy(first_layer_logits.float(), labels[0, :, :])
                 for i in range(speech_layers):
-                    # print(f"loss {i}: {speech_logits[:, :, :, i].shape} | {labels[i + 1, :, :].shape}")
+                    print(f"loss {i}: {speech_logits[:, :, :, i].shape} | {labels[i + 1, :, :].shape}")
                     loss += (
                         vocab_parallel_cross_entropy(speech_logits[:, :, :, i].float(), labels[i + 1, :, :])
                         * speech_mask.T
@@ -365,7 +366,7 @@ class GPTModel(MegatronModule):
             inference_max_sequence_len=inference_max_sequence_len,
             checkpoint_activations_all_layers=checkpoint_activations_all_layers,
         )
-
+        # import ipdb; ipdb.set_trace()
         if self.post_process:
             return post_language_model_processing(
                 lm_output,
@@ -377,7 +378,7 @@ class GPTModel(MegatronModule):
                 self.parallel_output,
                 forward_method_parallel_output,
                 self.fp16_lm_cross_entropy,
-                return_logits=encoder_input is not None,
+                return_logits=True,
                 sequence_parallel=self.sequence_parallel,
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
                 speech_mask=speech_mask,

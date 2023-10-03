@@ -60,6 +60,7 @@ from nemo.core.classes import Exportable
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
+from encodec import EncodecModel
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -761,6 +762,25 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # TODO @tmoon: Use once available in Megatron-LM
         # return DataIteratorList(iters)
 
+    def convert_tokens_to_range(self, tokens, offset_first_layer=False, offset_all_layers=False):
+        # convert tokens to range [0, 1024]
+        output_tokens = tokens.clone()
+        if offset_first_layer:
+            output_tokens[0] = output_tokens[0] - self.tokenizer.vocab_size
+        
+        output_tokens_new = []
+        for _c in range(output_tokens.shape[0]):
+            si = _c
+            ei = _c + output_tokens.shape[1] - 8
+            if offset_all_layers and _c > 0:
+                output_tokens[_c, si:ei] -= (self.tokenizer.vocab_size + _c*1024)
+            output_tokens_new.append(output_tokens[_c, si:ei])
+        output_tokens_new = torch.stack(output_tokens_new)
+        output_tokens = output_tokens_new
+        output_tokens = torch.clamp(output_tokens, min=0, max=1023)
+
+        return output_tokens
+    
     def get_forward_output_and_loss_func(self, validation_step=False):
         def fwd_output_and_loss_func(dataloader_iter, model, checkpoint_activations_all_layers=None):
 
@@ -781,8 +801,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             if self.get_attention_mask_from_fusion:
                 required_keys.remove('attention_mask')
             batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch.items()}
+            # import ipdb; ipdb.set_trace()
             # Model forward pass
-            output_tensor = model(
+            output_tensor, logits = model(
                 batch['tokens'],
                 batch['position_ids'],
                 batch['attention_mask'],
@@ -790,6 +811,41 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 checkpoint_activations_all_layers=checkpoint_activations_all_layers,
                 speech_mask=batch['speech_mask'],
             )
+
+            # import ipdb; ipdb.set_trace()
+            # logits (T, B, 264192)
+            print("global_step", self.trainer.global_step)
+            print("batch['speech_mask'][0].sum()", batch['speech_mask'][0].sum())
+            print("batch['speech_mask'][1].sum()", batch['speech_mask'][1].sum())
+            if self.trainer.global_step % 10 == 0 and batch['speech_mask'][0].sum() != 0:
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(enabled=False):
+                        all_speech_logits = []
+                        all_speech_token_preds = []
+                        for _i in range(8):
+                            vsi = self.tokenizer.vocab_size + _i*1024
+                            layer_logits = logits[:,:,vsi:vsi+1024]
+                            all_speech_token_preds.append(layer_logits.argmax(dim=-1))
+                            all_speech_logits.append(layer_logits)
+                        all_speech_logits = torch.stack(all_speech_logits, dim=-1) # (T, B, 1024, 8)
+                        all_speech_token_preds = torch.stack(all_speech_token_preds, dim=-1) # (T, B, 8)
+                        speech_token_preds_example = all_speech_token_preds[:,0,:].permute(1,0) # (8, T)
+                        speech_token_preds_example = self.convert_tokens_to_range(speech_token_preds_example)
+
+                        input_tokens_example = batch['tokens'][0]
+                        input_tokens_example = self.convert_tokens_to_range(input_tokens_example, offset_first_layer=True, offset_all_layers=True)
+
+                        labels_example = batch['labels'][0]
+                        labels_example = self.convert_tokens_to_range(labels_example, offset_first_layer=True, offset_all_layers=False)
+
+                        label_wav = self.additional_models['encodec'].decode([[labels_example[None], None]])[0, 0]
+                        dec_input_wav = self.additional_models['encodec'].decode([[input_tokens_example[None], None]])[0, 0]
+                        pred_wav = self.additional_models['encodec'].decode([[speech_token_preds_example[None], None]])[0, 0]
+
+                        self.logger.experiment.add_audio('label_wav', label_wav, self.trainer.global_step, sample_rate=22050)
+                        self.logger.experiment.add_audio('dec_input_wav', dec_input_wav, self.trainer.global_step, sample_rate=22050)
+                        self.logger.experiment.add_audio('pred_wav', pred_wav, self.trainer.global_step, sample_rate=22050)
+
 
             def loss_func(output_tensor):
                 # Loss for a micro-batch (ub)
@@ -916,8 +972,10 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         test_iters = self.trainer.limit_test_batches
 
         train_valid_test_num_samples = [
-            max_train_steps * global_batch_size,
-            eval_iters * global_batch_size,
+            # max_train_steps * global_batch_size,
+            # eval_iters * global_batch_size,
+            1000,
+            20,
             test_iters * global_batch_size,
         ]
 
@@ -1376,6 +1434,13 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
             base_module.speech_residual_model = SimplestModule(hidden_size, 1024)
         elif self.cfg.get('speech_residual_model', None) == 'linear':
             base_module.speech_residual_model = LinearModule(hidden_size, 1024)
+        
+        encodec_model = EncodecModel.encodec_model_24khz()
+        encodec_model.set_target_bandwidth(6.0)
+        encodec_model.cuda()
+        encodec_model.eval()
+
+        self.additional_models = {'encodec': encodec_model}
 
     def model_provider_func(self, pre_process, post_process):
         """Very small override of base model so we can have different embedding and output layer size"""
