@@ -115,7 +115,7 @@ def post_language_model_processing(
         speech_logits = torch.zeros([*output.shape[:-1], 1024, speech_layers], device=output.device)  # [S, B, H, L]
         for i in range(speech_layers):
             # print(f"{i}: {num_speech_tokens - 1024 * (i + 1)} - {num_speech_tokens - 1024 * (i + 2) or None}")
-            print("i", i, output.shape[2]-(num_speech_tokens - 1024 * (i + 1)),  output.shape[2]-(num_speech_tokens - 1024 * (i + 2) ) )
+            # print("i", i, output.shape[2]-(num_speech_tokens - 1024 * (i + 1)),  output.shape[2]-(num_speech_tokens - 1024 * (i + 2) ) )
             speech_logits[:, :, :, i] = output[
                 :, :, -(num_speech_tokens - 1024 * (i + 1)) : -(num_speech_tokens - 1024 * (i + 2)) or None
             ]

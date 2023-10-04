@@ -310,6 +310,7 @@ class GPTDataset(Dataset):
         seed,
         drop_last=True,
     ):
+        # import ipdb; ipdb.set_trace()
         if not HAVE_MEGATRON_CORE:
             raise ImportError(
                 "megatron-core was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
@@ -355,6 +356,8 @@ class GPTDataset(Dataset):
             splits = self.indexed_dataset.sizes[1::2]
 
         # Build index mappings.
+        self.num_samples = num_samples
+
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
             self.name,
             data_prefix,
@@ -377,7 +380,8 @@ class GPTDataset(Dataset):
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
         #    sample i --> [sample_idx[i], sample_idx[i+1])
-        return self.sample_idx.shape[0] - 1
+        # return self.sample_idx.shape[0] - 1
+        return min(self.num_samples, self.sample_idx.shape[0] - 1)
 
     def _get_text(self, idx: int) -> np.ndarray:
         # Get the shuffled index.
@@ -504,6 +508,7 @@ class GPTDataset(Dataset):
             'loss_mask': loss_mask,  # 1d
             'position_ids': position_ids,  # 1d
             "speech_mask": speech_mask,  # 1d
+            "idx": torch.tensor(idx),
         }
 
 

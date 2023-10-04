@@ -842,9 +842,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                         dec_input_wav = self.additional_models['encodec'].decode([[input_tokens_example[None], None]])[0, 0]
                         pred_wav = self.additional_models['encodec'].decode([[speech_token_preds_example[None], None]])[0, 0]
 
-                        self.logger.experiment.add_audio('label_wav', label_wav, self.trainer.global_step, sample_rate=22050)
-                        self.logger.experiment.add_audio('dec_input_wav', dec_input_wav, self.trainer.global_step, sample_rate=22050)
-                        self.logger.experiment.add_audio('pred_wav', pred_wav, self.trainer.global_step, sample_rate=22050)
+                        self.logger.experiment.add_audio('label_wav', label_wav, self.trainer.global_step, sample_rate=24000)
+                        self.logger.experiment.add_audio('dec_input_wav', dec_input_wav, self.trainer.global_step, sample_rate=24000)
+                        self.logger.experiment.add_audio('pred_wav', pred_wav, self.trainer.global_step, sample_rate=24000)
+
+                        data_idx = batch['idx'][0].item()
+                        self.logger.experiment.add_text('Audio idx', "Data idx {}".format(data_idx), self.trainer.global_step)
 
 
             def loss_func(output_tensor):
@@ -932,7 +935,10 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if parallel_state.is_pipeline_last_stage():
             # only the last pipeline parallel stages return loss with their batch size
             if self.cfg.data.get('validation_drop_last', True):
-                averaged_loss = torch.stack(outputs).mean()
+                if len(outputs) > 0:
+                    averaged_loss = torch.stack(outputs).mean()
+                else:
+                    averaged_loss = torch.tensor(0.0, dtype=torch.float32).cuda()
             else:
                 # Compute the avg loss by total_loss across all samples / total number of samples
                 total_loss_and_total_samples = torch.vstack(outputs).sum(axis=0)
@@ -974,7 +980,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         train_valid_test_num_samples = [
             # max_train_steps * global_batch_size,
             # eval_iters * global_batch_size,
-            1000,
+            500,
             20,
             test_iters * global_batch_size,
         ]
@@ -984,7 +990,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 1
             ] = 1  # This is to make sure we only have one epoch on every validation iteration
 
-        self._train_ds, self._validation_ds, self._test_ds = build_train_valid_test_datasets(
+        self._train_ds, self._validation_ds, _ = build_train_valid_test_datasets(
             cfg=self.cfg,
             trainer=self.trainer,
             data_prefix=self.cfg.data.data_prefix,
@@ -996,6 +1002,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             skip_warmup=self.cfg.data.get('skip_warmup', True),
             tokenizer=self.tokenizer,
         )
+        self._test_ds = self._train_ds
         if self._train_ds is not None:
             logging.info(f'Length of train dataset: {len(self._train_ds)}')
         if self._validation_ds is not None:
@@ -1004,6 +1011,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             logging.info(f'Length of test dataset: {len(self._test_ds)}')
         logging.info(f'Finished building GPT datasets.')
 
+        # import ipdb; ipdb.set_trace()
         return self._train_ds, self._validation_ds, self._test_ds
 
     def build_pretraining_data_loader(
@@ -1112,7 +1120,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
     def setup_training_data(self, cfg):
         if hasattr(self, '_train_ds'):
-            consumed_samples = self.compute_consumed_samples(0)
+            # consumed_samples = self.compute_consumed_samples(0)
+            consumed_samples = 0
             logging.info(
                 f'Setting up train dataloader with len(len(self._train_ds)): {len(self._train_ds)} and consumed samples: {consumed_samples}'
             )
@@ -1441,6 +1450,130 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
         encodec_model.eval()
 
         self.additional_models = {'encodec': encodec_model}
+
+    def test_step(self, batch, batch_idx):
+        # import ipdb; ipdb.set_trace()
+        if batch_idx in [1, 2, 3, 4, 5]:
+            with torch.no_grad():
+                required_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'speech_mask', 'idx']
+                batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch.items()}
+                output_tensor, logits = self.model(
+                    batch['tokens'],
+                    batch['position_ids'],
+                    batch['attention_mask'],
+                    batch['labels'],
+                    speech_mask=batch['speech_mask'],
+                )
+                
+                with torch.cuda.amp.autocast(enabled=False):
+                    all_speech_logits = []
+                    all_speech_token_preds = []
+                    for _i in range(8):
+                        vsi = self.tokenizer.vocab_size + _i*1024
+                        layer_logits = logits[:,:,vsi:vsi+1024]
+                        all_speech_token_preds.append(layer_logits.argmax(dim=-1))
+                        all_speech_logits.append(layer_logits)
+                    all_speech_logits = torch.stack(all_speech_logits, dim=-1) # (T, B, 1024, 8)
+                    all_speech_token_preds = torch.stack(all_speech_token_preds, dim=-1) # (T, B, 8)
+                    speech_token_preds_example = all_speech_token_preds[:,0,:].permute(1,0) # (8, T)
+                    speech_token_preds_example = self.convert_tokens_to_range(speech_token_preds_example)
+
+                    input_tokens_example = batch['tokens'][0]
+                    input_tokens_example = self.convert_tokens_to_range(input_tokens_example, offset_first_layer=True, offset_all_layers=True)
+
+                    labels_example = batch['labels'][0]
+                    labels_example = self.convert_tokens_to_range(labels_example, offset_first_layer=True, offset_all_layers=False)
+
+                    label_wav = self.additional_models['encodec'].decode([[labels_example[None], None]])[0, 0]
+                    dec_input_wav = self.additional_models['encodec'].decode([[input_tokens_example[None], None]])[0, 0]
+                    pred_wav = self.additional_models['encodec'].decode([[speech_token_preds_example[None], None]])[0, 0]
+
+                    self.logger.experiment.add_audio('label_wav', label_wav, batch_idx, sample_rate=24000)
+                    self.logger.experiment.add_audio('dec_input_wav', dec_input_wav, batch_idx, sample_rate=24000)
+                    self.logger.experiment.add_audio('pred_wav Teacher Forcing', pred_wav, batch_idx, sample_rate=24000)
+
+                    data_idx = batch['idx'][0].item()
+                    print("data idx", data_idx)
+                    self.logger.experiment.add_text('Audio idx', "Data idx {}".format(data_idx), batch_idx)
+
+
+                prompt_len = 100
+                curr_tokens = batch['tokens'][:,:,:prompt_len] # (B, 8, T)
+                curr_position_ids = batch['position_ids'][:,:prompt_len]
+                curr_attention_mask = batch['attention_mask'][:,:,:prompt_len,:prompt_len]
+                curr_speech_mask = batch['speech_mask'][:,:prompt_len]
+
+                all_preds = []
+                for _t in range(400):
+                    print("_t", _t)
+                    logits, _ = self.model(
+                        curr_tokens,
+                        curr_position_ids,
+                        curr_attention_mask,
+                        speech_mask=curr_speech_mask,
+                    )
+
+                    logits = logits.transpose(0, 1).contiguous()
+
+                    all_speech_logits = []
+                    all_speech_token_preds = []
+                    for _i in range(8):
+                        vsi = self.tokenizer.vocab_size + _i*1024
+                        layer_logits = logits[:,:,vsi:vsi+1024]
+                        all_speech_token_preds.append(layer_logits.argmax(dim=-1))
+                        all_speech_logits.append(layer_logits)
+                    all_speech_logits = torch.stack(all_speech_logits, dim=-1) # (T, B, 1024, 8)
+
+                    output_logits_currtimestep = (
+                        all_speech_logits[-1,:, :, :].permute(0, 2, 1).contiguous().view(-1, 1024)
+                    )  # (B*8, V)
+                    print("output_logits_currtimestep", output_logits_currtimestep.shape)
+                    temperature = self.cfg.get('temperature', 1.2)  # Set temp 0.01 for greedy decoding
+                    output_logits_currtimestep = output_logits_currtimestep / temperature
+                    output_logits_currtimestep = torch.nn.functional.softmax(output_logits_currtimestep, dim=1)
+                    output_tokens_curr_timestep = torch.multinomial(output_logits_currtimestep, num_samples=1)  # (B*8, 1)
+                    # Convert back to (B, 8)
+                    output_tokens_curr_timestep = output_tokens_curr_timestep.view(all_speech_logits.shape[1], 8)
+
+
+                    all_speech_token_preds = torch.stack(all_speech_token_preds, dim=-1) # (T, B, 8)
+                    all_speech_token_preds[-1,:,:] = output_tokens_curr_timestep[:,:] # Update last-timestep
+
+                    all_preds.append(all_speech_token_preds[-1]) # (B, 8)
+                    all_speech_token_preds_processed = all_speech_token_preds.clone() # (T, B, 8)
+                    for _i in range(8):
+                        all_speech_token_preds_processed[:,:,_i] = all_speech_token_preds_processed[:,:,_i] + self.tokenizer.vocab_size + _i*1024
+                    
+                    all_speech_token_preds_processed = all_speech_token_preds_processed.permute(1, 2, 0) # (B, 8, T)
+                    
+                    curr_tokens = torch.cat([curr_tokens, all_speech_token_preds_processed[:,:,-1:]], dim=2)
+                    # curr_tokens = batch['tokens'][:,:,:prompt_len+_t+1]
+                    curr_position_ids = batch['position_ids'][:,:prompt_len+_t+1]
+                    curr_attention_mask = batch['attention_mask'][:,:,:prompt_len+_t+1,:prompt_len+_t+1]
+                    curr_speech_mask = batch['speech_mask'][:,:prompt_len+_t+1]
+                
+                all_preds = torch.stack(all_preds, dim=0) # (T, B, 8)
+                all_preds = all_preds.permute(1, 2, 0) # (B, 8, T)
+                prompt_tokens = batch['tokens'][:,:,:prompt_len] # (B, 8, T)
+                for _i in range(8):
+                    prompt_tokens[:,_i,:] = prompt_tokens[:,_i,:] - self.tokenizer.vocab_size - _i*1024
+                prompt_and_preds = torch.cat([prompt_tokens, all_preds], dim=2) # (B, 8, T)
+                # import ipdb; ipdb.set_trace()
+                prompt_and_preds_example = prompt_and_preds[0] # (8, T)
+                prompt_and_preds_example = self.convert_tokens_to_range(prompt_and_preds_example)
+                prompt_and_preds_wav = self.additional_models['encodec'].decode([[prompt_and_preds_example[None], None]])[0, 0]
+                self.logger.experiment.add_audio('prompt_and_preds_wav', prompt_and_preds_wav, batch_idx, sample_rate=24000)
+
+                prompt_example = prompt_tokens[0] # (8, T)
+                prompt_example = self.convert_tokens_to_range(prompt_example)
+                prompt_wav = self.additional_models['encodec'].decode([[prompt_example[None], None]])[0, 0]
+                self.logger.experiment.add_audio('prompt_wav', prompt_wav, batch_idx, sample_rate=24000)
+
+
+
+
+
+        return torch.tensor(0.0, dtype=torch.float32).cuda()
 
     def model_provider_func(self, pre_process, post_process):
         """Very small override of base model so we can have different embedding and output layer size"""
