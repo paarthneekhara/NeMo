@@ -61,6 +61,9 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
 from encodec import EncodecModel
+from nemo.collections.nlp.modules.common.transformer.text_generation import LengthParam
+from nemo.collections.nlp.modules.common.text_generation_utils import get_default_sampling_params
+
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -1504,6 +1507,23 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 curr_speech_mask = batch['speech_mask'][:,:prompt_len]
 
                 all_preds = []
+                temperature = self.cfg.get('temperature', 1.0)  # Set temp 0.01 for greedy decoding
+
+                prompt_input = batch['tokens'][:,:,:501]
+                lengths = LengthParam(min_length=200, max_length=400)
+                context_length = torch.tensor([prompt_len-1], device=self.device).contiguous()
+                sampling_params = get_default_sampling_params()
+                gen_fn_output = self.generate((prompt_input[:1].contiguous(), context_length), lengths, sampling_params=sampling_params, mode="greedy")
+                gen_fn_preds = torch.tensor(gen_fn_output['token_ids'], device=self.device)
+
+                for _i in range(8):
+                    mask = gen_fn_preds[:,_i,:] != 0.
+                    gen_fn_preds[:,_i,:] -= self.tokenizer.vocab_size + 1024*_i
+                    gen_fn_preds[:,_i,:] *= mask
+                gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
+                gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
+                self.logger.experiment.add_audio('gen_fn_preds_wav', gen_fn_preds_wav, batch_idx, sample_rate=24000)
+
                 for _t in range(400):
                     print("_t", _t)
                     logits, _ = self.model(
@@ -1528,7 +1548,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         all_speech_logits[-1,:, :, :].permute(0, 2, 1).contiguous().view(-1, 1024)
                     )  # (B*8, V)
                     print("output_logits_currtimestep", output_logits_currtimestep.shape)
-                    temperature = self.cfg.get('temperature', 1.2)  # Set temp 0.01 for greedy decoding
+                    
                     output_logits_currtimestep = output_logits_currtimestep / temperature
                     output_logits_currtimestep = torch.nn.functional.softmax(output_logits_currtimestep, dim=1)
                     output_tokens_curr_timestep = torch.multinomial(output_logits_currtimestep, num_samples=1)  # (B*8, 1)
@@ -1568,6 +1588,9 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 prompt_example = self.convert_tokens_to_range(prompt_example)
                 prompt_wav = self.additional_models['encodec'].decode([[prompt_example[None], None]])[0, 0]
                 self.logger.experiment.add_audio('prompt_wav', prompt_wav, batch_idx, sample_rate=24000)
+
+                
+
 
 
 

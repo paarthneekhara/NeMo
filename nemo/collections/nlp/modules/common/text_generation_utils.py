@@ -414,7 +414,7 @@ def synced_generate(
         elif mode in ["greedy", "multinomial"]:
             func = sample_sequence_batch
             if mode == "multinomial":
-                extra["temperature"] = 0.7
+                extra["temperature"] = 1.0
                 extra["greedy"] = False
                 print("Doing multinomial")
             else:
