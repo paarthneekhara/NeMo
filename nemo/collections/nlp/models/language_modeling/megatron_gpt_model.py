@@ -61,6 +61,8 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
 from encodec import EncodecModel
+from nemo.collections.nlp.modules.common.transformer.text_generation import LengthParam
+from nemo.collections.nlp.modules.common.text_generation_utils import get_default_sampling_params
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -1433,6 +1435,140 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
         encodec_model.cuda()
         encodec_model.eval()
         self.additional_models = {'encodec': encodec_model}
+
+    def test_step(self, batch, batch_idx):
+        # A few batches to check the model
+        if batch_idx in [1, 2, 3, 4, 5]:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=False):
+                    required_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'speech_mask']
+                    batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch.items()}
+                    _, logits = self.model(
+                        batch['tokens'],
+                        batch['position_ids'],
+                        batch['attention_mask'],
+                        batch['labels'],
+                        speech_mask=batch['speech_mask'],
+                    )
+                    
+                    all_speech_logits = []
+                    all_speech_token_preds = []
+                    for _i in range(8):
+                        vsi = self.tokenizer.vocab_size + _i*1024
+                        layer_logits = logits[:,:,vsi:vsi+1024]
+                        all_speech_token_preds.append(layer_logits.argmax(dim=-1))
+                        all_speech_logits.append(layer_logits)
+                    all_speech_logits = torch.stack(all_speech_logits, dim=-1) # (T, B, 1024, 8)
+                    all_speech_token_preds = torch.stack(all_speech_token_preds, dim=-1) # (T, B, 8)
+                    speech_token_preds_example = all_speech_token_preds[:,0,:].permute(1,0) # (8, T)
+                    speech_token_preds_example = self.convert_tokens_to_range(speech_token_preds_example)
+
+                    input_tokens_example = batch['tokens'][0]
+                    input_tokens_example = self.convert_tokens_to_range(input_tokens_example, offset_first_layer=True, offset_all_layers=True)
+
+                    labels_example = batch['labels'][0]
+                    labels_example = self.convert_tokens_to_range(labels_example, offset_first_layer=True, offset_all_layers=False)
+
+                    label_wav = self.additional_models['encodec'].decode([[labels_example[None], None]])[0, 0]
+                    dec_input_wav = self.additional_models['encodec'].decode([[input_tokens_example[None], None]])[0, 0]
+                    pred_wav = self.additional_models['encodec'].decode([[speech_token_preds_example[None], None]])[0, 0]
+
+                    self.logger.experiment.add_audio('label_wav', label_wav, batch_idx, sample_rate=24000)
+                    self.logger.experiment.add_audio('dec_input_wav', dec_input_wav, batch_idx, sample_rate=24000)
+                    self.logger.experiment.add_audio('pred_wav Teacher Forcing', pred_wav, batch_idx, sample_rate=24000)
+
+
+                    # Autoregressive Inference From Generate Function
+                    prompt_len = 100
+                    # TODO Remove hardcoding
+                    prompt_input = batch['tokens']
+                    lengths = LengthParam(min_length=200, max_length=400)
+                    context_length = torch.tensor([prompt_len-1], device=self.device).contiguous()
+                    sampling_params = get_default_sampling_params()
+                    # Only doing inference for the first item in the batch
+                    gen_fn_output = self.generate((prompt_input[:1].contiguous(), context_length), lengths, sampling_params=sampling_params, mode="multinomial")
+                    gen_fn_preds = torch.tensor(gen_fn_output['token_ids'], device=self.device)
+
+                    for _i in range(8):
+                        mask = gen_fn_preds[:,_i,:] != 0.
+                        gen_fn_preds[:,_i,:] -= self.tokenizer.vocab_size + 1024*_i
+                        gen_fn_preds[:,_i,:] *= mask
+                    gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
+                    gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
+                    self.logger.experiment.add_audio('gen_fn_preds_wav', gen_fn_preds_wav, batch_idx, sample_rate=24000)
+
+                    # Manual AUtoregressive Inference
+                    curr_tokens = batch['tokens'][:,:,:prompt_len] # (B, 8, T)
+                    curr_position_ids = batch['position_ids'][:,:prompt_len]
+                    curr_attention_mask = batch['attention_mask'][:,:,:prompt_len,:prompt_len]
+                    curr_speech_mask = batch['speech_mask'][:,:prompt_len]
+                    
+                    all_preds = []
+                    temperature = self.cfg.get('temperature', 1.0)  # Set temp 0.01 for greedy decoding
+                    for _t in range(400):
+                        print("Decoding timestep", _t)
+                        logits, _ = self.model(
+                            curr_tokens,
+                            curr_position_ids,
+                            curr_attention_mask,
+                            speech_mask=curr_speech_mask,
+                        )
+
+                        logits = logits.transpose(0, 1).contiguous()
+
+                        all_speech_logits = []
+                        all_speech_token_preds = []
+                        for _i in range(8):
+                            vsi = self.tokenizer.vocab_size + _i*1024
+                            layer_logits = logits[:,:,vsi:vsi+1024]
+                            all_speech_token_preds.append(layer_logits.argmax(dim=-1))
+                            all_speech_logits.append(layer_logits)
+                        all_speech_logits = torch.stack(all_speech_logits, dim=-1) # (T, B, 1024, 8)
+
+                        output_logits_currtimestep = (
+                            all_speech_logits[-1,:, :, :].permute(0, 2, 1).contiguous().view(-1, 1024)
+                        )  # (B*8, V)
+                        output_logits_currtimestep = output_logits_currtimestep / temperature
+                        output_logits_currtimestep = torch.nn.functional.softmax(output_logits_currtimestep, dim=1)
+                        output_tokens_curr_timestep = torch.multinomial(output_logits_currtimestep, num_samples=1)  # (B*8, 1)
+                        # Convert back to (B, 8)
+                        output_tokens_curr_timestep = output_tokens_curr_timestep.view(all_speech_logits.shape[1], 8)
+
+
+                        all_speech_token_preds = torch.stack(all_speech_token_preds, dim=-1) # (T, B, 8)
+                        all_speech_token_preds[-1,:,:] = output_tokens_curr_timestep[:,:] # Update last-timestep
+
+                        all_preds.append(all_speech_token_preds[-1]) # (B, 8)
+                        all_speech_token_preds_processed = all_speech_token_preds.clone() # (T, B, 8)
+                        for _i in range(8):
+                            all_speech_token_preds_processed[:,:,_i] = all_speech_token_preds_processed[:,:,_i] + self.tokenizer.vocab_size + _i*1024
+                        
+                        all_speech_token_preds_processed = all_speech_token_preds_processed.permute(1, 2, 0) # (B, 8, T)
+                        
+                        curr_tokens = torch.cat([curr_tokens, all_speech_token_preds_processed[:,:,-1:]], dim=2)
+                        # curr_tokens = batch['tokens'][:,:,:prompt_len+_t+1]
+                        curr_position_ids = batch['position_ids'][:,:prompt_len+_t+1]
+                        curr_attention_mask = batch['attention_mask'][:,:,:prompt_len+_t+1,:prompt_len+_t+1]
+                        curr_speech_mask = batch['speech_mask'][:,:prompt_len+_t+1]
+                    
+                    all_preds = torch.stack(all_preds, dim=0) # (T, B, 8)
+                    all_preds = all_preds.permute(1, 2, 0) # (B, 8, T)
+                    prompt_tokens = batch['tokens'][:,:,:prompt_len] # (B, 8, T)
+                    for _i in range(8):
+                        prompt_tokens[:,_i,:] = prompt_tokens[:,_i,:] - self.tokenizer.vocab_size - _i*1024
+                    prompt_and_preds = torch.cat([prompt_tokens, all_preds], dim=2) # (B, 8, T)
+                    # import ipdb; ipdb.set_trace()
+                    prompt_and_preds_example = prompt_and_preds[0] # (8, T)
+                    prompt_and_preds_example = self.convert_tokens_to_range(prompt_and_preds_example)
+                    prompt_and_preds_wav = self.additional_models['encodec'].decode([[prompt_and_preds_example[None], None]])[0, 0]
+                    self.logger.experiment.add_audio('prompt_and_preds_wav', prompt_and_preds_wav, batch_idx, sample_rate=24000)
+
+                    prompt_example = prompt_tokens[0] # (8, T)
+                    prompt_example = self.convert_tokens_to_range(prompt_example)
+                    prompt_wav = self.additional_models['encodec'].decode([[prompt_example[None], None]])[0, 0]
+                    self.logger.experiment.add_audio('prompt_wav', prompt_wav, batch_idx, sample_rate=24000)
+        
+        return torch.tensor(0.0, dtype=torch.float32).cuda()
 
     def model_provider_func(self, pre_process, post_process):
         """Very small override of base model so we can have different embedding and output layer size"""
