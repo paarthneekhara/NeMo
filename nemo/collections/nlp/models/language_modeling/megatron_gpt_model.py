@@ -997,7 +997,31 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             for model_module in self.model:
                 model_module.eval()
 
+        dataloader_iter, dataloader_iter_copy = itertools.tee(dataloader_iter, 2)
         loss = self.fwd_bwd_step(dataloader_iter, batch_idx, True)
+
+        dataloader_iter_copy = self._make_data_iterator_list(dataloader_iter_copy)
+        batch = next(dataloader_iter_copy)
+        forward_args = {
+            'input_ids': batch['tokens'].cuda(),
+            'position_ids': batch['position_ids'].cuda(),
+            'attention_mask': batch['attention_mask'].cuda(),
+            'labels': batch['labels'].cuda(),
+            'loss_mask': batch['loss_mask'].cuda(),
+            'speech_mask': batch['speech_mask'].cuda(),
+            'return_logits': True,
+        }
+        
+        if not self.mcore_gpt:
+            forward_args['checkpoint_activations_all_layers'] = checkpoint_activations_all_layers
+            if not self.use_loss_mask:
+                forward_args.pop('loss_mask')
+        else:
+            # TODO: @eharper can we add this to mcore?
+            forward_args.pop('loss_mask')
+        
+        output_tensor, logits = self.model(**forward_args)
+        import ipdb; ipdb.set_trace()
 
         if isinstance(self.model, list):
             for model_module in self.model:
