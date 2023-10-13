@@ -855,6 +855,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 'loss_mask': batch['loss_mask'],
                 'speech_mask': batch['speech_mask'],
                 'return_logits': True,
+                'loss_mask_debug': batch['loss_mask'],
             }
 
             if not self.mcore_gpt:
@@ -866,10 +867,17 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 forward_args.pop('loss_mask')
             output_tensor, logits = model(**forward_args)
 
+            _loss = self.loss_func(batch['loss_mask'], output_tensor)
+            high_loss = False
+            if _loss > 40.0:
+                high_loss = True
+                print("High loss detected")
+                # import ipdb; ipdb.set_trace()
+
             check_interval = 100
             if self.trainer.val_check_interval is not None:
                 check_interval = self.trainer.val_check_interval
-            if self.trainer.global_step % check_interval == 0 and batch['speech_mask'][0].sum() != 0 and (not validation_step):
+            if high_loss or (self.trainer.global_step % check_interval == 0 and batch['speech_mask'][0].sum() != 0 and (not validation_step)):
                 # Logs every if the first item in the batch is speech
                 print("Logging training audio")
                 with torch.no_grad():
@@ -895,7 +903,10 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                                 if input_tokens_example[0, _t] < self.tokenizer.vocab_size:
                                     question_tokens.append(input_tokens_example[0, _t].item())
                             question_text = self.tokenizer.ids_to_text(question_tokens)
-                            self.logger.experiment.add_text('train_question_text', question_text, self.trainer.global_step)
+                            if high_loss:
+                                self.logger.experiment.add_text('high loss train_question_text', question_text, self.trainer.global_step)
+                            else:
+                                self.logger.experiment.add_text('train_question_text', question_text, self.trainer.global_step)
                             
                         input_tokens_example = self.convert_tokens_to_range(input_tokens_example, offset_first_layer=True, offset_all_layers=True, start_of_speech=start_of_speech)
 
@@ -906,9 +917,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                         dec_input_wav = self.additional_models['encodec'].decode([[input_tokens_example[None], None]])[0, 0]
                         pred_wav = self.additional_models['encodec'].decode([[speech_token_preds_example[None], None]])[0, 0]
 
-                        self.logger.experiment.add_audio('train_label_wav', label_wav, self.trainer.global_step, sample_rate=24000)
-                        self.logger.experiment.add_audio('train_dec_input_wav', dec_input_wav, self.trainer.global_step, sample_rate=24000)
-                        self.logger.experiment.add_audio('train_tf_pred_wav', pred_wav, self.trainer.global_step, sample_rate=24000)
+                        if high_loss:
+                            self.logger.experiment.add_audio('high loss train_label_wav', label_wav, self.trainer.global_step, sample_rate=24000)
+                            self.logger.experiment.add_audio('high loss train_dec_input_wav', dec_input_wav, self.trainer.global_step, sample_rate=24000)
+                            self.logger.experiment.add_audio('high loss train_tf_pred_wav', pred_wav, self.trainer.global_step, sample_rate=24000)
+                        else:
+                            self.logger.experiment.add_audio('train_label_wav', label_wav, self.trainer.global_step, sample_rate=24000)
+                            self.logger.experiment.add_audio('train_dec_input_wav', dec_input_wav, self.trainer.global_step, sample_rate=24000)
+                            self.logger.experiment.add_audio('train_tf_pred_wav', pred_wav, self.trainer.global_step, sample_rate=24000)
 
             def loss_func(output_tensor):
                 # Loss for a micro-batch (ub)

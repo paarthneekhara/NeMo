@@ -65,7 +65,8 @@ def post_language_model_processing(
     speech_mask=None,
     speech_residual_model=None,
     speech_loss_scale=1.0,
-    text_size=256000
+    text_size=256000,
+    loss_mask_debug=None
 ):
     if get_key_value:
         lm_output, presents = lm_output
@@ -152,13 +153,31 @@ def post_language_model_processing(
                     first_layer_logits = output[:, :, : text_size + 1024]
                 # print(f"loss: {first_layer_logits.shape} | {labels[0, :, :].shape}")
                 loss += vocab_parallel_cross_entropy(first_layer_logits.float(), labels[0, :, :])
+                if loss_mask_debug is not None:
+                    loss = loss * loss_mask_debug.T
+                print("\nFirst layer loss: ", (loss.sum()/loss_mask_debug.sum()).item(), loss.shape, loss.max().item(), loss.min().item())
+                print("Max loss timestep", loss.shape, loss.argmax(dim=0), loss.sum(dim=1).argmax(dim=0))
+                for _i in range(4):
+                    print("bi", _i, "loss", (loss[:,_i].sum()/loss_mask_debug[_i].sum()).item() )
+                    print("speech mask sum", speech_mask[_i,:].sum(), "loss mask sum", loss_mask_debug[_i].sum())
+
+                print("logits", first_layer_logits.shape, "labels", labels[0, :, :].shape, labels[0, :, :].min().item(), labels[0, :, :].max().item())
                 for i in range(speech_layers):
                     # print(f"loss {i}: {speech_logits[:, :, :, i].shape} | {labels[i + 1, :, :].shape}")
-                    loss += (
+                    curr_layer_loss = (
                         vocab_parallel_cross_entropy(speech_logits[:, :, :, i].float(), labels[i + 1, :, :])
                         * speech_mask.T
                         * speech_loss_scale
                     )
+                    if loss_mask_debug is not None:
+                        curr_layer_loss = curr_layer_loss * loss_mask_debug.T
+                    loss += curr_layer_loss
+                    print("Layer ", i, " loss: ", (curr_layer_loss.sum()/loss_mask_debug.sum()).item(), curr_layer_loss.min().item(), curr_layer_loss.max().item())
+                    print("logits", speech_logits[:, :, :, i].shape, "labels", labels[i + 1, :, :].shape, labels[i + 1, :, :].min().item(), labels[i + 1, :, :].max().item())
+                    print("Curr loss timestep", curr_layer_loss.shape, curr_layer_loss.argmax(dim=0), curr_layer_loss.sum(dim=1).argmax(dim=0))
+
+                    for _i in range(4):
+                        print("bi", _i, "loss", (curr_layer_loss[:,_i].sum()/loss_mask_debug[_i].sum()).item()  ) 
 
         # [s b] -> [b, s]
         loss = loss.transpose(0, 1).contiguous()
@@ -353,6 +372,7 @@ class GPTModel(MegatronModule):
         checkpoint_activations_all_layers=None,
         speech_mask=None,
         return_logits=None,
+        loss_mask_debug=None
     ):
         # input_ids: [b, s]
         # position_ids: [b, s]
@@ -373,6 +393,7 @@ class GPTModel(MegatronModule):
         )
 
         if self.post_process:
+            print("loss mask original", loss_mask)
             if loss_mask is not None:
                 loss_lm_output = lm_output.transpose(0, 1)[loss_mask == 1].unsqueeze(1)
                 loss_labels = labels[loss_mask == 1].unsqueeze(0)
@@ -396,6 +417,7 @@ class GPTModel(MegatronModule):
                 speech_loss_scale=self.speech_loss_scale,
                 text_size=self.text_size,
                 gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                loss_mask_debug=loss_mask_debug
             )
             if loss_mask is not None:
                 if isinstance(post_process_result, tuple):
