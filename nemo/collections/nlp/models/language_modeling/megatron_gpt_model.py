@@ -2004,7 +2004,8 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 all_preds = torch.stack(all_preds).permute(1, 0, 2) # (B, 8, T)
                 all_preds_example = all_preds[0]
                 all_preds_example = self.convert_tokens_to_range(all_preds_example, offset_first_layer=True)
-                all_preds_wav = self.additional_models['encodec'].decode([[all_preds_example[None], None]])[0, 0]
+                with torch.cuda.amp.autocast(enabled=False):
+                    all_preds_wav = self.additional_models['encodec'].decode([[all_preds_example[None], None]])[0, 0]
                 self.logger.experiment.add_audio('Val TF Wav', all_preds_wav, self.trainer.global_step, sample_rate=24000)
 
                 
@@ -2035,9 +2036,10 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         gen_fn_preds[:,_i,:] *= mask
 
                     gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
-                    gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
-                    self.logger.experiment.add_audio('Val {} Wav'.format(gen_type), gen_fn_preds_wav, self.trainer.global_step, sample_rate=24000)
+                    with torch.cuda.amp.autocast(enabled=False):
+                        gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
 
+                    self.logger.experiment.add_audio('Val {} Wav'.format(gen_type), gen_fn_preds_wav, self.trainer.global_step, sample_rate=24000)
 
                 if not self.pretraining:
                     question_tokens = []
