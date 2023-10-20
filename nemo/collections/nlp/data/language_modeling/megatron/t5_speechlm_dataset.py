@@ -211,15 +211,11 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             else:
                 raise NotImplementedError(f"Unknown context type {doc['context_type']}")
 
-            print("Question:", question_in_manifest)
-            print("approx_context_len", approx_context_len)
-
             approx_question_len = len(doc["question"].split(' ')) + 3
 
             if doc["answer_type"] in ["SPEECH", "AUDIOCODEC"]:
                 assert "answer_duration" in doc, f"answer_duration key not in document {doc}"
                 approx_answer_len = doc["answer_duration"] * 76
-                print("approx_answer_len", approx_answer_len)
                 if self.seq_pattern == "delay_parallel":
                     # In delay parallel, there is padding so add 8 frames
                     approx_answer_len = approx_answer_len + 8
