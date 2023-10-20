@@ -184,10 +184,11 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 doc = json.loads(json_line)
 
             question_in_manifest = doc['question']
-
+            
+            # Should not go here for multitask manifests
             if "Text to speech this" in question_in_manifest:
                 tts += 1
-                if self.train_task != 'tts':
+                if self.train_task not in ['tts', 'all']:
                     continue
             elif "Next token prediction" in question_in_manifest:
                 tts += 1
@@ -199,11 +200,26 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             if doc["context_type"] == "SPEECH":
                 assert "context_duration" in doc, f"context_duration key not in document {doc}"
                 approx_context_len = min(doc["context_duration"] * 76 * 0.3, 400)
+            elif "Remove Noise" in question_in_manifest:
+                approx_context_len = doc["answer_duration"] * 76
+            elif "Extract Speaker Audio" in question_in_manifest:
+                approx_context_len = doc["answer_duration"] * 76 + 400 # 400 is the max ref speaker audio
+            elif "Text to speech this" in question_in_manifest:
+                approx_context_len = 400 # Max length of Ref TTS audio
+            elif "Edit Speech" in question_in_manifest:
+                approx_context_len = doc["answer_duration"] * 76
+            else:
+                raise NotImplementedError(f"Unknown context type {doc['context_type']}")
+
+            print("Question:", question_in_manifest)
+            print("approx_context_len", approx_context_len)
+
             approx_question_len = len(doc["question"].split(' ')) + 3
 
-            if doc["answer_type"] == "SPEECH":
+            if doc["answer_type"] in ["SPEECH", "AUDIOCODEC"]:
                 assert "answer_duration" in doc, f"answer_duration key not in document {doc}"
                 approx_answer_len = doc["answer_duration"] * 76
+                print("approx_answer_len", approx_answer_len)
                 if self.seq_pattern == "delay_parallel":
                     # In delay parallel, there is padding so add 8 frames
                     approx_answer_len = approx_answer_len + 8
@@ -258,7 +274,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         # predicted by the decoder.
         start_token_index = 0
         end_token_index = -1
-        if "Text to speech this" in question_in_manifest:
+        if ("Text to speech this" in question_in_manifest) and (doc["context_type"] == "SPEECH"):
             total_context_len = context_tokens[0].size()[1]
             reduced_len = min(
                 400,
@@ -306,9 +322,9 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         context_tokens, context_tokens_len = self.list_to_tensor(context_tokens)
         question_tokens, question_tokens_len = self.list_to_tensor(question_tokens)
 
-        if doc["question_type"] != "SPEECH" and doc["context_type"] == "SPEECH":
+        if doc["question_type"] == "TEXT" and doc["context_type"] != "TEXT":
             question_tokens = pad_text_to_speech_dims(question_tokens, self.tokenizer.pad_id)
-        if doc["context_type"] != "SPEECH" and doc["question_type"] == "SPEECH":
+        if doc["context_type"] == "TEXT" and doc["question_type"] != "TEXT":
             context_tokens = pad_text_to_speech_dims(context_tokens, self.tokenizer.pad_id)
         context_and_question_tokens = torch.cat([context_tokens, question_tokens], dim=1)
 
@@ -357,7 +373,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
 
             dec_input, dec_input_len = self.list_to_tensor(dec_input, True)
             dec_labels, dec_labels_len = self.list_to_tensor(dec_labels, True)
-            is_speech = True if doc["answer_type"] == "SPEECH" else False
+            is_speech = True if doc["answer_type"] != "TEXT" else False
             if is_speech:
                 assert dec_input.dim() == 2 and dec_labels.dim() == 2
                 if self.seq_pattern == "delay_parallel":
@@ -559,6 +575,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         return codec_codes
 
     def _get_tokens(self, doc, field, field_data):
+        rng = random.Random() # Custom random generator (since random uses fixed seeds)
         if f"{field}_type" not in doc.keys():
             field_tokens = self._get_text_tokens(field_data.strip(" "))  # list of ids
         elif doc[f"{field}_type"] == 'TEXT':
@@ -570,6 +587,47 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             field_tokens = self._get_speech_tokens(field_data, dur)  # list of ids
             if not isinstance(field_tokens, list):
                 field_tokens = [field_tokens]
+        elif doc[f"{field}_type"] == 'AUDIOCODEC':
+            reference_codec_paths = field_data.split(";")
+            reference_codec_path = rng.choice(reference_codec_paths)
+            field_tokens = torch.load(reference_codec_path).long()
+            field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
+            field_tokens = [field_tokens]
+            # print("AUDIOCODEC", field_tokens.shape)
+        elif doc[f"{field}_type"] == 'REFSPEAKERCODEC':
+            reference_codec_paths = field_data.split(";")
+            reference_codec_path = rng.choice(reference_codec_paths)
+            field_tokens = torch.load(reference_codec_path).long()
+            field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
+            reference_codec_len = rng.randint(240, 400)
+            field_tokens = [field_tokens[:, :reference_codec_len]]
+
+        elif doc[f"{field}_type"] == 'SEPARATIONCODECS':
+            mixed_codec_path, reference_codec_paths = field_data.split(",")
+            reference_codec_paths = reference_codec_paths.split(";")
+            reference_codec_path = rng.choice(reference_codec_paths)
+            mixed_codec = torch.load(mixed_codec_path).long()
+            mixed_codec[0] = (mixed_codec[0] + self.speech_offset).long()
+            reference_codec = torch.load(reference_codec_path).long()
+            reference_codec[0] = (reference_codec[0] + self.speech_offset).long()
+            reference_codec_len = rng.randint(240, 400)
+            reference_codec = reference_codec[:, :reference_codec_len]
+            mask_tokens = torch.ones(8, 8).type_as(mixed_codec)
+            field_tokens = [torch.cat([mixed_codec, mask_tokens, reference_codec], dim=1)]
+
+        elif doc[f"{field}_type"] == 'EDITINGCODECS':
+            reference_audio_path = field_data
+            reference_codec = torch.load(reference_audio_path).long()
+            assert reference_codec.shape[1] > 80 # ensure reference audio is atleast 1 second
+            reference_codec[0] = (reference_codec[0] + self.speech_offset).long()
+            mask_len = rng.randint(40, 320) # ~0.5 second to 4 seconds
+            mask_len = min(mask_len, reference_codec.shape[1]-80)
+            mask_start = rng.randint(0, reference_codec.shape[1]-mask_len)
+            mask_end = mask_start + mask_len
+            mask = torch.ones(8,8).long()
+            seg1 = reference_codec[:, :mask_start]
+            seg2 = reference_codec[:, mask_end:]
+            field_tokens = [torch.cat([seg1, mask, seg2], dim=1)]
         else:
             raise Exception(f"{field}_type not recognized")
         return field_tokens
@@ -788,7 +846,7 @@ class GPTSpeechLMDataset(T5SpeechLMDataset):
         # predicted by the decoder.
         start_token_index = 0
         end_token_index = -1
-        if "Text to speech this" in question_in_manifest:
+        if ("Text to speech this" in question_in_manifest) and (doc["context_type"] == "SPEECH"):
             total_context_len = context_tokens[0].size()[1]
             reduced_len = min(
                 400,
@@ -840,9 +898,9 @@ class GPTSpeechLMDataset(T5SpeechLMDataset):
         # for l in range(1, context_tokens.shape[0]):
         #     context_tokens[l] += self.speech_offset + 1024 * l  # TODO: fix hardcode
 
-        if doc["question_type"] != "SPEECH" and doc["context_type"] == "SPEECH":
+        if doc["question_type"] == "TEXT" and doc["context_type"] != "TEXT":
             question_tokens = pad_text_to_speech_dims(question_tokens, self.tokenizer.pad_id)
-        if doc["context_type"] != "SPEECH" and doc["question_type"] == "SPEECH":
+        if doc["context_type"] == "TEXT" and doc["question_type"] != "TEXT":
             context_tokens = pad_text_to_speech_dims(context_tokens, self.tokenizer.pad_id)
         context_and_question_tokens = torch.cat([context_tokens, question_tokens], dim=1)
 
@@ -862,10 +920,13 @@ class GPTSpeechLMDataset(T5SpeechLMDataset):
             #     answer_text_ids += self.tokenizer.text_to_ids(T5Sentinel.FIRST.value)
             answer_text_ids = answer_ids
 
+
             if self.add_eos_to_decoder_output:
                 answer_text_ids += [self.tokenizer.eos_id]
             else:
                 answer_text_ids += self.tokenizer.text_to_ids(T5Sentinel.END.value)
+            
+            # import ipdb; ipdb.set_trace()
 
         # Skip example if the final length doesn't fit length requirements even after truncation
         if (
@@ -886,7 +947,7 @@ class GPTSpeechLMDataset(T5SpeechLMDataset):
             input_ids = answer_text_ids
 
             input_ids, input_ids_len = self.list_to_tensor(input_ids, True)
-            is_speech = True if doc["answer_type"] == "SPEECH" else False
+            is_speech = True if doc["answer_type"] != "TEXT" else False
             if is_speech:
                 assert input_ids.dim() == 2
                 if self.seq_pattern == "delay_parallel":
@@ -921,6 +982,14 @@ class GPTSpeechLMDataset(T5SpeechLMDataset):
                 input_ids,
                 input_ids_len,
             )
+        
+        else:
+            print("self._get_element_len(context_and_question_tokens)", self._get_element_len(context_and_question_tokens))
+            print("self._get_element_len(virtual_tokens)", self._get_element_len(virtual_tokens))
+            print("self._get_element_len(answer_text_ids)", self._get_element_len(answer_text_ids))
+            print("self.min_seq_length", self.min_seq_length)
+            print("self.max_seq_length", self.max_seq_length)
+
 
     def collate_fn(self, batch):
         (

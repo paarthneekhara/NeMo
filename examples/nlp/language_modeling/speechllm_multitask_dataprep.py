@@ -344,12 +344,12 @@ def main():
             tts_record = {
                 "audio_filepath" : batch['audio_filepath'][sidx],
                 "text" : batch['text'][sidx],
-                "question" : batch['question'][sidx].replace("Text to speech this", "TTS this"), # Replace text to speech with a new phrase
+                "question" : batch['question'][sidx],
                 "answer" : target_codec_filepath,
                 "context" : tts_contextpath,
                 "question_type" : "TEXT",
                 "answer_type" : "AUDIOCODEC",
-                "context_type" : "AUDIOCODEC",
+                "context_type" : "REFSPEAKERCODEC",
                 "context_duration" : batch['context_duration'][sidx],
                 "answer_duration" : batch['duration'][sidx],
                 "taskname" : "squad",
@@ -386,7 +386,7 @@ def main():
             speechediting_record = {
                 "audio_filepath" : batch['audio_filepath'][sidx],
                 "text" : batch['text'][sidx],
-                "question" : "Edit Speech",
+                "question" : batch['question'][sidx].replace("Text to speech this", "Edit Speech"),
                 "answer" : target_codec_filepath,
                 "context" : target_codec_filepath,
                 "question_type" : "TEXT",

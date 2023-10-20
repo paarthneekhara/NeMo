@@ -869,6 +869,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             check_interval = 100
             if self.trainer.val_check_interval is not None:
                 check_interval = self.trainer.val_check_interval
+            
+            check_interval = max(check_interval, 10)
+            
             if self.trainer.global_step % check_interval == 0 and batch['speech_mask'][0].sum() != 0 and (not validation_step):
                 # Logs every if the first item in the batch is speech
                 print("Logging training audio")
