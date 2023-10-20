@@ -601,33 +601,34 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
             reference_codec_len = rng.randint(240, 400)
             field_tokens = [field_tokens[:, :reference_codec_len]]
-
         elif doc[f"{field}_type"] == 'SEPARATIONCODECS':
             mixed_codec_path, reference_codec_paths = field_data.split(",")
             reference_codec_paths = reference_codec_paths.split(";")
             reference_codec_path = rng.choice(reference_codec_paths)
             mixed_codec = torch.load(mixed_codec_path).long()
-            mixed_codec[0] = (mixed_codec[0] + self.speech_offset).long()
             reference_codec = torch.load(reference_codec_path).long()
-            reference_codec[0] = (reference_codec[0] + self.speech_offset).long()
             reference_codec_len = rng.randint(240, 400)
             reference_codec = reference_codec[:, :reference_codec_len]
-            mask_tokens = torch.ones(8, 8).type_as(mixed_codec)
-            field_tokens = [torch.cat([mixed_codec, mask_tokens, reference_codec], dim=1)]
-
+            # MIXED AUDIO AND REF AUDIO ARE SEPARATED BY 8 TIMESTEPS OF 1023 TOKENS IN ALL CODEBOOKS
+            mask_tokens = (torch.ones(8, 8) * 1023).long()
+            field_tokens = torch.cat([mixed_codec, mask_tokens, reference_codec], dim=1)
+            field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
+            field_tokens = [field_tokens]
         elif doc[f"{field}_type"] == 'EDITINGCODECS':
             reference_audio_path = field_data
             reference_codec = torch.load(reference_audio_path).long()
             assert reference_codec.shape[1] > 80 # ensure reference audio is atleast 1 second
-            reference_codec[0] = (reference_codec[0] + self.speech_offset).long()
             mask_len = rng.randint(40, 320) # ~0.5 second to 4 seconds
             mask_len = min(mask_len, reference_codec.shape[1]-80)
             mask_start = rng.randint(0, reference_codec.shape[1]-mask_len)
             mask_end = mask_start + mask_len
-            mask = torch.ones(8,8).long()
+            mask_tokens = (torch.ones(8, 8) * 1023).long()
             seg1 = reference_codec[:, :mask_start]
             seg2 = reference_codec[:, mask_end:]
-            field_tokens = [torch.cat([seg1, mask, seg2], dim=1)]
+            field_tokens = torch.cat([seg1, mask_tokens, seg2], dim=1)
+            # MISSING AUDIO IS REPLACED WITH 8 TIMESTEPS OF 1023 TOKENS IN ALL CODEBOOKS
+            field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
+            field_tokens = [field_tokens]
         else:
             raise Exception(f"{field}_type not recognized")
         return field_tokens
