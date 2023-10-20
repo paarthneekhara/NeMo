@@ -31,7 +31,7 @@ class AudioDataset(Dataset):
         noise_manifest_path=None,
         min_snr_db=0,
         max_snr_db=5,
-        max_same_speaker_audios=10,
+        max_same_speaker_audios=5,
     ):
         self.data = []
         speakerwise_records = {}
@@ -68,7 +68,7 @@ class AudioDataset(Dataset):
 
         self.white_noise_perturber = WhiteNoisePerturbation()
 
-        self.max_same_speaker_audios = 10
+        self.max_same_speaker_audios = max_same_speaker_audios
 
     def __len__(self):
         return len(self.data)
@@ -409,6 +409,8 @@ def main():
         if bidx == 0:
             save_batch_audios(batch, bidx, temp_dir, encodec_model)
 
+    random.shuffle(manifest_records)
+    
     with open(args.out_manifest_path, "w") as f:
         file_str = ""
         for record in manifest_records:
