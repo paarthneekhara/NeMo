@@ -1747,7 +1747,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
         self.additional_models = {'encodec': encodec_model}
         self.pretraining = True
 
-    def convert_tokens_to_range(self, tokens, offset_first_layer=False, offset_all_layers=False, start_of_speech=0):
+    def convert_tokens_to_range(self, tokens, offset_first_layer=False, offset_all_layers=False, start_of_speech=0, delay_pattern=True):
         # offset tokens to be in range [0, 1024] and convert delay parallel to parallel
         offset = self.cfg.data.get('speech_offset', self.tokenizer.vocab_size)
         output_tokens = tokens.clone()
@@ -1756,8 +1756,13 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
 
         output_tokens_new = []
         for _c in range(output_tokens.shape[0]):
-            si = _c
-            ei = _c + output_tokens.shape[1] - 8
+            if delay_pattern:
+                si = _c
+                ei = _c + output_tokens.shape[1] - 8
+            else:
+                si = 0
+                ei = output_tokens.shape[1]
+
             if offset_all_layers and _c > 0:
                 output_tokens[_c, :] -= (offset + _c*1024)
             if start_of_speech != 0:
@@ -2066,6 +2071,61 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
         
         return loss_total
 
+    def test_step(self, batch, batch_idx):
+        # A few batches to check the model
+        print("test step", batch_idx)
+        if batch_idx in [0,1,2,3]:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=False):
+                    forward_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'loss_mask', 'speech_mask']
+                    for key in forward_keys:
+                        if batch[key] is not None:
+                            batch[key] = batch[key].cuda()
+                    
+                    # Autoregressive Inference From Generate Function
+                    for sidx in range(batch['tokens'].shape[0]):
+                        print("Batch {}, Sample {}".format(batch_idx, sidx))
+                        prompt_len = 100 if self.pretraining else torch.count_nonzero(~batch["loss_mask"][sidx] * batch['tokens'][sidx][0]) + 2
+                        # prompt_len = prompt_len + 8
+                        prompt_tokens = batch['tokens'][sidx:sidx+1]
+                        max_length = prompt_tokens.shape[2] - prompt_len - 1
+                        lengths = LengthParam(min_length=max_length, max_length=max_length)
+                        sampling_params = get_default_sampling_params()
+                        context_length = torch.tensor([prompt_len], device=self.device).contiguous()
+                        gen_fn_output = self.generate((prompt_tokens.contiguous(), context_length), lengths, sampling_params=sampling_params, mode="multinomial")
+                        gen_fn_preds = torch.tensor(gen_fn_output['token_ids'], device=self.device)
+                        gen_fn_preds = gen_fn_preds[:,:,prompt_len:]
+                        for _i in range(8):
+                            mask = gen_fn_preds[:,_i,:] != 0.
+                            gen_fn_preds[:,_i,:] -= self.tokenizer.vocab_size + 1024*_i
+                            gen_fn_preds[:,_i,:] *= mask
+                        gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
+                        gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
+
+                        _step = batch_idx * batch['tokens'].shape[0] + sidx
+                        self.logger.experiment.add_audio('gen_fn_preds_wav', gen_fn_preds_wav, _step, sample_rate=24000)
+
+                        context_question_tokens = batch['tokens'][sidx][:,:prompt_len]
+                        context_question_tokens_encodec = self.convert_tokens_to_range(context_question_tokens, offset_first_layer=True, offset_all_layers=True, delay_pattern=False)
+                        context_question_wav = self.additional_models['encodec'].decode([[context_question_tokens_encodec[None], None]])[0, 0]
+                        self.logger.experiment.add_audio('context_question_wav', context_question_wav, _step, sample_rate=24000)
+
+                        target_tokens = batch['labels'][sidx][:,prompt_len:]
+                        target_tokens_encodec = self.convert_tokens_to_range(target_tokens, offset_first_layer=True, offset_all_layers=False)
+                        target_wav = self.additional_models['encodec'].decode([[target_tokens_encodec[None], None]])[0, 0]
+                        self.logger.experiment.add_audio('target_wav', target_wav, _step, sample_rate=24000)
+
+                        question_tokens = []
+                        for _t in range(prompt_len):
+                            if context_question_tokens[0, _t] < self.tokenizer.vocab_size:
+                                question_tokens.append(context_question_tokens[0, _t].item())
+                        question_text = self.tokenizer.ids_to_text(question_tokens)
+                        self.logger.experiment.add_text('question text', question_text, _step)
+
+                        
+
+        return torch.tensor(0.0, dtype=torch.float32).cuda()
+    
     def on_validation_epoch_end(self):
         if parallel_state.is_pipeline_last_stage():
             # only the last pipeline parallel stages return loss with their batch size
@@ -2145,7 +2205,27 @@ class MegatronSpeechGPTSFTModel(MegatronSpeechGPTModel):
             )
 
     def setup_test_data(self, cfg):
-        pass
+        if self.cfg.data.get('test_ds', None):
+            self._test_ds, self._test_dl = self.build_virtual_prompt_dataset(
+                dataset_paths=self.cfg.data.test_ds,
+                batch_size=self.cfg.get("test_global_batch_size", self.cfg.global_batch_size),
+                for_train=True,
+                drop_last=self.cfg.get("test_drop_last", True),
+                shuffle=False,
+                num_workers=self.cfg.data.num_workers,
+                pin_memory=True,
+            )
+        elif self.cfg.data.get('test_manifest', None):
+            self._test_ds, self._test_dl = self.build_virtual_prompt_tarred_dataset(
+                dataset_paths=self.cfg.data.test_manifest,
+                audio_path=self.cfg.data.test_audio_path,
+                batch_size=self.cfg.get("test_global_batch_size", self.cfg.global_batch_size),
+                for_train=True,
+                drop_last=self.cfg.get("test_drop_last", True),
+                shuffle=0,
+                num_workers=self.cfg.data.num_workers,
+                pin_memory=True,
+            )
 
     def build_virtual_prompt_dataset(
         self, dataset_paths, batch_size, for_train, drop_last, shuffle, num_workers, pin_memory
