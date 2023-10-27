@@ -63,11 +63,15 @@ from nemo.collections.nlp.modules.common.transformer.text_generation import (
 )
 from nemo.collections.nlp.parts import utils_funcs
 from nemo.collections.nlp.parts.utils_funcs import activation_to_func, get_last_rank
+import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.core.classes import Exportable
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
 import numpy as np
+import os
+import soundfile as sf
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -2074,7 +2078,30 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
     def test_step(self, batch, batch_idx):
         # A few batches to check the model
         print("test step", batch_idx)
-        if batch_idx in [0,1,2,3]:
+        if 'asr_model' not in self.additional_models:
+            asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(
+                model_name="stt_en_conformer_transducer_large"
+            )
+            asr_model = asr_model.cuda()
+            asr_model.eval()
+            self.additional_models['asr_model'] = asr_model
+        
+        if 'sv_model' not in self.additional_models:
+            sv_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
+            sv_model = sv_model.cuda()
+            sv_model.eval()
+            self.additional_models['sv_model'] = sv_model
+        
+        _exp_dir_path = self.logger.save_dir
+        _exp_dir_path = _exp_dir_path + '/Sample_Audios'
+        if not os.path.exists(_exp_dir_path):
+            os.mkdir(_exp_dir_path)
+
+        hyp_pred_transcript_list = []
+        gt_transcript_list = []
+        similarity_list = []
+        
+        if batch_idx in [0,1]:
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=False):
                     forward_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'loss_mask', 'speech_mask']
@@ -2122,9 +2149,54 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         question_text = self.tokenizer.ids_to_text(question_tokens)
                         self.logger.experiment.add_text('question text', question_text, _step)
 
-                        
+                        audio_fp_pred = os.path.join(_exp_dir_path, f'predicted_wav_{_step}.wav')
+                        sf.write(audio_fp_pred, gen_fn_preds_wav.cpu().numpy(), 24000)
 
-        return torch.tensor(0.0, dtype=torch.float32).cuda()
+                        audio_fp_gt = os.path.join(_exp_dir_path, f'target_wav_{_step}.wav')
+                        sf.write(audio_fp_gt, target_wav.cpu().numpy(), 24000)
+
+                        spk_embedding_pred = self.additional_models['sv_model'].get_embedding(audio_fp_pred)
+                        spk_embedding_pred = spk_embedding_pred.cpu().detach().numpy().flatten()
+                        spk_embedding_gt = self.additional_models['sv_model'].get_embedding(audio_fp_gt)
+                        spk_embedding_gt = spk_embedding_gt.cpu().detach().numpy().flatten()
+                        similarity = np.dot(spk_embedding_pred, spk_embedding_gt) / (
+                            np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
+                        )
+
+                        similarity_list.append(similarity)
+
+                        pred_transcript = self.additional_models['asr_model'].transcribe([audio_fp_pred])[0][0]
+                        gt_transcript = self.additional_models['asr_model'].transcribe([audio_fp_gt])[0][0]
+
+                        self.logger.experiment.add_text("Inf Predicted Text", pred_transcript, _step)
+                        self.logger.experiment.add_text("Inf GT Text", gt_transcript, _step)
+
+                        hyp_pred_transcript_list.append(pred_transcript)
+                        gt_transcript_list.append(gt_transcript)
+
+        cer_gtaudio = None
+        wer_gtaudio = None
+        similarity = None
+        if len(hyp_pred_transcript_list) > 0:
+            cer_gtaudio = word_error_rate(hyp_pred_transcript_list, gt_transcript_list, use_cer=True)
+            wer_gtaudio = word_error_rate(hyp_pred_transcript_list, gt_transcript_list, use_cer=False)
+            similarity = np.mean(similarity_list)
+            
+        
+        self.test_step_outputs.append({
+            'cer_gtaudio': cer_gtaudio,
+            'wer_gtaudio': wer_gtaudio,
+            'similarity': similarity,
+        })
+    
+    def on_test_epoch_end(self):
+        cers_gtaudio = [x['cer_gtaudio'] for x in self.test_step_outputs if x['cer_gtaudio'] is not None]
+        wers_gtaudio = [x['wer_gtaudio'] for x in self.test_step_outputs if x['wer_gtaudio'] is not None]
+        similarities = [x['similarity'] for x in self.test_step_outputs if x['similarity'] is not None]
+        if len(cers_gtaudio) > 0:
+            self.log('test_cer_gtaudio', np.mean(cers_gtaudio), prog_bar=True, rank_zero_only=True, batch_size=1)
+            self.log('test_wer_gtaudio', np.mean(wers_gtaudio), prog_bar=True, rank_zero_only=True, batch_size=1)
+            self.log('test_similarity', np.mean(similarities), prog_bar=True, rank_zero_only=True, batch_size=1)
     
     def on_validation_epoch_end(self):
         if parallel_state.is_pipeline_last_stage():
