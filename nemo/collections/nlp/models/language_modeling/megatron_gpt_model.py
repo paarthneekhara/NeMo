@@ -2187,79 +2187,106 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
         gt_transcript_list = []
         similarity_list = []
         
-        # Testing it only on 2 batches, remove this if to run on all batches
-        if batch_idx in [0,1]:
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=False):
-                    forward_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'loss_mask', 'speech_mask']
-                    for key in forward_keys:
-                        if batch[key] is not None:
-                            batch[key] = batch[key].cuda()
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=False):
+                forward_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'loss_mask', 'speech_mask']
+                for key in forward_keys:
+                    if batch[key] is not None:
+                        batch[key] = batch[key].cuda()
+                
+                
+                # Prepare context lengths and tokens for inference
+                max_prompt_len = 0
+                context_lengths = []
+                for sidx in range(batch['tokens'].shape[0]):
+                    prompt_len = 100 if self.pretraining else torch.count_nonzero(~batch["loss_mask"][sidx] * batch['tokens'][sidx][0]) + 2
+                    max_prompt_len = max(max_prompt_len, prompt_len)
+                    # Set the rest of tokens to zeros, just to make sure they are not used
+                    # batch['tokens'][sidx][:,prompt_len:] = 0
+                    context_length = torch.tensor(prompt_len, device=self.device).contiguous()
+                    context_lengths.append(context_length)
+                context_lengths = torch.stack(context_lengths)
+                
+                max_length = self.cfg.get("inference_max_length", 1000)
+                # Pad tokens to max length
+                if (max_length + 1 + max_prompt_len) > batch['tokens'].shape[2]:
+                    batch['tokens'] = torch.nn.functional.pad(
+                        batch['tokens'], 
+                        (0, max_length + 1 + max_prompt_len - batch['tokens'].shape[2]), value=0
+                    )
+
+                # Batched inference only working correctly with a batch size 1. 
+                lengths = LengthParam(min_length=max_length, max_length=max_length)
+                sampling_params = get_default_sampling_params()
+                # gen_fn_output = self.generate((batch['tokens'].contiguous(), context_lengths), lengths, sampling_params=sampling_params, mode="multinomial")
+                # gen_fn_predictions_all = torch.tensor(gen_fn_output['token_ids'], device=self.device)
+
+                for sidx in range(batch['tokens'].shape[0]):
+                    print("Batch {}, Sample {}".format(batch_idx, sidx))
+                    prompt_len = context_lengths[sidx].item()
+                    gen_fn_output = self.generate((batch['tokens'][sidx:sidx+1].contiguous(), context_lengths[sidx:sidx+1]), lengths, sampling_params=sampling_params, mode="multinomial")
+                    gen_fn_predictions = torch.tensor(gen_fn_output['token_ids'], device=self.device)
+                    # gen_fn_preds_example = gen_fn_predictions_all[sidx,:,prompt_len:]
+                    gen_fn_preds_example = gen_fn_predictions[0,:,prompt_len:]
                     
-                    # Autoregressive Inference From Generate Function
-                    for sidx in range(batch['tokens'].shape[0]):
-                        print("Batch {}, Sample {}".format(batch_idx, sidx))
-                        prompt_len = 100 if self.pretraining else torch.count_nonzero(~batch["loss_mask"][sidx] * batch['tokens'][sidx][0]) + 2
-                        # prompt_len = prompt_len + 8
-                        prompt_tokens = batch['tokens'][sidx:sidx+1]
-                        max_length = prompt_tokens.shape[2] - prompt_len - 1
-                        lengths = LengthParam(min_length=max_length, max_length=max_length)
-                        sampling_params = get_default_sampling_params()
-                        context_length = torch.tensor([prompt_len], device=self.device).contiguous()
-                        gen_fn_output = self.generate((prompt_tokens.contiguous(), context_length), lengths, sampling_params=sampling_params, mode="multinomial")
-                        gen_fn_preds = torch.tensor(gen_fn_output['token_ids'], device=self.device)
-                        gen_fn_preds = gen_fn_preds[:,:,prompt_len:]
-                        for _i in range(8):
-                            mask = gen_fn_preds[:,_i,:] != 0.
-                            gen_fn_preds[:,_i,:] -= self.tokenizer.vocab_size + 1024*_i
-                            gen_fn_preds[:,_i,:] *= mask
-                        gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
-                        gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
+                    # Slice up to the end token.
+                    for _t in range(gen_fn_preds_example.shape[1]):
+                        if gen_fn_preds_example[0, _t] == self.tokenizer.eos_id:
+                            gen_fn_preds_example = gen_fn_preds_example[:,:_t+8] # +8 for delay pattern?
+                            break
 
-                        _step = batch_idx * batch['tokens'].shape[0] + sidx
-                        self.logger.experiment.add_audio('gen_fn_preds_wav', gen_fn_preds_wav, _step, sample_rate=24000)
+                    for _i in range(8):
+                        mask = gen_fn_preds_example[_i,:] != 0.
+                        gen_fn_preds_example[_i,:] -= self.tokenizer.vocab_size + 1024*_i
+                        gen_fn_preds_example[_i,:] *= mask # to avoid setting 0 values to negative values
 
-                        context_question_tokens = batch['tokens'][sidx][:,:prompt_len]
-                        context_question_tokens_encodec = self.convert_tokens_to_range(context_question_tokens, offset_first_layer=True, offset_all_layers=True, delay_pattern=False)
-                        context_question_wav = self.additional_models['encodec'].decode([[context_question_tokens_encodec[None], None]])[0, 0]
-                        self.logger.experiment.add_audio('context_question_wav', context_question_wav, _step, sample_rate=24000)
+                    gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds_example)
+                    gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
 
-                        target_tokens = batch['labels'][sidx][:,prompt_len:]
-                        target_tokens_encodec = self.convert_tokens_to_range(target_tokens, offset_first_layer=True, offset_all_layers=False)
-                        target_wav = self.additional_models['encodec'].decode([[target_tokens_encodec[None], None]])[0, 0]
-                        self.logger.experiment.add_audio('target_wav', target_wav, _step, sample_rate=24000)
+                    _step = batch_idx * batch['tokens'].shape[0] + sidx
+                    self.logger.experiment.add_audio('gen_fn_preds_wav', gen_fn_preds_wav, _step, sample_rate=24000)
 
-                        question_tokens = []
-                        for _t in range(prompt_len):
-                            if context_question_tokens[0, _t] < self.tokenizer.vocab_size:
-                                question_tokens.append(context_question_tokens[0, _t].item())
-                        question_text = self.tokenizer.ids_to_text(question_tokens)
-                        self.logger.experiment.add_text('question text', question_text, _step)
+                    context_question_tokens = batch['tokens'][sidx][:,:prompt_len]
+                    context_question_tokens_encodec = self.convert_tokens_to_range(context_question_tokens, offset_first_layer=True, offset_all_layers=True, delay_pattern=False)
+                    context_question_wav = self.additional_models['encodec'].decode([[context_question_tokens_encodec[None], None]])[0, 0]
+                    self.logger.experiment.add_audio('context_question_wav', context_question_wav, _step, sample_rate=24000)
 
-                        audio_fp_pred = os.path.join(_exp_dir_path, f'predicted_wav_{_step}.wav')
-                        sf.write(audio_fp_pred, gen_fn_preds_wav.cpu().numpy(), 24000)
+                    target_tokens = batch['labels'][sidx][:,prompt_len:]
+                    target_tokens_encodec = self.convert_tokens_to_range(target_tokens, offset_first_layer=True, offset_all_layers=False)
+                    target_wav = self.additional_models['encodec'].decode([[target_tokens_encodec[None], None]])[0, 0]
+                    self.logger.experiment.add_audio('target_wav', target_wav, _step, sample_rate=24000)
 
-                        audio_fp_gt = os.path.join(_exp_dir_path, f'target_wav_{_step}.wav')
-                        sf.write(audio_fp_gt, target_wav.cpu().numpy(), 24000)
+                    question_tokens = []
+                    for _t in range(prompt_len):
+                        if context_question_tokens[0, _t] < self.tokenizer.vocab_size:
+                            question_tokens.append(context_question_tokens[0, _t].item())
+                    question_text = self.tokenizer.ids_to_text(question_tokens)
+                    self.logger.experiment.add_text('question text', question_text, _step)
 
-                        spk_embedding_pred = self.additional_models['sv_model'].get_embedding(audio_fp_pred)
-                        spk_embedding_pred = spk_embedding_pred.cpu().detach().numpy().flatten()
-                        spk_embedding_gt = self.additional_models['sv_model'].get_embedding(audio_fp_gt)
-                        spk_embedding_gt = spk_embedding_gt.cpu().detach().numpy().flatten()
-                        similarity = np.dot(spk_embedding_pred, spk_embedding_gt) / (
-                            np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
-                        )
+                    audio_fp_pred = os.path.join(_exp_dir_path, f'predicted_wav_{_step}.wav')
+                    sf.write(audio_fp_pred, gen_fn_preds_wav.cpu().numpy(), 24000)
 
-                        similarity_list.append(similarity)
+                    audio_fp_gt = os.path.join(_exp_dir_path, f'target_wav_{_step}.wav')
+                    sf.write(audio_fp_gt, target_wav.cpu().numpy(), 24000)
 
-                        pred_transcript = self.additional_models['asr_model'].transcribe([audio_fp_pred])[0][0]
-                        gt_transcript = self.additional_models['asr_model'].transcribe([audio_fp_gt])[0][0]
+                    spk_embedding_pred = self.additional_models['sv_model'].get_embedding(audio_fp_pred)
+                    spk_embedding_pred = spk_embedding_pred.cpu().detach().numpy().flatten()
+                    spk_embedding_gt = self.additional_models['sv_model'].get_embedding(audio_fp_gt)
+                    spk_embedding_gt = spk_embedding_gt.cpu().detach().numpy().flatten()
+                    similarity = np.dot(spk_embedding_pred, spk_embedding_gt) / (
+                        np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
+                    )
 
-                        self.logger.experiment.add_text("Inf Predicted Text", pred_transcript, _step)
-                        self.logger.experiment.add_text("Inf GT Text", gt_transcript, _step)
+                    similarity_list.append(similarity)
 
-                        hyp_pred_transcript_list.append(pred_transcript)
-                        gt_transcript_list.append(gt_transcript)
+                    pred_transcript = self.additional_models['asr_model'].transcribe([audio_fp_pred])[0][0]
+                    gt_transcript = self.additional_models['asr_model'].transcribe([audio_fp_gt])[0][0]
+
+                    self.logger.experiment.add_text("Inf Predicted Text", pred_transcript, _step)
+                    self.logger.experiment.add_text("Inf GT Text", gt_transcript, _step)
+
+                    hyp_pred_transcript_list.append(pred_transcript)
+                    gt_transcript_list.append(gt_transcript)
 
         cer_gtaudio = None
         wer_gtaudio = None
