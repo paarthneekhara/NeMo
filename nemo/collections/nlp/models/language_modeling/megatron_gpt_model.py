@@ -32,7 +32,7 @@ from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingSampler,
 )
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
-from nemo.collections.nlp.data.language_modeling.megatron.t5_speechlm_dataset import GPTSpeechLMDataset
+from nemo.collections.nlp.data.language_modeling.megatron.t5_speechlm_dataset import GPTSpeechLMDataset, phoneme_tokenizer
 from nemo.collections.nlp.data.language_modeling.megatron.t5_speechlm_tarred_dataset import GPTSpeechLMTarredDataset
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
 from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
@@ -896,14 +896,22 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
                         if not self.pretraining:
                             question_tokens = []
+                            question_phoneme_tokens = []
                             question_start = 0
                             for _t in range(start_of_speech):
                                 if input_tokens_example[0, _t] < self.tokenizer.vocab_size:
                                     question_tokens.append(input_tokens_example[0, _t].item())
+                                elif input_tokens_example[0, _t] >= self.tokenizer.vocab_size and input_tokens_example[0, _t] < self.cfg.text_size:
+                                    question_phoneme_tokens.append(input_tokens_example[0, _t].item() - self.tokenizer.vocab_size)
                                 elif len(question_tokens) == 0:
                                     question_start += 1
-                            question_text = self.tokenizer.ids_to_text(question_tokens)
-                            self.logger.experiment.add_text('train_question_text', question_text, self.trainer.global_step)
+                            
+                            if len(question_tokens) > 0:
+                                question_text = self.tokenizer.ids_to_text(question_tokens)
+                                self.logger.experiment.add_text('train_question_text', question_text, self.trainer.global_step)
+                            if len(question_phoneme_tokens) > 0:
+                                phoneme_text = phoneme_tokenizer.decode(question_phoneme_tokens)
+                                self.logger.experiment.add_text('train_question_phonemetext', phoneme_text, self.trainer.global_step)
 
                         input_tokens_example = self.convert_tokens_to_range(input_tokens_example, offset_first_layer=True, offset_all_layers=True, start_of_speech=start_of_speech)
 
@@ -1738,7 +1746,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         args.pop('module')
 
-    def update_for_speech(self, speech_module="linear"):
+    def update_for_speech(self, speech_module="linear", num_phoneme_tokens=0):
         assert speech_module in ["linear", "conv"]
         from nemo.collections.nlp.modules.common.megatron.utils import scaled_init_method_normal
 
@@ -1753,9 +1761,10 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         one_speech_layer = 1024
         total_speech_tokens = 8*one_speech_layer
         new_embeddings = tensor_parallel.VocabParallelEmbedding(
-            num_embeddings=old_token_size + total_speech_tokens,
+            num_embeddings=old_token_size + num_phoneme_tokens + total_speech_tokens,
             embedding_dim=word_embedding.embedding_dim,
             init_method=_init_method,
+            config=self.model_parallel_config,
         )
         new_weight = new_embeddings.weight.clone()
         new_weight[:old_token_size, :] = word_embedding.weight.clone()
@@ -1767,7 +1776,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         output_layer = base_module.language_model.output_layer
         old_weight = output_layer.weight
         old_token_size = output_layer.weight.shape[0]
-        additional_output_size = total_speech_tokens if speech_module=="linear" else one_speech_layer
+        additional_output_size = total_speech_tokens + num_phoneme_tokens if speech_module=="linear" else one_speech_layer
         new_weight = torch.zeros(
             [old_token_size + additional_output_size, old_weight.shape[1]], dtype=old_weight.dtype, device=old_weight.device
         )
@@ -2082,14 +2091,21 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
 
                 if not self.pretraining:
                     question_tokens = []
+                    question_phoneme_tokens = []
                     question_start = 0
                     for _t in range(start_of_speech):
                         if input_tokens_example[0, _t] < self.tokenizer.vocab_size:
                             question_tokens.append(input_tokens_example[0, _t].item())
+                        elif input_tokens_example[0, _t] >= self.tokenizer.vocab_size and input_tokens_example[0, _t] < self.cfg.text_size:
+                            question_phoneme_tokens.append(input_tokens_example[0, _t].item()-self.tokenizer.vocab_size)
                         elif len(question_tokens) == 0:
                             question_start += 1
-                    question_text = self.tokenizer.ids_to_text(question_tokens)
-                    self.logger.experiment.add_text('Val Prompt Text', question_text, self.trainer.global_step)
+                    if len(question_tokens) > 0:
+                        question_text = self.tokenizer.ids_to_text(question_tokens)
+                        self.logger.experiment.add_text('Val Prompt Text', question_text, self.trainer.global_step)
+                    if len(question_phoneme_tokens) > 0:
+                        phoneme_text = phoneme_tokenizer.decode(question_phoneme_tokens)
+                        self.logger.experiment.add_text('Val Prompt Phoneme Text', phoneme_text, self.trainer.global_step)
 
                 if attention_probs_list is not None:
                     for lidx in range(len(attention_probs_list)):
@@ -2146,7 +2162,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 lengths = LengthParam(min_length=max_length, max_length=max_length)
                 sampling_params = get_default_sampling_params()
                 sampling_params["add_BOS"] = self.cfg.data.get("add_bos", True)
-                sampling_params["vocab_size"] = self.cfg.get("text_size", 256000)
+                # sampling_params["vocab_size"] = self.cfg.get("text_size", 256000)
                 context_length = torch.tensor([prompt_len], device=self.device).contiguous()
 
                 # For custom inference
@@ -2256,7 +2272,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         gen_fn_preds = gen_fn_preds[:,:,prompt_len:]
                         for _i in range(8):
                             mask = gen_fn_preds[:,_i,:] != 0.
-                            gen_fn_preds[:,_i,:] -= self.tokenizer.vocab_size + 1024*_i
+                            gen_fn_preds[:,_i,:] -= self.cfg.get("text_size", self.tokenizer.vocab_size) + 1024*_i
                             gen_fn_preds[:,_i,:] *= mask
                         gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
                         gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
@@ -2275,11 +2291,19 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         self.logger.experiment.add_audio('target_wav', target_wav, _step, sample_rate=24000)
 
                         question_tokens = []
+                        question_phoneme_tokens = []
                         for _t in range(prompt_len):
                             if context_question_tokens[0, _t] < self.tokenizer.vocab_size:
                                 question_tokens.append(context_question_tokens[0, _t].item())
-                        question_text = self.tokenizer.ids_to_text(question_tokens)
-                        self.logger.experiment.add_text('question text', question_text, _step)
+                            elif context_question_tokens[0, _t] >= self.tokenizer.vocab_size and context_question_tokens[0, _t] < self.cfg.text_size:
+                                question_phoneme_tokens.append(context_question_tokens[0, _t].item() - self.tokenizer.vocab_size )
+                        
+                        if len(question_tokens) > 0:
+                            question_text = self.tokenizer.ids_to_text(question_tokens)
+                            self.logger.experiment.add_text('question text', question_text, _step)
+                        if len(question_phoneme_tokens) > 0:
+                            phoneme_text = phoneme_tokenizer.decode(question_phoneme_tokens)
+                            self.logger.experiment.add_text('question phoneme text', phoneme_text, _step)
 
                         audio_fp_pred = os.path.join(_exp_dir_path, f'predicted_wav_{_step}.wav')
                         sf.write(audio_fp_pred, gen_fn_preds_wav.cpu().numpy(), 24000)
