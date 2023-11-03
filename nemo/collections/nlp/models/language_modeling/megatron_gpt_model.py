@@ -2143,6 +2143,9 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                                 attention_sliced_list.append(attention_probs_sliced)
                     question_ids = self.tokenizer.ids_to_tokens(question_tokens)
                     phoneme_seq += question_ids
+                    if len(question_phoneme_tokens) > 0:
+                        phoneme_ids = phoneme_tokenizer.decode(question_phoneme_tokens).split("|")
+                        phoneme_seq += phoneme_ids
                     attention_sliced = torch.stack(attention_sliced_list)
                     attention_sliced = torch.mean(attention_sliced, 0)
                     alignment_image_sliced = plot_alignment_to_numpy(

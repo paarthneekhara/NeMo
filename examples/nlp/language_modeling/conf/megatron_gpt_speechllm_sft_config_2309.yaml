@@ -200,6 +200,7 @@ model:
     pin_memory: true
     speech_offset: ???
     train_task: tts
+    use_attention_prior: False
 
   # Nsys profiling options
   nsys_profile:

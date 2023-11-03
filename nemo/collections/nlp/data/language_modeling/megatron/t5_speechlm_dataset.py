@@ -155,14 +155,11 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.trim_hop_length = trim_hop_length if trim_hop_length is not None else 512
         self.speech_offset = speech_offset if speech_offset is not None else 3
         self.seq_pattern = seq_pattern
-<<<<<<< HEAD
         self.use_attention_prior = use_attention_prior
         self.attention_prior_scaling_factor = attention_prior_scaling_factor
         # self.cross_attention_epsilon = cross_attention_epsilon  # value of prior for context tokens (b/w 0 and 1)
         # assert self.cross_attention_epsilon >= 0.0 and self.cross_attention_epsilon <= 1.0
-=======
         self.lm_vocab_size = tokenizer.vocab_size
->>>>>>> multitask dataset and phoneme tts
 
         # Initialize sup_data_path, sup_data_types and run preprocessing methods for every supplementary data type
         if sup_data_path is not None:
