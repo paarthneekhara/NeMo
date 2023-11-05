@@ -1953,7 +1953,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
 
                 for _t in range(pred_steps):
                     logging.info("Decoding timestep", _t)
-                    logits, _, _ = self.model(
+                    (_, logits), _ = self.model(
                         curr_tokens,
                         curr_position_ids,
                         curr_attention_mask,
@@ -2201,7 +2201,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 lengths = LengthParam(min_length=max_length, max_length=max_length)
                 sampling_params = get_default_sampling_params()
                 sampling_params["add_BOS"] = self.cfg.data.get("add_bos", True)
-                # sampling_params["vocab_size"] = self.cfg.get("text_size", 256000)
+                sampling_params["vocab_size"] = self.cfg.get("text_size", 256000)
                 context_length = torch.tensor([prompt_len], device=self.device).contiguous()
 
                 # For custom inference
@@ -2300,15 +2300,18 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                     for sidx in range(batch['tokens'].shape[0]):
                         print("Batch {}, Sample {}".format(batch_idx, sidx))
                         prompt_len = 100 if self.pretraining else torch.count_nonzero(~batch["loss_mask"][sidx] * batch['tokens'][sidx][0]) + 2
-                        # prompt_len = prompt_len + 8
+                        prompt_len = prompt_len + 50
                         prompt_tokens = batch['tokens'][sidx:sidx+1]
                         max_length = prompt_tokens.shape[2] - prompt_len - 1
                         lengths = LengthParam(min_length=max_length, max_length=max_length)
                         sampling_params = get_default_sampling_params()
+                        sampling_params["add_BOS"] = self.cfg.data.get("add_bos", True)
+                        sampling_params["vocab_size"] = self.cfg.get("text_size", 256000)
                         context_length = torch.tensor([prompt_len], device=self.device).contiguous()
                         gen_fn_output = self.generate((prompt_tokens.contiguous(), context_length), lengths, sampling_params=sampling_params, mode="multinomial")
                         gen_fn_preds = torch.tensor(gen_fn_output['token_ids'], device=self.device)
                         gen_fn_preds = gen_fn_preds[:,:,prompt_len:]
+                        # import ipdb; ipdb.set_trace()
                         for _i in range(8):
                             mask = gen_fn_preds[:,_i,:] != 0.
                             gen_fn_preds[:,_i,:] -= self.cfg.get("text_size", self.tokenizer.vocab_size) + 1024*_i
