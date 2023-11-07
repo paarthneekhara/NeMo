@@ -279,7 +279,8 @@ def main():
     compute_duration = args.compute_duration == 1
 
 
-    for source_target_out in source_target_out_pairs:
+    for pidx, source_target_out in enumerate(source_target_out_pairs):
+        print("Processing pair {}/{}".format(pidx + 1, len(source_target_out_pairs)))
         source_audio_path = source_target_out[0]
         source_audio_length = wav_featurizer.process(source_audio_path).shape[0]
         target_audio_paths = source_target_out[1].split(",")

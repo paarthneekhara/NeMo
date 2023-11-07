@@ -327,10 +327,11 @@ class FastPitchModel_SSL(ModelPT):
             val_out["pitch_loss"] = pitch_loss
             val_out["val_loss"] = mel_loss + pitch_loss
 
+        self.validation_step_outputs.append(val_out)
         return val_out
 
-    def on_validation_epoch_end(self, outputs):
-        collect = lambda key: torch.stack([x[key] for x in outputs]).mean()
+    def on_validation_epoch_end(self):
+        collect = lambda key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
         val_loss = collect("val_loss")
         mel_loss = collect("mel_loss")
 
@@ -341,7 +342,7 @@ class FastPitchModel_SSL(ModelPT):
             pitch_loss = collect("pitch_loss")
             self.log("v_pitch_loss", pitch_loss)
 
-        single_output = outputs[0]
+        single_output = self.validation_step_outputs[0]
         spec_target = single_output['mel_target']
         spec_predict = single_output['mel_pred']
         spec_len = single_output['spec_len']
@@ -379,6 +380,8 @@ class FastPitchModel_SSL(ModelPT):
             wav_vocoded = self.vocode_spectrogram(spec_predict[:, :_spec_len])
             self.tb_logger.add_audio("Generated Audio", wav_vocoded[0], self.global_step, 22050)
             self.log_train_images = True
+        
+        self.validation_step_outputs.clear()  # free memory)
 
     def generate_wav(
         self,
