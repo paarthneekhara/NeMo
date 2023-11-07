@@ -1,3 +1,7 @@
+# Manifests: 
+# Train: wget https://expressivecloning.s3.us-east-2.amazonaws.com/libri_train_selfvc.json
+# Val: wget https://expressivecloning.s3.us-east-2.amazonaws.com/libri_val_selfvc.json
+
 # Step 1: Conformer Training Command
 python examples/asr/speech_pretraining/speech_pre_training.py \
 model.train_ds.manifest_filepath="/data/SSLTTS/manifests/libri_train_selfvc.json" \
