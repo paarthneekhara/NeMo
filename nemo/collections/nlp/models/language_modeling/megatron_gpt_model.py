@@ -286,6 +286,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self._nsys_profile_end_step *= grad_accum_steps
 
         self.get_attention_mask_from_fusion = self.cfg.get('get_attention_mask_from_fusion', True)
+        self.get_attention_mask_from_fusion = False
+        
         self.initialize_ub = self.cfg.get('ub_tp_comm_overlap', False)
 
         self.inference_params = None
