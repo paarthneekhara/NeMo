@@ -286,7 +286,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self._nsys_profile_end_step *= grad_accum_steps
 
         self.get_attention_mask_from_fusion = self.cfg.get('get_attention_mask_from_fusion', True)
-        self.get_attention_mask_from_fusion = False
+        # TODO: @pneekhara: Hardcoding this because some how, I am not able to set it from config
+        # Check if flash attention
+        if not self.cfg.get('use_flash_attention', False):
+            print("Not using flash attention, setting get_attention_mask_from_fusion to False")
+            self.get_attention_mask_from_fusion = False
         
         self.initialize_ub = self.cfg.get('ub_tp_comm_overlap', False)
 
