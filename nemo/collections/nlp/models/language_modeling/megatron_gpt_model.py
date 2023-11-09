@@ -286,11 +286,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self._nsys_profile_end_step *= grad_accum_steps
 
         self.get_attention_mask_from_fusion = self.cfg.get('get_attention_mask_from_fusion', True)
-        # TODO: @pneekhara: Hardcoding this because some how, I am not able to set it from config
-        # Check if flash attention
+        
         if not self.cfg.get('use_flash_attention', False):
             print("Not using flash attention, setting get_attention_mask_from_fusion to False")
             self.get_attention_mask_from_fusion = False
+        
+        # TODO: @pneekhara Setting get_attention_mask_from_fusion to False for now for all attention types
+        # Setting this to False, uses dataset's attention mask
+        self.get_attention_mask_from_fusion = False
         
         self.initialize_ub = self.cfg.get('ub_tp_comm_overlap', False)
 
@@ -873,6 +876,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 'global_step': self.global_step
             }
 
+            if not self.cfg.get('use_attention_prior', False):
+                forward_args.pop('attention_prior')
+
             if not self.mcore_gpt:
                 forward_args['checkpoint_activations_all_layers'] = checkpoint_activations_all_layers
                 if not self.use_loss_mask:
@@ -880,6 +886,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             else:
                 # TODO: @eharper can we add this to mcore?
                 forward_args.pop('loss_mask')
+            
+            # import ipdb; ipdb.set_trace()
             (output_tensor, logits), attention_probs_list = model(**forward_args)
 
             if self.trainer.global_step % self.train_check_interval == 0 and batch['speech_mask'][0].sum() != 0 and self.should_log and (not validation_step):
@@ -2062,6 +2070,9 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 'attention_prior': batch['attention_prior'],
                 'global_step': self.global_step
             }
+
+            if not self.cfg.get('use_attention_prior', False):
+                forward_args.pop('attention_prior')
 
             if not self.mcore_gpt:
                 forward_args['checkpoint_activations_all_layers'] = None
