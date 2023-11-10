@@ -2328,7 +2328,6 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         gen_fn_output = self.generate((prompt_tokens.contiguous(), context_length), lengths, sampling_params=sampling_params, mode="multinomial")
                         gen_fn_preds = torch.tensor(gen_fn_output['token_ids'], device=self.device)
                         gen_fn_preds = gen_fn_preds[:,:,prompt_len:]
-                        # import ipdb; ipdb.set_trace()
                         for _i in range(8):
                             mask = gen_fn_preds[:,_i,:] != 0.
                             gen_fn_preds[:,_i,:] -= self.cfg.get("text_size", self.tokenizer.vocab_size) + 1024*_i

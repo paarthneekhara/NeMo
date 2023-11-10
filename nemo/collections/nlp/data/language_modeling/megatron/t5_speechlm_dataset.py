@@ -1126,7 +1126,7 @@ class GPTSpeechLMDataset(T5SpeechLMDataset):
             decoder_input_list.append(decoder_input)
             decoder_labels_list.append(decoder_labels)
 
-            decoder_mask[i, :context_tokens_len+question_tokens_len] = 0  # Mask out context and question
+            decoder_mask[i, :context_tokens_len+question_tokens_len-1] = 0  # Mask out context and question
 
             if self.use_attention_prior:
                 cross_attention_question_prior = torch.from_numpy(
