@@ -2212,7 +2212,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 self.logger.experiment.add_audio('Val TF Wav', all_preds_wav, self.trainer.global_step, sample_rate=24000)
 
                 prompt_len = 100 if self.pretraining else torch.count_nonzero(~batch["loss_mask"][0] * batch['tokens'][0][0]) + 2
-                prompt_len = prompt_len + 8 # TODO: Not sure why it doesn't work without this.
+                prompt_len = prompt_len # TODO: Not sure why it doesn't work without this.
                 prompt_tokens = batch['tokens'][:1] # First sample in batch
                 max_length = prompt_tokens.shape[2] - prompt_len - 1
                 lengths = LengthParam(min_length=max_length, max_length=max_length)
