@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Example Run Command: python ssl_tts_vc.py --ssl_model_ckpt_path <PATH TO CKPT> --hifi_ckpt_path <PATH TO CKPT> \
+# Example Run Command: python self_vc.py --ssl_model_ckpt_path <PATH TO CKPT> --hifi_ckpt_path <PATH TO CKPT> \
 # --fastpitch_ckpt_path <PATH TO CKPT> --source_audio_path <SOURCE CONTENT WAV PATH> --target_audio_path \
 # <TARGET SPEAKER WAV PATH> --out_path <PATH TO OUTPUT WAV>
 
@@ -197,6 +197,7 @@ def main():
     parser.add_argument('--segment_length_seconds', type=int, default=16)
     parser.add_argument('--use_unique_tokens', type=int, default=0)
     parser.add_argument('--duration', type=float, default=None)
+    parser.add_argument('--sample_rate', type=float, default=22050)
     args = parser.parse_args()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -209,6 +210,7 @@ def main():
         with open(args.source_target_out_pairs, "r") as f:
             lines = f.readlines()
             source_target_out_pairs = [line.strip().split(";") for line in lines]
+            source_target_out_pairs = [[r.strip() for r in pair] for pair in source_target_out_pairs]
     else:
         assert args.source_audio_path is not None, "source_audio_path is required"
         assert args.target_audio_path is not None, "target_audio_path is required"
@@ -216,19 +218,20 @@ def main():
             source_name = os.path.basename(args.source_audio_path).split(".")[0]
             target_name = os.path.basename(args.target_audio_path).split(".")[0]
             args.out_path = "swapped_{}_{}.wav".format(source_name, target_name)
-
-        wav_featurizer_22050 = WaveformFeaturizer(sample_rate=22050, int_values=False, augmentor=None)
-        source_audio_wav = wav_featurizer_22050.process(args.source_audio_path)
+        
+        _wav_featurizer = WaveformFeaturizer(sample_rate=args.sample_rate, int_values=False, augmentor=None)
+        source_audio_wav = _wav_featurizer.process(args.source_audio_path)
         source_audio_length = source_audio_wav.shape[0]
-        if source_audio_length > args.max_input_length_sec * 22050:
-            print("Segmenting audio into 16s chunks")
+        if source_audio_length > args.max_input_length_sec * args.sample_rate:
+            print("Segmenting the long source audio into chunks")
             # break audio into segments
             source_audio_basedir = os.path.dirname(args.source_audio_path)
             temp_dir = os.path.join(source_audio_basedir, "temp")
             if not os.path.exists(temp_dir):
                 os.makedirs(temp_dir)
-
-            segment_length = int(16 * 20480)  # around
+            
+            # segment_length is nearest multiple of 1024
+            segment_length = args.segment_length_seconds * int(args.sample_rate / 1024) * 1024
             si = 0
             seg_num = 0
             source_target_out_pairs = []
@@ -244,7 +247,6 @@ def main():
         else:
             source_target_out_pairs = [(args.source_audio_path, args.target_audio_path, args.out_path)]
 
-    print(source_target_out_pairs)
     out_paths = [r[2] for r in source_target_out_pairs]
     out_dir = get_base_dir(out_paths)
     if not os.path.exists(out_dir):
