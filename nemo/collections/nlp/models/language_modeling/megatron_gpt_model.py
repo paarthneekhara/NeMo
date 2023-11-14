@@ -1952,30 +1952,41 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
 
         return model
 
-    def custom_autoregressive_inference(self, batch, prompt_len, pred_steps=500):
+    def custom_autoregressive_inference(self, batch, prompt_len, pred_steps=500, sidx=0):
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=False):
-                curr_tokens = batch['tokens'][:1,:,:prompt_len] # (B, 8, T)
-                curr_position_ids = batch['position_ids'][:1,:prompt_len]
+                curr_tokens = batch['tokens'][sidx:sidx+1,:,:prompt_len] # (B, 8, T)
+                curr_position_ids = batch['position_ids'][sidx:sidx+1,:prompt_len]
                 curr_attention_mask = None
                 if batch['attention_mask'] is not None:
-                    curr_attention_mask = batch['attention_mask'][:1,:,:prompt_len,:prompt_len]
-                curr_speech_mask = batch['speech_mask'][:1,:prompt_len]
+                    curr_attention_mask = batch['attention_mask'][sidx:sidx+1,:,:prompt_len,:prompt_len]
+                curr_speech_mask = batch['speech_mask'][sidx:sidx+1,:prompt_len]
 
                 all_preds = []
-                temperature = self.cfg.get('temperature', 1.0)  # Set temp 0.01 for greedy decoding
+                temperature = self.cfg.get('temperature', 0.5)  # Set temp 0.01 for greedy decoding
 
+                end_timestep = None
                 for _t in range(pred_steps):
-                    logging.info("Decoding timestep", _t)
-                    (_, logits), _ = self.model(
+                    if (end_timestep is not None) and _t == end_timestep + 8:
+                        break
+                    
+                    if _t % 10 == 0:
+                        print("Decoding timestep", _t)
+
+                    (logits, _), _ = self.model(
                         curr_tokens,
                         curr_position_ids,
                         curr_attention_mask,
                         speech_mask=curr_speech_mask,
                         return_logits=True
                     )
-
+                    # import ipdb; ipdb.set_trace()
                     logits = logits.transpose(0, 1).contiguous()
+                    # print("Prediction", logits[-1,0].argmax().item())
+                    if logits[-1,0].argmax().item() == self.tokenizer.eos_id:
+                        end_timestep = _t
+                        print("End detected!!!", _t)
+
                     all_speech_logits = []
                     all_speech_token_preds = []
                     for _i in range(8):
@@ -2010,10 +2021,6 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
 
                 all_preds = torch.stack(all_preds, dim=0) # (T, B, 8)
                 all_preds = all_preds.permute(1, 2, 0) # (B, 8, T)
-
-                # prompt_tokens = batch['tokens'][:,:,:prompt_len] # (B, 8, T)
-                # for _i in range(8):
-                #     prompt_tokens[:,_i,:] = prompt_tokens[:,_i,:] - self.tokenizer.vocab_size - _i*1024
 
                 preds_example = all_preds[0]
                 preds_example = self.convert_tokens_to_range(preds_example)
@@ -2312,11 +2319,18 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                     for key in forward_keys:
                         if batch[key] is not None:
                             batch[key] = batch[key].cuda()
-
+                    
+                    # import ipdb; ipdb.set_trace()
+                    
+                    
                     # Autoregressive Inference From Generate Function
                     for sidx in range(batch['tokens'].shape[0]):
+                        _step = batch_idx * batch['tokens'].shape[0] + sidx
                         print("Batch {}, Sample {}".format(batch_idx, sidx))
                         prompt_len = 100 if self.pretraining else torch.count_nonzero(~batch["loss_mask"][sidx] * batch['tokens'][sidx][0]) + 2
+
+                        pred_custom_wav = self.custom_autoregressive_inference(batch, prompt_len, pred_steps=1000, sidx=sidx)
+                        self.logger.experiment.add_audio('pred_custom_wav', pred_custom_wav, _step, sample_rate=24000)
                         # prompt_len = prompt_len + 50
                         prompt_tokens = batch['tokens'][sidx:sidx+1]
                         max_length = prompt_tokens.shape[2] - prompt_len - 1
@@ -2339,7 +2353,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         gen_fn_preds_example = self.convert_tokens_to_range(gen_fn_preds[0])
                         gen_fn_preds_wav = self.additional_models['encodec'].decode([[gen_fn_preds_example[None], None]])[0, 0]
 
-                        _step = batch_idx * batch['tokens'].shape[0] + sidx
+                        
                         self.logger.experiment.add_audio('gen_fn_preds_wav', gen_fn_preds_wav, _step, sample_rate=24000)
 
                         context_question_tokens = batch['tokens'][sidx][:,:prompt_len]
