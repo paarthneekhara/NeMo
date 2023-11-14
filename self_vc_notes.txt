@@ -85,9 +85,12 @@ trainer.max_epochs=500 \
 
 
 # INFERENCE
+---------------------------------------------------------------------
 # inference script also supports batched inference, 
 # Can pass source_target_out_pairs.txt instead of source_audio_path, target_audio_path and out_path
 # Each line in source_target_out_pairs.txt is formatted as source.wav;target.wav;out.wav
+# Sample Source Wav: https://expressivecloning.s3.us-east-2.amazonaws.com/AMTEVAL/SRC_UNSEEN_LIBRI/source_30.wav
+# Sample Target Wav: https://expressivecloning.s3.us-east-2.amazonaws.com/AMTEVAL/TARGET_UNSEEN_LIBRI/targetspeaker_29.wav
 
 python scripts/ssl_tts/self_vc.py \
 --source_audio_path source_audio.wav \
