@@ -1,6 +1,11 @@
-# Manifests: 
-# Train: wget https://expressivecloning.s3.us-east-2.amazonaws.com/libri_train_selfvc.json
-# Val: wget https://expressivecloning.s3.us-east-2.amazonaws.com/libri_val_selfvc.json
+# Training Val Manifests: 
+Train: wget https://expressivecloning.s3.us-east-2.amazonaws.com/libri_train_selfvc.json
+Val: wget https://expressivecloning.s3.us-east-2.amazonaws.com/libri_val_selfvc.json
+
+# Pretrained checkpoints
+Conformer: https://expressivecloning.s3.us-east-2.amazonaws.com/SelfVC_Checkpoints/ConformerSSL_LibriCSS.ckpt
+FastPitch: https://expressivecloning.s3.us-east-2.amazonaws.com/SelfVC_Checkpoints/FastPitch_LibriCSS.ckpt
+HiFiGAN: https://expressivecloning.s3.us-east-2.amazonaws.com/SelfVC_Checkpoints/HiFiFinetuned.ckpt
 
 # Step 1: Conformer Training Command
 python examples/asr/speech_pretraining/speech_pre_training.py \
@@ -88,7 +93,7 @@ python scripts/ssl_tts/self_vc.py \
 --source_audio_path source_audio.wav \
 --target_audio_path target_speaker_audio.wav \
 --out_path out.wav \
---fastpitch_ckpt_path /data/SSLTTS/TextlessFastPitchExperimentsLibri360/SelfVC_LibriCSSNewCode/Run1FromScratch/2023-10-09_16-41-26/checkpoints/Epoch139.ckpt \
---ssl_model_ckpt_path /data/SSLTTS/PretrainingExperiments/LibriPlusCSS/conformerSSL/checkpoints/Epoch74_6016.ckpt \
---compute_pitch 1 --compute_duration 0 --use_unique_tokens=0 \
---hifi_ckpt_path /data/SSLTTS/HiFiLibriEpoch334.ckpt ; \
+--fastpitch_ckpt_path SelfVC_Checkpoints/FastPitch_LibriCSS.ckpt \
+--ssl_model_ckpt_path SelfVC_Checkpoints/ConformerSSL_LibriCSS.ckpt \
+--hifi_ckpt_path SelfVC_Checkpoints/HiFiFinetuned.ckpt \
+--compute_pitch 1 --compute_duration 0 --use_unique_tokens=0 ;
