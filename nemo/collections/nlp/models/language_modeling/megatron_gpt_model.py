@@ -2609,6 +2609,7 @@ class MegatronSpeechGPTSFTModel(MegatronSpeechGPTModel):
             seq_pattern=self.cfg.get('seq_pattern', 'delay_parallel'),
             decoder_only_model=True,
             context_length=self.cfg.data.get('context_length', None),
+            use_phoneme_tokenizer=self.cfg.data.get('use_phoneme_tokenizer', False),
         )
 
         rank = parallel_state.get_data_parallel_rank()
