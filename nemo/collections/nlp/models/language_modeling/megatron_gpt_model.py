@@ -2312,7 +2312,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
         similarity_list = []
 
         # Testing it only on 2 batches, remove this if to run on all batches
-        if batch_idx in [0,1]:
+        if batch_idx in [0,1,2,3]:
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=False):
                     forward_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'loss_mask', 'speech_mask']
