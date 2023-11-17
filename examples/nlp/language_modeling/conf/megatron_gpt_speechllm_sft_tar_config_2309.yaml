@@ -196,7 +196,7 @@ model:
     add_sentinel_to_input: True
     ul2_prompt_token: null # <extra_id_s>, <extra_id_r>, <extra_id_x>
     shuffle: true
-    num_workers: 4
+    num_workers: 1
     pin_memory: true
     speech_offset: ???
     train_task: tts

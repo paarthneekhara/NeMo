@@ -872,7 +872,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 'speech_mask': batch['speech_mask'],
                 'return_logits': True,
                 'return_all_selfattention_probs': self.return_all_selfattention_probs if not validation_step else False,
-                'attention_prior': batch['attention_prior'],
+                'attention_prior': batch.get('attention_prior', None),
                 'global_step': self.global_step
             }
 
@@ -2062,7 +2062,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
             batch = next(dataloader_iter)
             forward_keys = ['tokens', 'position_ids', 'attention_mask', 'labels', 'loss_mask', 'speech_mask', 'attention_prior']
             for key in forward_keys:
-                if batch[key] is not None:
+                if (key in batch) and (batch[key] is not None):
                     batch[key] = batch[key].cuda()
 
             forward_args = {
@@ -2074,7 +2074,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 'speech_mask': batch['speech_mask'],
                 'return_logits': True,
                 'return_all_selfattention_probs': self.should_log,
-                'attention_prior': batch['attention_prior'],
+                'attention_prior': batch.get('attention_prior', None),
                 'global_step': self.global_step
             }
 
