@@ -537,7 +537,7 @@ class T5SpeechLMTarredDataset(_TarredInstructionTuningDataset):
             _text = field_data.strip(" ")
             if self.use_phoneme_tokenizer:
                 instruction_tokens = self._get_text_tokens("Phoneme TTS")
-                field_tokens = self._get_phoneme_tokens(_text.replace("Text to speech this  ", ""))
+                field_tokens = self._get_phoneme_tokens(_text.replace("Text to speech this ", ""))
                 field_tokens = instruction_tokens + field_tokens
             else:
                 field_tokens = self._get_text_tokens(_text)  # list of ids

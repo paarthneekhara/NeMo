@@ -69,6 +69,7 @@ def _modify_config(gpt_cfg, cfg, add_cfg_to_tree=False):
         gpt_cfg.attn_prior_end_step = cfg.model.attn_prior_end_step
         gpt_cfg.attn_prior_scaledown_start_step = cfg.model.attn_prior_scaledown_start_step
         gpt_cfg.attn_prior_starting_strength = cfg.model.attn_prior_starting_strength
+        gpt_cfg.use_attention_prior = cfg.model.get("use_attention_prior", False)
         # gpt_cfg.bias_activation_fusion = cfg.model.bias_activation_fusion  # Missing from older checkpoints?
         # gpt_cfg.bias_dropout_add_fusion = cfg.model.bias_dropout_add_fusion  # Missing from older checkpoints?
         sft_cls = MegatronSpeechGPTModel
