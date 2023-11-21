@@ -696,6 +696,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.log('global_batch_size', current_global_batch_size, prog_bar=True, rank_zero_only=True, batch_size=1)
             self.if_first_step = 1
 
+        # print(f"loss: {loss_mean}")
+        # import ipdb; ipdb.set_trace()
         return loss_mean
 
     def backward(self, *args, **kwargs):
@@ -858,8 +860,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     required_keys.update(('tokens', 'position_ids'))
                 if parallel_state.is_pipeline_last_stage():
                     required_keys.update(('labels', 'loss_mask'))
-            if self.get_attention_mask_from_fusion:
-                required_keys.remove('attention_mask')
+            # if self.get_attention_mask_from_fusion:
+            #     required_keys.remove('attention_mask')
             batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch_cpu.items()}
 
             # Model forward pass
@@ -886,9 +888,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             else:
                 # TODO: @eharper can we add this to mcore?
                 forward_args.pop('loss_mask')
-            
-            # import ipdb; ipdb.set_trace()
-            (output_tensor, logits), attention_probs_list = model(**forward_args)
+            (output_tensor, logits), attention_probs_list, prior = model(**forward_args)
 
             if self.trainer.global_step % self.train_check_interval == 0 and batch['speech_mask'][0].sum() != 0 and self.should_log and (not validation_step):
                 # Logs every if the first item in the batch is speech
@@ -998,6 +998,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         return fwd_output_and_loss_func
 
     def get_forward_output_only_func(self):
+        """ Used in inference / generate """
         def fwd_output_only_func(dataloader_iter, model):
             batch = next(dataloader_iter)
             extra_arg = {}
@@ -1054,7 +1055,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     extra_arg['set_inference_key_value_memory'] = set_inference_key_value_memory[0].item()
                     extra_arg['inference_max_sequence_len'] = inference_max_sequence_len[0].item()
                 extra_arg['speech_mask'] = speech_mask
-            output_tensor, attention_probs_list = model(tokens, position_ids, attention_mask, **extra_arg)
+                # extra_arg['return_all_selfattention_probs'] = True
+            output_tensor, attention_, prior = model(tokens, position_ids, attention_mask, **extra_arg)
 
             # Advance inference sequence offset.
             if self.inference_params:
@@ -2089,7 +2091,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                 # TODO: @eharper can we add this to mcore?
                 forward_args.pop('loss_mask')
 
-            (_, logits), attention_probs_list = self.model(**forward_args)
+            (_, logits), attention_probs_list, prior = self.model(**forward_args)
             layerwise_metrics = {}
             loss_total = 0.0
             all_preds = []
@@ -2173,7 +2175,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                     attention_sliced = torch.stack(attention_sliced_list)
                     attention_sliced = torch.mean(attention_sliced, 0)
                     alignment_image_sliced = plot_alignment_to_numpy(
-                        attention_sliced.cpu().float().numpy(), phoneme_seq=phoneme_seq, phoneme_ver=2, vmin=0., vmax=1.
+                        attention_sliced.cpu().float().numpy(), phoneme_seq=phoneme_seq, phoneme_ver=2, vmin=0.
                     )
                     self.logger.experiment.add_image(
                         f"Val Attention Probs Average Sliced TF",
@@ -2181,29 +2183,30 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                         self.global_step,
                         dataformats="HWC",
                     )
-
-                    # phoneme_seq = [question_start, start]
-                    # prior = batch['attention_prior'][0,:,:].T
-                    # prior_data = plot_alignment_to_numpy(
-                    #     prior.cpu().float().numpy(), phoneme_seq=phoneme_seq, phoneme_ver=1, vmin=0., vmax=1.
-                    # )
-                    # self.logger.experiment.add_image(
-                    #     f"Attention Prior",
-                    #     prior_data,
-                    #     self.global_step,
-                    #     dataformats="HWC",
-                    # )
-                    # phoneme_seq += question_ids
-                    # prior = prior[question_start:start, start:start+length_of_speech]
-                    # prior_data = plot_alignment_to_numpy(
-                    #     prior.cpu().float().numpy(), phoneme_seq=phoneme_seq, phoneme_ver=2, vmin=0., vmax=1.
-                    # )
-                    # self.logger.experiment.add_image(
-                    #     f"Attention Prior Sliced",
-                    #     prior_data,
-                    #     self.global_step,
-                    #     dataformats="HWC",
-                    # )
+                    if prior is not None:
+                        phoneme_seq = [question_start, start]
+                        # prior = batch['attention_prior'][0,:,:].T
+                        prior = torch.exp(prior[0,0,:,:].T)
+                        prior_data = plot_alignment_to_numpy(
+                            prior.cpu().float().numpy(), phoneme_seq=phoneme_seq, phoneme_ver=1, vmin=0., vmax=1.
+                        )
+                        self.logger.experiment.add_image(
+                            f"Attention Prior",
+                            prior_data,
+                            self.global_step,
+                            dataformats="HWC",
+                        )
+                        # phoneme_seq += question_ids
+                        # prior = prior[question_start:start, start:start+length_of_speech]
+                        # prior_data = plot_alignment_to_numpy(
+                        #     prior.cpu().float().numpy(), phoneme_seq=phoneme_seq, phoneme_ver=2, vmin=0., vmax=1.
+                        # )
+                        # self.logger.experiment.add_image(
+                        #     f"Attention Prior Sliced",
+                        #     prior_data,
+                        #     self.global_step,
+                        #     dataformats="HWC",
+                        # )
 
                 # Only for the first batch, log TF and autoregressive inference
 
@@ -2549,6 +2552,9 @@ class MegatronSpeechGPTSFTModel(MegatronSpeechGPTModel):
             context_length=self.cfg.data.get('context_length', None),
             use_attention_prior=self.cfg.data.get('use_attention_prior', True),
             attention_prior_scaling_factor=self.cfg.data.get('attention_prior_scaling_factor', 1.),
+            spec_aug = self.cfg.data.get('spec_aug', False),
+            spec_aug_time_width = self.cfg.data.get('spec_aug_time_width', 0.2),
+            spec_aug_time_masks = self.cfg.data.get('spec_aug_time_masks', 2),
             # cross_attention_epsilon=self.cfg.data.get('cross_attention_epsilon', 1e-8),
         )
 
