@@ -1977,7 +1977,7 @@ class MegatronSpeechGPTModel(MegatronGPTModel):
                     if _t % 10 == 0:
                         print("Decoding timestep", _t)
 
-                    (logits, _), _ = self.model(
+                    (logits, _), _, _ = self.model(
                         curr_tokens,
                         curr_position_ids,
                         curr_attention_mask,
