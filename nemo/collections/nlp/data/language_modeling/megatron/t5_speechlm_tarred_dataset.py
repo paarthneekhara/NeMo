@@ -977,7 +977,7 @@ class GPTSpeechLMTarredDataset(T5SpeechLMTarredDataset):
             decoder_input_list.append(decoder_input)
             decoder_labels_list.append(decoder_labels)
 
-            decoder_mask[i, :context_tokens_len+question_tokens_len] = 0  # Mask out context and question
+            decoder_mask[i, :context_tokens_len+question_tokens_len-1] = 0  # Mask out context and question
             speech_input_mask[i, context_tokens_len:context_tokens_len+question_tokens_len] = 0
 
         # Using causal attention mask for whole input
