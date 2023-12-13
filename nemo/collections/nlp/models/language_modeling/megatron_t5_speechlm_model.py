@@ -1024,7 +1024,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
     def test_step(self, batch, batch_idx):
         return self.predict_step(batch, batch_idx)
 
-    def test_epoch_end(self, outputs):
+    def on_test_epoch_end(self, outputs):
         """
         This might still be broken for lightning 2.0. to fix: see
         https://github.com/NVIDIA/NeMo/blob/9bdf4d12276ee8f95a340cf2f7f340e9b5b74a7e/docs/source/starthere/migration-guide.rst
@@ -1084,6 +1084,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             use_attention_prior=self.cfg.data.get('use_attention_prior', False),
             attention_prior_scaling_factor=self.cfg.data.get('attention_prior_scaling_factor', 1.0),
             cross_attention_epsilon=self.cfg.data.get('cross_attention_epsilon', 0.0),
+            lm_vocab_size=self.lm_vocab_size,
         )
 
         rank = parallel_state.get_data_parallel_rank()
@@ -1143,6 +1144,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             use_attention_prior=self.cfg.data.get('use_attention_prior', False),
             attention_prior_scaling_factor=self.cfg.data.get('attention_prior_scaling_factor', 1.0),
             cross_attention_epsilon=self.cfg.data.get('cross_attention_epsilon', 0.0),
+            lm_vocab_size=self.lm_vocab_size,
         )
         rank = parallel_state.get_data_parallel_rank()
         world_size = parallel_state.get_data_parallel_world_size()
