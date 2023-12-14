@@ -207,6 +207,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         self.plot_alignments_sliced  = self.cfg.get('plot_alignments_sliced', True)
         app_state = AppState()
         self.is_rank_zero = app_state.global_rank == 0
+        self.predict_step_outputs = []
 
     def decode_wav_from_codec_model(self, codes):
         codec_model = self.additional_models['codec']
@@ -1043,11 +1044,12 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
     def test_step(self, batch, batch_idx):
         return self.predict_step(batch, batch_idx)
 
-    def on_test_epoch_end(self, outputs):
+    def on_test_epoch_end(self):
         """
         This might still be broken for lightning 2.0. to fix: see
         https://github.com/NVIDIA/NeMo/blob/9bdf4d12276ee8f95a340cf2f7f340e9b5b74a7e/docs/source/starthere/migration-guide.rst
         """
+        outputs = self.predict_step_outputs
         average_metrics = {}
         for output in outputs:
             for key in output:
@@ -1217,10 +1219,13 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 dec_input_mask, (0, max_inference_timesteps - dec_input_mask.shape[1]), value=1
             )
 
+            end_inference_loop_at = None
             for t in range(dec_input.shape[2] - 1):
                 if t % 10 == 0:
                     logging.info("Timestep {}".format(t))
-
+                if t == end_inference_loop_at:
+                    print("All ends detected")
+                    break
                 output_logits, _, token_and_speech_logits = self.forward(
                     virtual_tokens,
                     context_and_question_tokens,
@@ -1277,6 +1282,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         if _b not in end_indices:
                             logging.info("End detected for item {}".format(_b) + " at timestep {}".format(t))
                             end_indices[_b] = t
+                            if len(end_indices) == token_preds.shape[0]:
+                                end_inference_loop_at = t + 8
 
                 output_token_list.append(output_tokens_curr_timestep)
 
@@ -1435,12 +1442,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             # compute average similarity
             similarity_avg = np.mean(similarity_list)
             self.logger.experiment.add_scalar(f'Inf SV Avg Cossim', similarity_avg, batch_idx)
-
-            return {
+            self.predict_step_outputs.append({
                 'sv_avg_cossim': similarity_avg,
                 'cer_transcript': cer_glob,
                 'wer_transcript': wer_glob,
-            }
+            })
 
     def predict_step_old(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
 
