@@ -104,9 +104,10 @@ class AudioDataset(Dataset):
             try:
                 sf.read(record["audio_filepath"])
                 sf.read(record["context"])
-                filtered_data.append(record)
             except:
                 print("Skipping invalid record", record["audio_filepath"])
+                continue
+            filtered_data.append(record)
         print("Original data size", len(self.data))
         print("Filtered data size", len(filtered_data))
         self.data = filtered_data

@@ -125,7 +125,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         cross_attention_epsilon: Optional[float] = 0.0,
         lm_vocab_size: Optional[int] = None,
         num_speech_codebooks: Optional[int] = 8,
-        codebook_fps: Optional[int] = 76,
+        codebook_fps: Optional[int] = 75,
         **kwargs,
     ):
         """
@@ -267,19 +267,19 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
 
             if doc["context_type"] == "SPEECH":
                 assert "context_duration" in doc, f"context_duration key not in document {doc}"
-                approx_context_len = 3 * self.codebook_fps
+                approx_context_len = 3 * (self.codebook_fps + 1) # +1 just to be safe
                 if self.context_length is not None and doc["context_duration"] < self.context_length:
                     logging.debug(f"skipped as context_length of {doc['context_duration']} is less than {self.context_length}")
                     skipped += 1
                     continue
             elif "Remove Noise" in question_in_manifest:
-                approx_context_len = doc["answer_duration"] * self.codebook_fps
+                approx_context_len = doc["answer_duration"] * (self.codebook_fps + 1)
             elif "Extract Speaker Audio" in question_in_manifest:
-                approx_context_len = doc["answer_duration"] * self.codebook_fps + 400 # 400 is the max ref speaker audio
+                approx_context_len = doc["answer_duration"] * (self.codebook_fps + 1) + 400 # 400 is the max ref speaker audio
             elif ("Text to speech this" in question_in_manifest) or ('Phoneme TTS' in question_in_manifest):
                 approx_context_len = 400 # Max length of Ref TTS audio
             elif "Edit Speech" in question_in_manifest:
-                approx_context_len = doc["answer_duration"] * self.codebook_fps
+                approx_context_len = doc["answer_duration"] * (self.codebook_fps + 1)
             else:
                 raise NotImplementedError(f"Unknown context type {doc['context_type']}")
 
