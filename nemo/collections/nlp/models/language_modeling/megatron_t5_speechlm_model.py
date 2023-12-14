@@ -1283,7 +1283,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                             logging.info("End detected for item {}".format(_b) + " at timestep {}".format(t))
                             end_indices[_b] = t
                             if len(end_indices) == token_preds.shape[0]:
-                                end_inference_loop_at = t + 8
+                                end_inference_loop_at = t + self.num_speech_codebooks
 
                 output_token_list.append(output_tokens_curr_timestep)
 
