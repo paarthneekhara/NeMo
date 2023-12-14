@@ -943,7 +943,7 @@ class GPTSpeechLMTarredDataset(T5SpeechLMTarredDataset):
                     dim=1,
                 )
                 dec_input_new = []
-                for _c in range(self.num_codebooks):
+                for _c in range(self.num_speech_codebooks):
                     st = num_codebooks - _c
                     et_decoder_input = dec_input_padded.shape[1] - _c
                     dec_input_new.append(dec_input_padded[_c, st:et_decoder_input])
