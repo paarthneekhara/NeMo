@@ -1107,7 +1107,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             cross_attention_epsilon=self.cfg.data.get('cross_attention_epsilon', 0.0),
             lm_vocab_size=self.lm_vocab_size,
             num_speech_codebooks=self.num_speech_codebooks,
-            codebook_fps=self.cfg.data.get('codebook_fps', 76),
+            codebook_fps=self.cfg.data.get('codebook_fps', 75),
         )
 
         rank = parallel_state.get_data_parallel_rank()
