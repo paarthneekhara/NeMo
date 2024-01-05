@@ -54,6 +54,13 @@ class AudioDataset(Dataset):
             with open(manifest_path, "r") as f:
                 for line in f:
                     record = json.loads(line)
+                    if 'answer_duration' not in record:
+                        record['answer_duration'] = record['duration']
+                    
+                    if 'mls_english_' in record['speaker']:
+                        record['speaker'] = record['speaker'].replace('mls_english_', '')
+                        record['speaker'] = int(record['speaker'])
+
                     if record['answer_duration'] < min_duration or record['answer_duration'] > max_duration:
                         continue
 
@@ -62,7 +69,7 @@ class AudioDataset(Dataset):
                     ):
                         continue
 
-                    self.data.append(json.loads(line))
+                    self.data.append(record)
                     if record['speaker'] not in speakerwise_records:
                         speakerwise_records[record['speaker']] = []
                     speakerwise_records[record['speaker']].append(record)
@@ -285,6 +292,9 @@ class AudioDataset(Dataset):
             mixed_audio = 0.5 * (audio + alternate_audio)
 
         mixed_audio_length = audio_length
+
+        if "question" not in sample:
+            sample['question'] = "Text to speech this " + sample['text']
 
         return {
             "audio": audio,
