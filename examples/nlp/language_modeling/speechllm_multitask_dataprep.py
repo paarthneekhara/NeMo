@@ -57,7 +57,7 @@ class AudioDataset(Dataset):
                     if 'answer_duration' not in record:
                         record['answer_duration'] = record['duration']
                     
-                    if 'mls_english_' in record['speaker']:
+                    if isinstance(record['speaker'], str) and 'mls_english_' in record['speaker']:
                         record['speaker'] = record['speaker'].replace('mls_english_', '')
                         record['speaker'] = int(record['speaker'])
 
@@ -341,23 +341,24 @@ def save_batch_audios(batch, bidx, temp_dir, codec_model, codec_model_type='enco
         mixed_audio_path = os.path.join(temp_dir, f"{bidx}_{sidx}_mixed.wav")
         torchaudio.save(mixed_audio_path, mixed_audio[None].cpu(), codec_model_sample_rate)
 
-        for key in batch:
-            if "CODEC" in key:
-                codec = batch[key][sidx]  # (8, T)
-                if codec_model_type == 'encodec':
-                    codec_decoded_audio = codec_model.decode([[codec.unsqueeze(0), None]])[0][0]
-                elif codec_model_type == 'uniaudio_codec':
-                    codec_decoded_audio = codec_model.decode(codec.unsqueeze(0))[0][0]
-                elif codec_model_type == 'dac':
-                    _z = codec_model.quantizer.from_codes(codec.unsqueeze(0))[0]
-                    codec_decoded_audio = codec_model.decoder(_z)[0][0]
-                elif codec_model_type == 'nemo_codec':
-                    codec_len = torch.Tensor([codec.shape[1]]).long().cuda()
-                    codec_decoded_audio, _ = codec_model.decode(tokens=codec.unsqueeze(0), tokens_len=codec_len)
-                    codec_decoded_audio = codec_decoded_audio[0]
+        with torch.no_grad():
+            for key in batch:
+                if "CODEC" in key:
+                    codec = batch[key][sidx]  # (8, T)
+                    if codec_model_type == 'encodec':
+                        codec_decoded_audio = codec_model.decode([[codec.unsqueeze(0), None]])[0][0]
+                    elif codec_model_type == 'uniaudio_codec':
+                        codec_decoded_audio = codec_model.decode(codec.unsqueeze(0))[0][0]
+                    elif codec_model_type == 'dac':
+                        _z = codec_model.quantizer.from_codes(codec.unsqueeze(0))[0]
+                        codec_decoded_audio = codec_model.decoder(_z)[0][0]
+                    elif codec_model_type == 'nemo_codec':
+                        codec_len = torch.Tensor([codec.shape[1]]).long().cuda()
+                        codec_decoded_audio, _ = codec_model.decode(tokens=codec.unsqueeze(0), tokens_len=codec_len)
+                        codec_decoded_audio = codec_decoded_audio[0]
 
-                codec_decoded_audio_path = os.path.join(temp_dir, f"{bidx}_{sidx}_{key}_decoded.wav")
-                torchaudio.save(codec_decoded_audio_path, codec_decoded_audio[None].cpu(), codec_model_sample_rate)
+                    codec_decoded_audio_path = os.path.join(temp_dir, f"{bidx}_{sidx}_{key}_decoded.wav")
+                    torchaudio.save(codec_decoded_audio_path, codec_decoded_audio[None].cpu(), codec_model_sample_rate)
 
 
 def estimate_duration_from_codeclen(codec_len, codec_downsampling_factor=320.0, codec_model_sample_rate=24000):
