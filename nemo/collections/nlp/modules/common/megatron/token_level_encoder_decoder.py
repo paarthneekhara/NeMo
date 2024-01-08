@@ -712,15 +712,17 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                     attention_probs = [torch.softmax(attention_score, dim=-1) for attention_score in attention_scores]
                     
                     if text_limits is not None and hasattr(self, "forward_sum_loss"):
-                        attention_scores_combined = torch.cat(attention_scores, dim=1)
+                        attention_scores_filtered = [attention_scores[lidx] for lidx in self.alignment_decoder_layerids]
+                        attention_scores_combined = torch.cat(attention_scores_filtered, dim=1)
                         text_start_idx = text_limits[0,0].item()
                         assert torch.all(text_limits[:,0] == text_start_idx) # all texts should start at the same index
-                        attention_scores_sliced = attention_scores_combined[:,:,:,text_start_idx:-2] # -2 to remove eos and pad
+                        end_offset = self.alignment_text_end_offset
+                        attention_scores_sliced = attention_scores_combined[:,:,:,text_start_idx:-(2 + end_offset)] # -2 to remove eos and pad
                         # attention_logprobs = torch.log_softmax(attention_scores_sliced, dim=-1)
                         attention_logprobs = attention_scores_sliced # not taking log_softmax, since we will do that in loss function
                         attention_logprobs = torch.mean(attention_logprobs, dim=1, keepdim=True)
                         dec_len = torch.sum(dec_attn_mask, dim=1)
-                        enc_len = text_limits[:,1] - text_limits[:,0]
+                        enc_len = text_limits[:,1] - text_limits[:,0] - end_offset
                         # print("enc len: ", enc_len)
                         # print("dec len: ", dec_len)
                         # print("text limits: ", text_limits)
