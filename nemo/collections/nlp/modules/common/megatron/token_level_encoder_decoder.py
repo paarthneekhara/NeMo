@@ -717,7 +717,10 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                         text_start_idx = text_limits[0,0].item()
                         assert torch.all(text_limits[:,0] == text_start_idx) # all texts should start at the same index
                         end_offset = self.alignment_text_end_offset
-                        attention_scores_sliced = attention_scores_combined[:,:,:,text_start_idx:-(2 + end_offset)] # -2 to remove eos and pad
+                        # align_every_n_head: eg if set to 2, will skip every other head
+                        # if set to 12, will select 1 head from every layer
+                        align_every_n_head = self.align_every_n_head
+                        attention_scores_sliced = attention_scores_combined[:,::align_every_n_head,:,text_start_idx:-(2 + end_offset)] # -2 to remove eos and pad
                         # attention_logprobs = torch.log_softmax(attention_scores_sliced, dim=-1)
                         attention_logprobs = attention_scores_sliced # not taking log_softmax, since we will do that in loss function
                         attention_logprobs = torch.mean(attention_logprobs, dim=1, keepdim=True)

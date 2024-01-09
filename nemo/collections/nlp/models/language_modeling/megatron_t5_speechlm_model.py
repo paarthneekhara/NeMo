@@ -146,6 +146,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             alignment_loss_scale = cfg.get('alignment_loss_scale', 1.0)
             self.frozen_model.enc_dec_model.forward_sum_loss = ForwardSumLoss(loss_scale=alignment_loss_scale)
             self.frozen_model.enc_dec_model.alignment_text_end_offset = cfg.get('alignment_text_end_offset', 0)
+            self.frozen_model.enc_dec_model.align_every_n_head = cfg.get('align_every_n_head', 1)
             self.frozen_model.enc_dec_model.alignment_decoder_layerids = cfg.get('alignment_decoder_layerids', list(range(0,12)))
             self.alignment_loss_start_step = cfg.get('alignment_loss_start_step', 0)
             self.alignment_loss_end_step = cfg.get('alignment_loss_end_step', float('inf'))
