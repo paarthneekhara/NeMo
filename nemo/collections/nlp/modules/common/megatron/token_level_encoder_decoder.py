@@ -554,6 +554,9 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
         cross_attention_prior=None,
         text_limits=None,
         global_step=None,
+        set_inference_key_value_memory=False,
+        decoder_max_sequence_len=None,
+        encoder_max_sequence_len=None,
     ):
         """
         Return value is per token / per dimension (i.e., non collapsed loss value)
@@ -616,6 +619,7 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
 
         if output_enc_hidden_only:
             # When pipeline parallel > 1 we need to make sure encoder exist (will be missing in decoder)
+            # Speecht5 should not go here for inference
             if enc_output is None and self.enc_dec_model.encoder is not None:
                 enc_output = self.enc_dec_model.encode(
                     enc_input=enc_input,
@@ -640,6 +644,9 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                 else:
                     dec_position_ids = None
                 dec_input = self.get_decoder_embeddings(dec_input_ids, dec_position_ids, token_type_ids)
+                if decoder_max_sequence_len or encoder_max_sequence_len:
+                    # In inference, only need last input
+                    dec_input = dec_input[-1,:,:].unsqueeze(0)
             else:
                 # Note: This is when the decoder itself is split across PP ranks.
                 dec_input = None
@@ -702,15 +709,18 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                 dec_cross_attention_relative_position_bias=decoder_cross_attention_relative_position_bias,
                 return_all_crossattention_probs=return_all_crossattention_probs,
                 batch_data=batch_data,
+                set_inference_key_value_memory=set_inference_key_value_memory,
+                decoder_max_sequence_len=decoder_max_sequence_len,
+                encoder_max_sequence_len=encoder_max_sequence_len,
             )
-            
+
             alignment_loss = None
             if self.post_process and self.add_decoder:
                 dec_output, enc_output = output  # [s, b, h]
                 if return_all_crossattention_probs:
                     dec_output, attention_scores = dec_output
                     attention_probs = [torch.softmax(attention_score, dim=-1) for attention_score in attention_scores]
-                    
+
                     if text_limits is not None and hasattr(self, "forward_sum_loss"):
                         attention_scores_filtered = [attention_scores[lidx] for lidx in self.alignment_decoder_layerids]
                         attention_scores_combined = torch.cat(attention_scores_filtered, dim=1)
@@ -871,7 +881,7 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                         hiddens_dict["output"] = token_logits
                         return hiddens_dict
                     else:
-                        return all_speech_logits, [token_logits, speech_logits, attention_probs]
+                        return all_speech_logits, [token_logits, speech_logits, attention_probs, enc_output]
 
             elif self.add_decoder and not self.add_encoder:
                 decoder_output, _ = output

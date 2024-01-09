@@ -158,6 +158,9 @@ class MegatronTransformerEncoderDecoderModule(MegatronModule):
         dec_self_attention_relative_position_bias=None,
         dec_cross_attention_relative_position_bias=None,
         return_all_crossattention_probs=False,
+        set_inference_key_value_memory=False,
+        decoder_max_sequence_len=None,
+        encoder_max_sequence_len=None,
     ):
         if self.decoder is None:
             raise ValueError(f"Cannot call .decode(...) when self.decoder is None.")
@@ -172,6 +175,9 @@ class MegatronTransformerEncoderDecoderModule(MegatronModule):
             dec_self_attention_relative_position_bias=dec_self_attention_relative_position_bias,
             dec_cross_attention_relative_position_bias=dec_cross_attention_relative_position_bias,
             return_all_crossattention_probs=return_all_crossattention_probs,
+            set_inference_key_value_memory=set_inference_key_value_memory,
+            decoder_max_sequence_len=decoder_max_sequence_len,
+            encoder_max_sequence_len=encoder_max_sequence_len,
         )
 
         return dec_output
@@ -194,6 +200,9 @@ class MegatronTransformerEncoderDecoderModule(MegatronModule):
         dec_cross_attention_relative_position_bias=None,
         batch_data=None,
         return_all_crossattention_probs=False,
+        set_inference_key_value_memory=False,
+        decoder_max_sequence_len=None,
+        encoder_max_sequence_len=None,
     ):
         # encoder
         if enc_output is None:
@@ -215,6 +224,8 @@ class MegatronTransformerEncoderDecoderModule(MegatronModule):
         if self.decoder is None or output_enc_hidden_only:
             return enc_output
 
+        # import ipdb; ipdb.set_trace()
+
         # decoder
         dec_output = self.decode(
             dec_input=dec_input,
@@ -229,6 +240,9 @@ class MegatronTransformerEncoderDecoderModule(MegatronModule):
             dec_self_attention_relative_position_bias=dec_self_attention_relative_position_bias,
             dec_cross_attention_relative_position_bias=dec_cross_attention_relative_position_bias,
             return_all_crossattention_probs=return_all_crossattention_probs,
+            set_inference_key_value_memory=set_inference_key_value_memory,
+            decoder_max_sequence_len=decoder_max_sequence_len,
+            encoder_max_sequence_len=encoder_max_sequence_len,
         )
 
         # if self.hiddens_module is not None enc_output is a dict, else it is a torch.tensor
