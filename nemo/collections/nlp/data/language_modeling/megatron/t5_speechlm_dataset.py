@@ -220,6 +220,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
 
         self.context_length = kwargs.pop('context_length', None) #only used in gpt dataset atm
         # self.attention_prior_strength = attention_prior_strength
+        self.transformer_type = kwargs.pop('transformer_type', 'T5')
 
         super().__init__(
             datasets=datasets,
@@ -326,9 +327,13 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 approx_answer_len = len(doc["answer"].split(' ')) + 3
 
             # Below if is only for GPT
-            if (
+            if (self.transformer_type == "GPT") and (
                 approx_context_len + approx_question_len + approx_answer_len < self.max_seq_length
             ):
+                self.examples.append(doc)
+            elif (self.transformer_type == "T5") and (
+                approx_context_len + approx_question_len < self.max_seq_length
+                and approx_answer_len < self.max_seq_length):
                 self.examples.append(doc)
             else:
                 logging.debug(f"skipped for {approx_context_len + approx_question_len} {approx_answer_len} len")
@@ -1028,6 +1033,11 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         return data_dict
 
 class GPTSpeechLMDataset(T5SpeechLMDataset):
+    def __init__(self, *args, **kwargs):
+        kwargs["transformer_type"] = "GPT"
+        super().__init__(*args, **kwargs)
+        
+
     def __getitem__(self, idx):
         doc = self.examples[idx]
         taskname = doc["taskname"]
