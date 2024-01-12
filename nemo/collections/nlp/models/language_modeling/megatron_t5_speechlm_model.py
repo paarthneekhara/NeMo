@@ -821,7 +821,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             speech_mask=speech_mask,
             cross_attention_prior=cross_attention_prior,
             text_limits=text_limits,
-            inference=True,
+            inference=False,
         )
 
         if batch_idx == 0 and self.is_rank_zero:
