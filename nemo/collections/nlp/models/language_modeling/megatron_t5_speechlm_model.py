@@ -1231,7 +1231,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             context_pattern=self.cfg.data.get('context_pattern', 'parallel'),
             context_duration_min=self.cfg.data.get('context_duration_min', 3.0),
             context_duration_max=self.cfg.data.get('context_duration_max', 5.0),
-            g2p=self.cfg.data.get('g2p', None)
+            g2p=self.cfg.data.get('g2p', None),
+            skip_datasets=self.cfg.data.get('skip_datasets', []),
         )
 
         rank = parallel_state.get_data_parallel_rank()

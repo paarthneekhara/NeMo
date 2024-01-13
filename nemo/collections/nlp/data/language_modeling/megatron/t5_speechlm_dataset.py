@@ -138,6 +138,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         context_pattern: Optional[str] = "parallel",
         context_duration_min: Optional[float] = 3.0,
         context_duration_max: Optional[float] = 5.0,
+        skip_datasets: Optional[List[str]] = [], # substrings of dataset names to skip
         **kwargs,
     ):
         """
@@ -221,6 +222,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.context_length = kwargs.pop('context_length', None) #only used in gpt dataset atm
         # self.attention_prior_strength = attention_prior_strength
         self.transformer_type = kwargs.pop('transformer_type', 'T5')
+        self.skip_datasets = skip_datasets
 
         super().__init__(
             datasets=datasets,
@@ -326,17 +328,27 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             else:
                 approx_answer_len = len(doc["answer"].split(' ')) + 3
 
-            # Below if is only for GPT
-            if (self.transformer_type == "GPT") and (
-                approx_context_len + approx_question_len + approx_answer_len < self.max_seq_length
-            ):
-                self.examples.append(doc)
-            elif (self.transformer_type == "T5") and (
-                approx_context_len + approx_question_len < self.max_seq_length
-                and approx_answer_len < self.max_seq_length):
-                self.examples.append(doc)
+            
+            skip_record = False
+            for skip_dataset in self.skip_datasets:
+                if skip_dataset in doc['answer']:
+                    skip_record = True
+
+            if not skip_record:
+                if (self.transformer_type == "GPT") and (
+                    approx_context_len + approx_question_len + approx_answer_len < self.max_seq_length
+                ):
+                    self.examples.append(doc)
+                elif (self.transformer_type == "T5") and (
+                    approx_context_len + approx_question_len < self.max_seq_length
+                    and approx_answer_len < self.max_seq_length):
+                    self.examples.append(doc)
+                else:
+                    logging.debug(f"skipped for {approx_context_len + approx_question_len} {approx_answer_len} len")
+                    skipped += 1
             else:
-                logging.debug(f"skipped for {approx_context_len + approx_question_len} {approx_answer_len} len")
+                print("Skipping", doc['answer'])
+                logging.debug(f"skipped for {doc['answer']} as it is in skip_datasets")
                 skipped += 1
 
         logging.info(f"After Process len(self.examples) {len(self.examples)} TTS = {tts} ASR = {asr}")
