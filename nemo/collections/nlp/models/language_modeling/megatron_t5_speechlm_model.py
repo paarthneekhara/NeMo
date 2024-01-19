@@ -31,8 +31,8 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.nlp.data.language_modeling.megatron.t5_speechlm_dataset import (
     T5SpeechLMDataset,
-    Lang
-    # phoneme_tokenizer,
+    Lang,
+    phoneme_tokenizer
 )
 from nemo.collections.nlp.data.language_modeling.megatron.t5_speechlm_tarred_dataset import T5SpeechLMTarredDataset
 from nemo.collections.nlp.models.language_modeling.megatron_base_prompt_learning_model import (
@@ -315,6 +315,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 cross_attention_prior=cross_attention_prior,
                 text_limits=text_limits,
                 global_step=self.global_step,
+                set_inference_key_value_memory=True if inference and inference_step == 0 else False,
+                decoder_max_sequence_len=decoder_max_sequence_len,
+                encoder_max_sequence_len=encoder_max_sequence_len,
             )
         else:
             with torch.autocast(device_type="cuda", dtype=self.autocast_dtype):
@@ -373,7 +376,10 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             override_config_path=t5_cfg,
             save_restore_connector=NLPSaveRestoreConnector(),
         )
-        self.frozen_model.tokenizer.update_phone_tokens()
+        
+        if not cfg.get('english_only_model', False):
+            self.frozen_model.tokenizer.update_phone_tokens()
+
         logging.info(f"self.frozen_model {self.frozen_model}")
 
     def fwd_bwd_step(self, dataloader_iter, batch_idx, forward_only):
@@ -1233,6 +1239,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             context_duration_max=self.cfg.data.get('context_duration_max', 5.0),
             g2p=self.cfg.data.get('g2p', None),
             skip_datasets=self.cfg.data.get('skip_datasets', []),
+            english_only_model=self.cfg.get('english_only_model', False),
         )
 
         rank = parallel_state.get_data_parallel_rank()
@@ -1473,18 +1480,31 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            nemo_sv_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
-            nemo_sv_model = nemo_sv_model.to(device)
-            nemo_sv_model.eval()
+            if 'nemo_sv_model' not in self.additional_models:
+                nemo_sv_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
+                nemo_sv_model = nemo_sv_model.to(device)
+                nemo_sv_model.eval()
+                self.additional_models['nemo_sv_model'] = nemo_sv_model
+            else:
+                nemo_sv_model = self.additional_models['nemo_sv_model']
 
-            asr_model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained(model_name="stt_multilingual_fastconformer_hybrid_large_pc_blend_eu")
-            asr_model = asr_model.to(device)
-            asr_model.eval()
+            if 'asr_model' not in self.additional_models:
+                asr_model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained(model_name="stt_multilingual_fastconformer_hybrid_large_pc_blend_eu")
+                asr_model = asr_model.to(device)
+                asr_model.eval()
+                self.additional_models['asr_model'] = asr_model
+            else:
+                asr_model = self.additional_models['asr_model']
+
             asr_model_zh = None
             if Lang.zh.value in lang:
-                asr_model_zh = nemo_asr.models.EncDecRNNTModel.from_pretrained(model_name="stt_zh_conformer_transducer_large")
-                asr_model_zh = asr_model_zh.to(device)
-                asr_model_zh.eval()
+                if 'asr_model_zh' not in self.additional_models:
+                    asr_model_zh = nemo_asr.models.EncDecRNNTModel.from_pretrained(model_name="stt_zh_conformer_transducer_large")
+                    asr_model_zh = asr_model_zh.to(device)
+                    asr_model_zh.eval()
+                    self.additional_models['asr_model_zh'] = asr_model_zh
+                else:
+                    asr_model_zh = self.additional_models['asr_model_zh']
             _exp_dir_path = self.logger.log_dir
             _exp_dir_path = _exp_dir_path + '/Sample_Audios'
             if not os.path.exists(_exp_dir_path):

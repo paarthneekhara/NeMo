@@ -50,39 +50,40 @@ from nemo.collections.common.tokenizers.text_to_speech.tokenizer_utils import an
 __all__ = ['T5SpeechLMDataset']
 
 
-# @dataclass
-# class G2PConfig:
-#     _target_: str = "nemo.collections.tts.g2p.models.en_us_arpabet.EnglishG2p"
-#     phoneme_dict: str = "scripts/tts_dataset_files/cmudict-0.7b_nv22.10"
-#     heteronyms: str = "scripts/tts_dataset_files/heteronyms-052722"
-#     phoneme_probability: float = 0.5
+@dataclass
+class G2PConfig:
+    _target_: str = "nemo.collections.tts.g2p.models.en_us_arpabet.EnglishG2p"
+    phoneme_dict: str = "scripts/tts_dataset_files/cmudict-0.7b_nv22.10"
+    heteronyms: str = "scripts/tts_dataset_files/heteronyms-052722"
+    phoneme_probability: float = 0.5
 
-# @dataclass
-# class TextTokenizer:
-#     _target_: str = "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.EnglishPhonemesTokenizer"
-#     punct: bool = True
-#     stresses: bool = True
-#     chars: bool = True
-#     apostrophe: bool = True
-#     pad_with_space: bool = True
-#     add_blank_at: bool = True
-#     g2p: G2PConfig = G2PConfig()
+@dataclass
+class TextTokenizer:
+    _target_: str = "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.EnglishPhonemesTokenizer"
+    punct: bool = True
+    stresses: bool = True
+    chars: bool = True
+    apostrophe: bool = True
+    pad_with_space: bool = True
+    add_blank_at: bool = True
+    g2p: G2PConfig = G2PConfig()
 
-# @dataclass
-# class TextTokenizerConfig:
-#     text_tokenizer: TextTokenizer = TextTokenizer()
+@dataclass
+class TextTokenizerConfig:
+    text_tokenizer: TextTokenizer = TextTokenizer()
 
-# def _get_default_text_tokenizer_conf():
-#     text_tokenizer: TextTokenizerConfig = TextTokenizerConfig()
-#     return OmegaConf.create(OmegaConf.to_yaml(text_tokenizer))
+def _get_default_text_tokenizer_conf():
+    text_tokenizer: TextTokenizerConfig = TextTokenizerConfig()
+    return OmegaConf.create(OmegaConf.to_yaml(text_tokenizer))
 
 def pad_text_to_speech_dims(text_tensor, pad_id, pad_size=7):
     token_len = text_tensor.shape[0]
     empty_padding = torch.ones((pad_size, token_len), dtype=text_tensor.dtype, device=text_tensor.device) * pad_id
     return torch.cat((text_tensor.unsqueeze(0), empty_padding), dim=0)
 
-# tokenizer_config = _get_default_text_tokenizer_conf()
-# phoneme_tokenizer = instantiate(tokenizer_config).text_tokenizer
+# For legacy models, trained with this phoneme tokenizer
+tokenizer_config = _get_default_text_tokenizer_conf()
+phoneme_tokenizer = instantiate(tokenizer_config).text_tokenizer
 
 class Lang(enum.Enum):
     en = 1
@@ -139,6 +140,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         context_duration_min: Optional[float] = 3.0,
         context_duration_max: Optional[float] = 5.0,
         skip_datasets: Optional[List[str]] = [], # substrings of dataset names to skip
+        english_only_model: Optional[bool] = False,
         **kwargs,
     ):
         """
@@ -193,6 +195,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.context_pattern = context_pattern
         self.context_duration_min = context_duration_min
         self.context_duration_max = context_duration_max
+        self.english_only_model = english_only_model
+
         self.g2p = {"fr": lambda x: x}
         if kwargs.get("g2p", None):
             if "english" in kwargs["g2p"]:
@@ -605,14 +609,18 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         return input_ids
 
     def _get_phoneme_tokens(self, text, lang="en"):
-        text = any_locale_text_preprocessing(text)
-        input_ids = self.g2p[lang](text)
-        input_ids_adjusted = []
-        for i in input_ids:
-            input_ids_adjusted.append(f"p{{{i}}}")
-        input_ids_adjusted = self.tokenizer.text_to_ids("".join(input_ids_adjusted))
-        # input_ids_adjusted = [_id + self.lm_vocab_size for _id in input_ids]
-        return input_ids_adjusted
+        if self.english_only_model:
+            input_ids = phoneme_tokenizer.encode(text)
+            input_ids_adjusted = [_id + self.lm_vocab_size for _id in input_ids]
+            return input_ids_adjusted
+        else:
+            text = any_locale_text_preprocessing(text)
+            input_ids = self.g2p[lang](text)
+            input_ids_adjusted = []
+            for i in input_ids:
+                input_ids_adjusted.append(f"p{{{i}}}")
+            input_ids_adjusted = self.tokenizer.text_to_ids("".join(input_ids_adjusted))
+            return input_ids_adjusted
 
     def _pad_wav_to_multiple(self, wav):
         if self.pad_multiple > 1:
