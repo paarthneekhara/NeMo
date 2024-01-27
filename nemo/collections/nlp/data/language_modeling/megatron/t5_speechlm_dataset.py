@@ -195,6 +195,9 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             if "mandarin" in kwargs["g2p"]:
                 mandarin_g2p = instantiate(kwargs["g2p"]["mandarin"])
                 self.g2p["zh"] = lambda x: mandarin_g2p(x)
+            if "german" in kwargs["g2p"]:
+                german_g2p = instantiate(kwargs["g2p"]["german"])
+                self.g2p["de"] = lambda x: german_g2p(x)
 
         # Initialize sup_data_path, sup_data_types and run preprocessing methods for every supplementary data type
         if sup_data_path is not None:
