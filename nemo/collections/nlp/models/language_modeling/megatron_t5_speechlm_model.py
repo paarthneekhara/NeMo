@@ -338,6 +338,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             t5_cfg.max_position_embeddings = cfg.data.max_seq_length
             if cfg.get('override_token_model', None):
                 t5_cfg.tokenizer.model = cfg['override_token_model']
+            if cfg.get('override_tokenizer_vocab_file', None):
+                t5_cfg.tokenizer.vocab_file = cfg['override_tokenizer_vocab_file']
 
         if cfg.get('train_from_scratch', False):
             print("Training from scratch!")
