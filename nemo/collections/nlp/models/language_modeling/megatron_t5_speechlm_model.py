@@ -370,10 +370,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             t5_cfg.use_flash_attention = cfg.get('use_flash_attention', False)
             if cfg.get('override_token_model', None):
                 t5_cfg.tokenizer.model = cfg['override_token_model']
+            if cfg.get('override_tokenizer_vocab_file', None):
+                t5_cfg.tokenizer.vocab_file = cfg['override_tokenizer_vocab_file']
 
         if cfg.get('train_from_scratch', False):
             print("Training from scratch!")
-            
             # Defaults for 220m model
             # To override any of these, add +model.override_<key>=<value> to the config file.
             # Eg. +model.override_hidden_size=1024
