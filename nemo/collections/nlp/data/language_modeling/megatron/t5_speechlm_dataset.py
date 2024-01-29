@@ -325,8 +325,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
 
             if not skip_record:        
                 if (
-                    approx_context_len + approx_question_len < self.max_seq_length
-                    and approx_answer_len < self.max_seq_length
+                    self.min_seq_length < approx_context_len + approx_question_len < self.max_seq_length
+                    and self.min_seq_length < approx_answer_len < self.max_seq_length
                 ):
                     self.examples.append(doc)
                 else:
@@ -465,12 +465,22 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 answer_text_ids += self.tokenizer.text_to_ids(T5Sentinel.END.value)
 
         # Skip example if the final length doesn't fit length requirements even after truncation
-        if (
+
+        if not (
             self.min_seq_length
             <= self._get_element_len(context_and_question_tokens) + self._get_element_len(virtual_tokens)
             <= self.max_seq_length
             and self.min_seq_length <= self._get_element_len(answer_text_ids) <= self.max_seq_length
-        ):
+        ):  
+            print("self.min_seq_length", self.min_seq_length)
+            print("self.max_seq_length", self.max_seq_length)
+            print("self._get_element_len(context_and_question_tokens)", self._get_element_len(context_and_question_tokens))
+            print("self._get_element_len(virtual_tokens)", self._get_element_len(virtual_tokens))
+            print("self._get_element_len(answer_text_ids)", self._get_element_len(answer_text_ids))
+            raise ValueError("Example length does not fit length requirements even after truncation")
+            
+        else:
+            # Valid example
             if self.virtual_prompt_source == VirtualPromptSource.PROMPT_ENCODER:
                 taskname_id = self.tokenizer.text_to_ids(taskname)
             elif (
