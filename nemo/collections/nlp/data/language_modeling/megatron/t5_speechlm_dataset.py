@@ -771,6 +771,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         elif doc[f"{field}_type"] == 'AUDIOCODEC':
             reference_codec_paths = field_data.split(";")
             reference_codec_path = rng.choice(reference_codec_paths)
+            if self.codec_folder is not None:
+                reference_codec_path = self.codec_folder / reference_codec_path
             field_tokens = torch.load(reference_codec_path).long()
             field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
             field_tokens = [field_tokens]
@@ -778,6 +780,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         elif doc[f"{field}_type"] == 'REFSPEAKERCODEC':
             reference_codec_paths = field_data.split(";")
             reference_codec_path = rng.choice(reference_codec_paths)
+            if self.codec_folder is not None:
+                reference_codec_path = self.codec_folder / reference_codec_path
             field_tokens = torch.load(reference_codec_path).long()
             field_tokens[0] = (field_tokens[0] + self.speech_offset).long()
             _min_len = int(self.context_duration_min * self.codebook_fps)
