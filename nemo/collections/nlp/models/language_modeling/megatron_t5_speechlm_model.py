@@ -341,26 +341,25 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             if cfg.get('override_tokenizer_vocab_file', None):
                 t5_cfg.tokenizer.vocab_file = cfg['override_tokenizer_vocab_file']
 
+        # To override any of these, add +model.override_<key>=<value> to the config file.
+        # Eg. +model.override_hidden_size=1024
+        # Besides dropout, change other params only when training from scratch.
+        overide_keys = [
+            'hidden_size', # 768
+            'num_layers', # 12
+            'num_attention_heads', # 12
+            'hidden_dropout', # 0.1
+            'attention_dropout', # 0.1
+            'kv_channels' # 64
+            'ffn_hidden_size', # 2048
+        ]
+        # Defaults for 220m model
+        for k in overide_keys:
+            if cfg.get(f'override_{k}') is not None:
+                t5_cfg[k] = cfg.get(f'override_{k}')
+
         if cfg.get('train_from_scratch', False):
             print("Training from scratch!")
-            
-            # Defaults for 220m model
-            # To override any of these, add +model.override_<key>=<value> to the config file.
-            # Eg. +model.override_hidden_size=1024
-            overide_keys = [
-                'hidden_size', # 768
-                'num_layers', # 12
-                'num_attention_heads', # 12
-                'hidden_dropout', # 0.1
-                'attention_dropout', # 0.1
-                'kv_channels' # 64
-                'ffn_hidden_size', # 2048
-            ]
-            # Defaults for 220m model
-            for k in overide_keys:
-                if cfg.get(f'override_{k}') is not None:
-                    t5_cfg[k] = cfg.get(f'override_{k}')
-
             self.frozen_model = MegatronT5Model(t5_cfg, trainer=trainer)
             num_params = sum(p.numel() for p in self.frozen_model.parameters() if p.requires_grad)
             print(f"Number of parameters: {num_params}")
@@ -1027,6 +1026,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             pad_multiple=self.cfg.data.get('pad_multiple', 1),
             pitch_augment=self.cfg.data.get('pitch_augment', None),
             sup_data_path=self.cfg.data.get('sup_data_path', '/sup_data_path'),
+            codec_folder=self.cfg.data.get('codec_folder', None),
             speech_offset=self.cfg.data.get('speech_offset', None),
             train_task=self.cfg.data.get('train_task', "tts"),
             seq_pattern=self.cfg.get('seq_pattern', 'delay_parallel'),
@@ -1044,7 +1044,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             context_duration_max=self.cfg.data.get('context_duration_max', 5.0),
             g2p=self.cfg.data.get('g2p', None),
             skip_datasets=self.cfg.data.get('skip_datasets', []),
-            english_only_model=self.cfg.get('english_only_model', False),
+            english_only_model=self.cfg.get('english_only_model', False)
         )
 
         rank = parallel_state.get_data_parallel_rank()
