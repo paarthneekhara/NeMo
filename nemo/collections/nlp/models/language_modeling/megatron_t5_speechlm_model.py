@@ -1522,8 +1522,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 nemo_sv_model = self.additional_models['nemo_sv_model']
 
             if 'asr_model' not in self.additional_models:
-                # asr_model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained(model_name="stt_multilingual_fastconformer_hybrid_large_pc_blend_eu")
-                asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(model_name="stt_en_conformer_transducer_large")
+                asr_model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.from_pretrained(model_name="stt_multilingual_fastconformer_hybrid_large_pc_blend_eu")
                 asr_model = asr_model.to(device)
                 asr_model.eval()
                 self.additional_models['asr_model'] = asr_model
