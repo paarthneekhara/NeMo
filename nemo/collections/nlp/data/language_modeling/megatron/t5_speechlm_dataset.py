@@ -327,9 +327,9 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 # approx len is equal to num of characters
                 approx_question_len = len(question_in_manifest)
 
-            if doc["answer_type"] in ["SPEECH", "AUDIOCODEC"]:
+            if doc["answer_type"] in ["SPEECH", "AUDIOCODEC", "CONTEXTANSWER"]:
                 assert "answer_duration" in doc, f"answer_duration key not in document {doc}"
-                approx_answer_len = doc["answer_duration"] * (self.codebook_fps + 1)
+                approx_answer_len = doc["answer_duration"] * (self.codebook_fps + 1) + 3 # 3 is for BOS, EOS and padding
                 if self.seq_pattern == "delay_parallel":
                     # In delay parallel, there is padding so add 8 frames
                     approx_answer_len = approx_answer_len + self.num_speech_codebooks
