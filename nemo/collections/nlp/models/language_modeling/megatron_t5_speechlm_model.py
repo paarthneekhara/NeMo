@@ -1168,7 +1168,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             )
 
             end_inference_loop_at = None
-            for t in range(dec_input.shape[2] - 1):
+            start_step = self.decoder_context_len + 1
+            for t in range(start_step, dec_input.shape[2] - 1):
                 if t % 10 == 0:
                     print("Timestep {}".format(t))
 
