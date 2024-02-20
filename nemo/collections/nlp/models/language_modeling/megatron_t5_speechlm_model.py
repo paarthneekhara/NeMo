@@ -1173,7 +1173,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 if t % 10 == 0:
                     print("Timestep {}".format(t))
 
-                if t == end_inference_loop_at:
+                if (end_inference_loop_at is not None) and (t >= end_inference_loop_at):
                     print("All ends detected")
                     break
 
@@ -1237,6 +1237,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                             end_indices[_b] = t
                             if len(end_indices) == token_preds.shape[0]:
                                 end_inference_loop_at = t + self.num_speech_codebooks
+                                
 
                 output_token_list.append(output_tokens_curr_timestep)
 
@@ -1287,14 +1288,14 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 audio_len = (labels[i][0] != 0).sum().item()
                 step = batch_idx * batch_size + i
                 if torch.count_nonzero(speech_mask) > 0:
-                    dec_input_to_1024 = self.convert_tokens_to_range(dec_input_raw[i, :, 0:audio_len])
+                    dec_input_to_1024 = self.convert_tokens_to_range(dec_input_raw[i, :, self.decoder_context_len:audio_len])
                     dec_input_wav = self.decode_wav_from_codec_model(dec_input_to_1024)
                     self.logger.experiment.add_audio("Inf Dec Input Wav", dec_input_wav, step, self.sample_rate)
 
                     predicted_tokens = output_tokens_combined[i]
                     if i in end_indices:
                         print("Clipping until end index for audio", i)
-                        predicted_tokens = predicted_tokens[:, 0 : end_indices[i] + 1]  # trim to audio length
+                        predicted_tokens = predicted_tokens[:, 0 : end_indices[i] + 1 - self.decoder_context_len]  # trim to audio length
 
                     pred_img = predicted_tokens.data.cpu().float().numpy()
                     dec_inp_img = dec_input_to_1024.data.cpu().float().numpy()
