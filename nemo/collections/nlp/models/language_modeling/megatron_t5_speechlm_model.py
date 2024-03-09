@@ -624,7 +624,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                                             dataformats="HWC",
                                         )
                                         attention_sliced_list.append(attention_probs[
-                                            0, _i, 0 : audio_len, text_si: text_ei
+                                            0, _i, self.decoder_context_len : audio_len, text_si: text_ei
                                         ])
                                 attention_sliced = torch.stack(attention_sliced_list)
                                 attention_sliced = torch.mean(attention_sliced, 0)
@@ -840,6 +840,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             _,
         ) = batch
         # loss_mask (b, t)
+
+        
         # does not use dataloader_iter due to device placement issues arising from PTL
         mode = self.training
         self.eval()
@@ -971,7 +973,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                                 #     phoneme_seq=None if self.plot_alignments_sliced else [question_si]
                                 # )
                                 attention_sliced_list.append(attention_probs[
-                                    0, _i, 0 : audio_len, text_si : text_ei
+                                    0, _i, self.decoder_context_len : audio_len, text_si : text_ei
                                 ])
                         attention_sliced = torch.stack(attention_sliced_list)
                         attention_sliced = torch.mean(attention_sliced, 0)

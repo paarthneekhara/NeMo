@@ -81,11 +81,12 @@ def main():
     parser.add_argument('--exp_name', type=str, default="2024-01-16_17-30-29")
     parser.add_argument('--exp_base_dir', type=str, default="/Data/Experiments/EVAL_NEMO_CODEC/temp08/jason_challenging_texts_ctc_corrected")
     parser.add_argument('--manifest_path', type=str, default="/Data/CodecDatasets/updatedcodecs/manifests/challenging_nemo_codec_phoneme.json")
+    parser.add_argument('--eval_type', type=str, default="pred") # pred or gt
     parser.add_argument('--no_subdir', type=str, default="false")
     args = parser.parse_args()
 
     audio_file_lists = find_sample_audios(args.exp_name, args.exp_base_dir, no_subdir=args.no_subdir=="true")
-    pred_audio_files = audio_file_lists['pred']
+    pred_audio_files = audio_file_lists[args.eval_type]
 
     manifest_records = read_manifest(args.manifest_path)
     max_answer_duration = 0
