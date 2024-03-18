@@ -142,7 +142,7 @@ def main():
         detailed_wer = word_error_rate_detail(hypotheses=[pred_text], references=[gt_text], use_cer=False)
         print("CER:", detailed_cer[0])
         wer_ranked_list.append(
-            (detailed_cer[0], detailed_wer[0], gt_text, pred_text, pred_audio_files[ridx])
+            [detailed_cer[0], detailed_wer[0], gt_text, pred_text, pred_audio_files[ridx]]
         )
 
         if args.eval_speaker == "true":
@@ -159,6 +159,7 @@ def main():
             wavlm_similarity = cosine_sim(wavlm_embeddings[0], wavlm_embeddings[1]).item()
             wavlm_similarities.append(wavlm_similarity)
             print("WAVLM Similarity:", wavlm_similarity)
+            wer_ranked_list[-1] = wer_ranked_list[-1] + [wavlm_similarity]
 
     
     # Reverse sort by CER
