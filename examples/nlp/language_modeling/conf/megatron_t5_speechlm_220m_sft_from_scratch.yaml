@@ -75,6 +75,7 @@ model:
   train_from_scratch: true
   override_tokenizer_vocab_file: ???
   use_flash_attention: true
+  lm_vocab_size: 30000
 
   frozen_model:
     # micro_batch_size: null
@@ -171,7 +172,6 @@ model:
     num_workers: 4
     pin_memory: true
     speech_offset: 30128
-    lm_vocab_size: 30000
     train_task: asr
     num_speech_codebooks: 8
     codebook_fps: 86
