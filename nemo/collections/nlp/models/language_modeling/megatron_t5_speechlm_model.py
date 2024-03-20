@@ -131,7 +131,6 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             self.decoder_context_len = int(self.codebook_fps * self.context_duration_min)
 
         self.context_pattern = cfg.data.get('context_pattern', 'parallel')
-        
 
         self.speech_offset = speech_offset
         self.speech_codebook_size = speech_codebook_size
@@ -363,7 +362,12 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
         # TODO: Fix this once apex patches FusedScaledMaskedSoftmax.
         # This is a workaround for the fact that `masked_softmax_fusion` has issues with certain input sizes that may be present while finetuning.
-        t5_cfg = MegatronT5Model.restore_from(cfg.get('language_model_path'), trainer=trainer, return_config=True)
+        if cfg.get('language_model_path', None):
+            t5_cfg = MegatronT5Model.restore_from(cfg.get('language_model_path'), trainer=trainer, return_config=True)
+        elif cfg.get('frozen_model', None):
+            t5_cfg = cfg["frozen_model"]
+        else:
+            raise ValueError("T5-TTS requires either 'language_model_path' or 'frozen_model' in its config.")
         OmegaConf.set_struct(t5_cfg, True)
         with open_dict(t5_cfg):
             if hasattr(t5_cfg, 'encoder') and hasattr(t5_cfg, 'decoder'):
@@ -841,7 +845,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         ) = batch
         # loss_mask (b, t)
 
-        
+
         # does not use dataloader_iter due to device placement issues arising from PTL
         mode = self.training
         self.eval()
@@ -1404,7 +1408,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             encoder_output = None
             # start_step = self.decoder_context_len + 1
             start_step = 0
-            
+
             for t in range(start_step, dec_input.shape[2] - 1):
                 if t % 100 == 0:
                     logging.info("Timestep {}".format(t))
@@ -1666,7 +1670,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         self.logger.experiment.add_audio("Context Wav", _context_wav, step, self.sample_rate)
                         context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{step}.wav')
                         sf.write(context_wav_fp, _context_wav.cpu().numpy(), self.sample_rate)
-                    
+
                     spk_embedding_context = nemo_sv_model.get_embedding(context_wav_fp)
                     spk_embedding_context = spk_embedding_context.cpu().detach().numpy().flatten()
                     pred_similarity_context = np.dot(spk_embedding_context, spk_embedding_pred) / (

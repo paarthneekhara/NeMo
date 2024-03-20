@@ -201,7 +201,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.phoneme_tokenizer = None
         if english_only_model:
             self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf()).text_tokenizer
-        
+
         self.context_conditioning = context_conditioning
         if self.context_conditioning == "decoder":
             assert self.context_duration_min == self.context_duration_max, "For decoder conditioning, context_duration_min and context_duration_max should be same"
@@ -304,7 +304,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 doc['answer_type'] = "CONTEXTANSWER"
                 doc['context_type'] = "DUMMYCONTEXT"
                 doc['context'] = "DUMMYCONTEXT"
-                
+
             question_in_manifest = doc['question']
 
             if "Text to speech this" in question_in_manifest or "Phoneme TTS" in question_in_manifest:
@@ -832,14 +832,17 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                     new_field_tokens.append(field_tokens[_c, st:et])
                 field_tokens = torch.stack(new_field_tokens, dim=0)
             field_tokens = [field_tokens]
-        
+
         elif doc[f"{field}_type"] == 'DUMMYCONTEXT':
             field_tokens = torch.zeros(self.num_speech_codebooks, 1).long()
             return [field_tokens]
-        
+
         elif doc[f"{field}_type"] == 'CONTEXTANSWER':
             # Both Context and Answer are in the field
             context_codec_path, answer_codec_path = field_data.split(";")
+            if self.codec_folder is not None:
+                context_codec_path = self.codec_folder / context_codec_path
+                answer_codec_path = self.codec_folder / answer_codec_path
             context_tokens = torch.load(context_codec_path).long()
             answer_tokens = torch.load(answer_codec_path).long()
             context_tokens[0] = (context_tokens[0] + self.speech_offset).long()
@@ -1085,7 +1088,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         if dec_labels_mask is not None and self.context_conditioning == 'decoder':
             # Mask out context tokens from loss computation. +1 for bos/pad in the beginning
             dec_labels_mask[:,:self.decoder_context_len + 1] = 0
-        
+
         data_dict = {
             "taskname_id": taskname_ids,
             "virtual_tokens": torch.stack(virtual_tokens_list),
