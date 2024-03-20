@@ -5,7 +5,9 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate_detail
 import string
 import pprint
-
+from transformers import AutoFeatureExtractor, WavLMForXVector
+import librosa
+import torch
 
 def _find_audio_files(audio_dir):
     audio_file_lists = {
@@ -83,10 +85,12 @@ def main():
     parser.add_argument('--manifest_path', type=str, default="/Data/CodecDatasets/updatedcodecs/manifests/challenging_nemo_codec_phoneme.json")
     parser.add_argument('--eval_type', type=str, default="pred") # pred or gt
     parser.add_argument('--no_subdir', type=str, default="false")
+    parser.add_argument('--eval_speaker', type=str, default="false") # false or true
     args = parser.parse_args()
 
     audio_file_lists = find_sample_audios(args.exp_name, args.exp_base_dir, no_subdir=args.no_subdir=="true")
     pred_audio_files = audio_file_lists[args.eval_type]
+    
 
     manifest_records = read_manifest(args.manifest_path)
     max_answer_duration = 0
@@ -108,10 +112,19 @@ def main():
     asr_model = asr_model.to(device)
     asr_model.eval()
 
+    if args.eval_speaker == "true":
+        wavlm_feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/wavlm-base-plus-sv")
+        wavlm_model = WavLMForXVector.from_pretrained("microsoft/wavlm-base-plus-sv")
+        wavlm_model = wavlm_model.to(device)
+        wavlm_model.eval()
+        gt_audio_files = audio_file_lists['gt']
+        assert len(gt_audio_files) == len(pred_audio_files), "Len GT Audio Files: {} Len Pred Audio Files: {}".format(len(gt_audio_files), len(pred_audio_files))
+
     pred_texts = []
     gt_texts = []
     wer_ranked_list = []
     all_cers = []
+    wavlm_similarities = []
     for ridx, record in enumerate(manifest_records[:len(pred_audio_files)]):
         gt_text = process_text(record['text'])
         if contains_invalid_text(gt_text):
@@ -129,8 +142,25 @@ def main():
         detailed_wer = word_error_rate_detail(hypotheses=[pred_text], references=[gt_text], use_cer=False)
         print("CER:", detailed_cer[0])
         wer_ranked_list.append(
-            (detailed_cer[0], detailed_wer[0], gt_text, pred_text, pred_audio_files[ridx])
+            [detailed_cer[0], detailed_wer[0], gt_text, pred_text, pred_audio_files[ridx]]
         )
+
+        if args.eval_speaker == "true":
+            pred_wav_np_16, _ = librosa.load(pred_audio_files[ridx], sr=16000)
+            gt_audio_file = record['audio_filepath']
+            print("gt_audio_file:", gt_audio_file)
+            # gt_audio_file = gt_audio_files[ridx]
+            gt_wav_np_16, _ = librosa.load(gt_audio_file, sr=16000)
+            wavlm_inputs = wavlm_feature_extractor([pred_wav_np_16, gt_wav_np_16], sampling_rate=16000, return_tensors="pt", padding=True)
+            wavlm_inputs = {k: v.to(device) for k, v in wavlm_inputs.items()}
+            wavlm_embeddings = wavlm_model(**wavlm_inputs).embeddings
+            wavlm_embeddings = torch.nn.functional.normalize(wavlm_embeddings, dim=-1).cpu()
+            cosine_sim = torch.nn.CosineSimilarity(dim=-1)
+            wavlm_similarity = cosine_sim(wavlm_embeddings[0], wavlm_embeddings[1]).item()
+            wavlm_similarities.append(wavlm_similarity)
+            print("WAVLM Similarity:", wavlm_similarity)
+            wer_ranked_list[-1] = wer_ranked_list[-1] + [wavlm_similarity]
+
     
     # Reverse sort by CER
     # Print challenging texts with highest CER
@@ -169,10 +199,13 @@ def main():
             'words' : words,
             'ins' : ins_rate,
             'del' : del_rate,
-            'sub' : sub_rate
+            'sub' : sub_rate,
         },
         'detailed' : wer_ranked_list
     }
+
+    if args.eval_speaker == "true":
+        all_metrics['average']['wavlm_similarity'] = sum(wavlm_similarities) / len(wavlm_similarities)
 
 
     pprint.pprint(all_metrics['average'])
