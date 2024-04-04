@@ -792,7 +792,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 instruction_tokens = self._get_text_tokens("Edit Speech")
                 field_tokens = self._get_phoneme_tokens(_text.replace("Edit Speech ", ""))
                 field_tokens = instruction_tokens + field_tokens
-            elif _text.startswith("| Language"):
+            elif _text.startswith("TEXT CONTEXT:"):
                 # Speaker id conditioning
                 field_tokens = self._get_text_tokens(_text)
                 # pad field tokens to fixed length
