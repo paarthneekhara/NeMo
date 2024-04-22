@@ -389,6 +389,7 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                 moe_dropout=decoder_cfg.get('moe_dropout', 0.0),
                 position_embedding_type=decoder_cfg.get('position_embedding_type', 'learned_absolute'),
                 use_flash_attention=decoder_cfg.get('use_flash_attention', False),
+                layer_type=decoder_cfg.get('layer_type', LayerType.decoder),
             )
 
         hiddens_module = get_hiddens_module(hiddens_cfg, model_parallel_cfg=config)
@@ -858,8 +859,12 @@ class MegatronTokenLevelEncoderDecoderSpeechLLMModule(MegatronTokenLevelEncoderD
                 else:
                     dec_position_ids = None
                 dec_input = self.get_decoder_embeddings(dec_input_ids, dec_position_ids, token_type_ids)
-                if decoder_max_sequence_len or encoder_max_sequence_len:
-                    # In inference, only need last input
+                if not set_inference_key_value_memory and (decoder_max_sequence_len or encoder_max_sequence_len):
+                    # In inference
+                    # On step 0 when set_inference_key_value_memory is True, we need all inputs in case
+                    # we are using decoder context
+                    # Else on step >= 1, only need last input
+                    logging.debug("Clipping dec_input")
                     dec_input = dec_input[-1, :, :].unsqueeze(0)
             else:
                 # Note: This is when the decoder itself is split across PP ranks.
