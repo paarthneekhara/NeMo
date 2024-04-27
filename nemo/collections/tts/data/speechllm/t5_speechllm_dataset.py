@@ -370,9 +370,14 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                     < self.max_seq_length
                 ):
                     self.examples.append(doc)
-                elif (self.transformer_type == "T5") and (
+                elif (self.transformer_type == "T5") and (self.context_conditioning == "encoder") and (
                     self.min_seq_length < approx_context_len + approx_question_len < self.max_seq_length
                     and self.min_seq_length < approx_answer_len < self.max_seq_length
+                ):
+                    self.examples.append(doc)
+                elif (self.transformer_type == "T5") and (self.context_conditioning == "decoder") and (
+                    self.min_seq_length < approx_question_len < self.max_seq_length
+                    and self.min_seq_length < approx_answer_len + approx_context_len + 3 < self.max_seq_length
                 ):
                     self.examples.append(doc)
                 else:
