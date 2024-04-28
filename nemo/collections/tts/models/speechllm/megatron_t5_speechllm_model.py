@@ -882,6 +882,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         ) = batch
         # loss_mask (b, t)
         # does not use dataloader_iter due to device placement issues arising from PTL
+
         mode = self.training
         self.eval()
         gbs = self.cfg.get('validation_global_batch_size', self.cfg.global_batch_size)
@@ -893,7 +894,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
         if batch_idx == 0 and self.is_rank_zero:
             self.frozen_model.enc_dec_model.logging_step = True
-
+        
         labels_original = labels.clone()  # (b, 8, t)
         output_loss, _, output_logits = self.forward(
             virtual_tokens,
@@ -1406,7 +1407,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
             end_indices = {}
             # pad dec_input (B, 8, T) to 1000 timesteps
-            max_inference_timesteps = self.cfg.get('max_inference_timesteps', 1200)
+            max_inference_timesteps = self.cfg.get('max_inference_timesteps', 2000)
             dec_input = torch.nn.functional.pad(dec_input, (0, max_inference_timesteps - dec_input.shape[2]), value=0)
             dec_input[:, :, self.decoder_context_len + 1:].zero_()
             dec_input_mask = torch.nn.functional.pad(
@@ -1598,12 +1599,12 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     dec_input_wav = self.decode_wav_from_codec_model(dec_input_to_1024_answer)
                     self.logger.experiment.add_audio("Inf Dec Input Wav", dec_input_wav, step, self.sample_rate)
 
-                    if self.decoder_context_len > 0:
-                        context_tokens = dec_input_to_1024[:, :self.decoder_context_len+1]
-                        context_wav = self.decode_wav_from_codec_model(context_tokens)
-                        self.logger.experiment.add_audio("Dec Context Wav", context_wav, step, self.sample_rate)
-                        context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{step}.wav')
-                        sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
+                    # if self.decoder_context_len > 0:
+                    #     context_tokens = dec_input_to_1024[:, :self.decoder_context_len+1]
+                    #     context_wav = self.decode_wav_from_codec_model(context_tokens)
+                    #     self.logger.experiment.add_audio("Inf Dec Context Wav", context_wav, step, self.sample_rate)
+                    #     context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{step}.wav')
+                    #     sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
 
                     predicted_tokens = output_tokens_combined[i]  # Should not contain context even if decoder context
                     if i in end_indices:
@@ -1670,8 +1671,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         context_wav = None
                         spk_embedding_context = spk_embedding_gt
                         # raise NotImplementedError("During prediction, there was no context found.")
-                    if context_wav:
-                        self.logger.experiment.add_audio("Context Wav", context_wav, step, self.sample_rate)
+                    if context_wav is not None:
+                        self.logger.experiment.add_audio("Inf Context Wav", context_wav, step, self.sample_rate)
                         context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{step}.wav')
                         sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
 
