@@ -9,6 +9,11 @@ import random
 import matplotlib.pyplot as plt
 import numpy as np
 
+manifest_path = "/datap/misc/speechllm_codecdatasets/manifests/LRHM_train_nemo_codec_bw_6.0_phoneme_tts.json"
+codec_model_path = "/datap/misc/Checkpoints/SpeechCodec.nemo"
+
+resampler = Resample(orig_freq=22050, new_freq=16000).cuda()
+
 def plot_similarity_historgram(records):
     similarities = [r['similarity'] for r in records]
     plt.hist(similarities, bins=20)
@@ -21,7 +26,6 @@ def plot_similarity_historgram(records):
     plt.clf()
     plt.close()
     
-
 def read_manifest(manifest_path):
     records = []
     with open(manifest_path, 'r') as f:
@@ -41,36 +45,12 @@ def write_manifest(manifest_path, records):
         print("Wrote {} records to: {}".format(len(records), manifest_path))
 
 
-def get_speaker_info_from_record(record):
-    if "/train-clean-360" in record["audio_filepath"]:
-        language = "en"
-        speaker_name = record["audio_filepath"].split("train-clean-360/")[1].split("/")[0]
-        dataset_name = "Libri360"
-    elif "RIVA-TTS" in record["audio_filepath"]:
-        language = record["audio_filepath"].split("RIVA-TTS/")[1].split("/")[0]
-        if language == "en":
-            speaker_name = record["audio_filepath"].split("RIVA-TTS/en/")[1].split("/")[0]
-        else:
-            if language in ["es", "fr"]:
-                speaker_name = record["audio_filepath"].split("RIVA-TTS/{}/".format(language))[1].split("/")[1]
-            else:
-                speaker_name = record["audio_filepath"].split("RIVA-TTS/{}/".format(language))[1].split("/")[0]
-        dataset_name = "Riva"
-    elif "HiFiTTS" in record["audio_filepath"]:
-        language = "en"
-        speaker_name = record["audio_filepath"].split("hi_fi_tts_v0/audio/")[1].split("/")[0]
-        dataset_name = "HiFiTTS"
-    elif "/data/filtered_24khz/audio_24khz/" in record["audio_filepath"]:
-        language = "en"
-        speaker_name = record["audio_filepath"].split("/data/filtered_24khz/audio_24khz/")[1].split("/")[0]
-        dataset_name = "MLS"
-        
-    speaker_full_name = "| Language:{} Dataset:{} Speaker:{} |".format(language, dataset_name, speaker_name)
-    return speaker_full_name
-
-resampler = Resample(orig_freq=22050, new_freq=16000).cuda()
 
 def decode_codes_and_find_similarity(codec_model, codec_fps):
+    """
+    Decodes the codec_fps (codec filepaths, typically context and answer)
+    and finds the similarity between the embeddings
+    """
     with torch.no_grad():
         max_codec_len = 0
         codec_list = []
@@ -88,7 +68,6 @@ def decode_codes_and_find_similarity(codec_model, codec_fps):
         for i, codec in enumerate(codec_list):
             codecs[i, :, :codec.shape[1]] = codec
         codecs = codecs.long()
-        # import ipdb; ipdb.set_trace()
         codec_decoded_audios, _ = codec_model.decode(tokens=codecs, tokens_len=codec_lens[:,0])
 
         audios_16 = []
@@ -131,11 +110,11 @@ def decode_codes_and_find_similarity(codec_model, codec_fps):
         return sum(similarities) / len(similarities)
 
 
-manifest_path = "/datap/misc/speechllm_codecdatasets/manifests/LRHM_train_nemo_codec_bw_6.0_phoneme_tts.json"
+
 
 records = read_manifest(manifest_path)
 
-codec_model = AudioCodecModel.restore_from("/datap/misc/Checkpoints/SpeechCodec.nemo")
+codec_model = AudioCodecModel.restore_from(codec_model_path)
 codec_model.to('cuda')
 codec_model.eval()
 codec_model_sample_rate = 22050
@@ -143,11 +122,9 @@ codec_model_downsampling_factor = 256.0
 
 nemo_sv_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
 
-similarity_wise_sorted = []
 with_similarity_records = []
 low_similarity_records = []
 high_similarity_records = []
-
 for ridx, record in enumerate(records):
     print("{} out of {}".format(ridx, len(records)))
     context_fps = record["context"].split(";")
@@ -166,7 +143,7 @@ for ridx, record in enumerate(records):
     
     with_similarity_records.append(record)
     print(ridx, record["similarity"])
-    similarity_wise_sorted.append((similarity, record))
+    
     if (ridx+1) % 100 == 0:
         updated_manifest_path = manifest_path.replace(".json", "_withsimilarity_inprogress.json")
         write_manifest(updated_manifest_path, with_similarity_records)
@@ -177,56 +154,3 @@ for ridx, record in enumerate(records):
 
         high_similarity_manifest_path = manifest_path.replace(".json", "_high_similarity.json")
         write_manifest(high_similarity_manifest_path, high_similarity_records)
-
-
-# speakerwise_records = {}
-# for record in records:
-#     speaker = get_speaker_info_from_record(record)
-#     if speaker not in speakerwise_records:
-#         speakerwise_records[speaker] = []
-#     speakerwise_records[speaker].append(record)
-
-# for speaker in speakerwise_records:
-#     random.shuffle(speakerwise_records[speaker])
-#     speakerwise_records[speaker] = speakerwise_records[speaker][:20]
-
-# print("Total Speakers: {}".format(len(speakerwise_records)))
-
-
-# for speaker in speakerwise_records:
-#     for ridx, record in enumerate(speakerwise_records[speaker]):
-#         print("{} out of {}".format(ridx, len(speakerwise_records[speaker])))
-#         context_fps = record["context"].split(";")
-#         answer_fp = record["answer"]
-#         try:
-#             similarity = decode_codes_and_find_similarity(codec_model, context_fps + [answer_fp])
-#         except:
-#             print("Error in record: ", record)
-#             continue
-#         record["similarity"] = round(similarity, 4)
-#         if similarity < 0.35:
-#             low_similarity_records.append(record)
-#         elif similarity > 0.7:
-#             high_similarity_records.append(record)
-#         with_similarity_records.append(record)
-#         print(ridx, record["similarity"])
-#         similarity_wise_sorted.append((similarity, record))
-#         if (ridx+1) % 100 == 0:
-#             updated_manifest_path = manifest_path.replace(".json", "_withsimilarity_inprogress.json")
-#             write_manifest(updated_manifest_path, with_similarity_records)
-#             plot_similarity_historgram(with_similarity_records)
-
-#             low_similarity_manifest_path = manifest_path.replace(".json", "_low_similarity.json")
-#             write_manifest(low_similarity_manifest_path, low_similarity_records)
-
-#             high_similarity_manifest_path = manifest_path.replace(".json", "_high_similarity.json")
-#             write_manifest(high_similarity_manifest_path, high_similarity_records)
-
-# updated_manifest_path = manifest_path.replace(".json", "_similarity.json")
-
-# similarity_wise_sorted = sorted(similarity_wise_sorted, key=lambda x: x[0])
-
-# sorted_records = [x[1] for x in similarity_wise_sorted]
-
-
-# write_manifest(updated_manifest_path, sorted_records)
