@@ -431,9 +431,10 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 if total_context_len > 600
                 else int(total_context_len * random.uniform(0.2, 0.5)),
             )
-            start_token_index = random.randint(
-                0, total_context_len - reduced_len
-            )  # start index can be greater than 440
+            # start_token_index = random.randint(
+            #     0, total_context_len - reduced_len
+            # )  # start index can be greater than 440
+            start_token_index = 0
             context_tokens[0] = context_tokens[0][
                 :, start_token_index : min(start_token_index + 440, start_token_index + reduced_len)
             ]
@@ -861,7 +862,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             assert self.context_duration_min == self.context_duration_max, "CONTEXTANSWER only supports fixed context duration"
             reference_codec_len = int(self.context_duration_min * self.codebook_fps)
             assert context_tokens.shape[1] >= reference_codec_len, "CONTEXTANSWER context duration is less than min duration {} {} {}".format(context_tokens.shape[1], reference_codec_len, context_codec_path)
-            si = rng.randint(0, context_tokens.shape[1] - reference_codec_len)
+            # si = rng.randint(0, context_tokens.shape[1] - reference_codec_len)
+            si = 0
             context_tokens = context_tokens[:, si:si+reference_codec_len]
             answer_tokens[0] = (answer_tokens[0] + self.speech_offset).long()
             pad_tokens = torch.zeros(self.num_speech_codebooks, 1).long()

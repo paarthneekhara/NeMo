@@ -1416,14 +1416,15 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             end_inference_loop_at = None
             fwd_bwd_function = get_forward_backward_func()
             encoder_output = None
-            for t in range(self.decoder_context_len, dec_input.shape[2] - 1):
+            for t in range(self.decoder_context_len + 1, dec_input.shape[2] - 1):
+                # import ipdb; ipdb.set_trace()
                 # Start at 0 if encoder context, else context_len
                 if t % 100 == 0:
                     logging.info("Timestep {}".format(t))
                 if t == end_inference_loop_at:
                     print("All ends detected")
                     break
-                if t == self.decoder_context_len:
+                if t == self.decoder_context_len + 1:
                     # Run first step manually
                     # logging.debug(f"Calling first step with input size:{dec_input[:, :, : t + 1].shape} and mask:{dec_input_mask[:, : t + 1].shape}")
                     output_logits, _, token_and_speech_logits = self.forward(
@@ -1601,7 +1602,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             for i in range(batch_size):
                 audio_len = (labels[i][0] != 0).sum().item()
                 # step = batch_idx * self.test_dataloader().batch_size + i
-                step = batch_idx * test_dataloader_batch_size + i 
+                step = batch_idx * test_dataloader_batch_size + i
                 if torch.count_nonzero(speech_mask) > 0:
                     dec_input_to_1024 = self.convert_tokens_to_range(dec_input_raw[i, :, 0:audio_len])
                     dec_input_to_1024_answer = dec_input_to_1024[:,self.decoder_context_len+1:]
