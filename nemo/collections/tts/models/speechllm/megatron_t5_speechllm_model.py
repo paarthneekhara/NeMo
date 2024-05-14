@@ -1417,7 +1417,6 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             fwd_bwd_function = get_forward_backward_func()
             encoder_output = None
             for t in range(self.decoder_context_len + 1, dec_input.shape[2] - 1):
-                # import ipdb; ipdb.set_trace()
                 # Start at 0 if encoder context, else context_len
                 if t % 100 == 0:
                     logging.info("Timestep {}".format(t))
