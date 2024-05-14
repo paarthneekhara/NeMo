@@ -53,8 +53,6 @@ model:
   validation_metric: accuracy
   num_speech_tokens: 10112 # Vocabulary size pertaining to speech
   seq_pattern: "parallel" # parallel, delay_parallel, flatten
-  speech_head_type: "linear" # token_level, linear
-  cross_entropy_type: "vocab_parallel" # regular, vocab_parallel
   attn_prior_scaledown_start_step: 10000
   attn_prior_end_step: 11000
   return_all_crossattention_probs: True
@@ -152,8 +150,8 @@ model:
 
   data:
     grapheme_prefix: null
-    train_ds: ["/data/speech/val_clean_300_speechlm_alltasks.json"]
-    validation_ds: ["/data/speech/val_clean_300_speechlm_alltasks.json"]
+    train_ds: ???
+    validation_ds: ???
     max_seq_length: 2048
     sample_rate: 24000
     add_eos: true
@@ -169,7 +167,7 @@ model:
     num_workers: 4
     pin_memory: true
     speech_offset: 30128
-    train_task: asr
+    train_task: all
     num_speech_codebooks: 8
     codebook_fps: 86
     context_duration_min: 2.9
@@ -177,8 +175,8 @@ model:
     g2p:
       english:
         _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
-        phoneme_dict: "/home/jasoli/gitrepos/NeMo/scripts/tts_dataset_files/ipa_cmudict-0.7b_nv23.01.txt"
-        heteronyms: "/home/jasoli/gitrepos/NeMo/scripts/tts_dataset_files/heteronyms-052722"
+        phoneme_dict: "scripts/tts_dataset_files/ipa_cmudict-0.7b_nv23.01.txt"
+        heteronyms: "scripts/tts_dataset_files/heteronyms-052722"
         phoneme_probability: 0.8
         ignore_ambiguous_words: False
         use_chars: True
@@ -186,7 +184,7 @@ model:
         grapheme_prefix: ${model.data.grapheme_prefix}
       spanish:
         _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
-        phoneme_dict: "/home/jasoli/gitrepos/NeMo/scripts/tts_dataset_files/es_ES/es_ES_nv230301.dict"
+        phoneme_dict: "scripts/tts_dataset_files/es_ES/es_ES_nv230301.dict"
         phoneme_probability: 0.8
         use_chars: True
         use_stresses: True
@@ -195,7 +193,7 @@ model:
         locale: "es-ES"
       mandarin:
         _target_: nemo.collections.tts.g2p.models.zh_cn_pinyin.ChineseG2p
-        phoneme_dict: "/home/jasoli/gitrepos/NeMo/scripts/tts_dataset_files/zh/36finals/ipa_dict_nv23.05.txt"
+        phoneme_dict: "scripts/tts_dataset_files/zh/36finals/ipa_dict_nv23.05.txt"
         word_segmenter: "jieba"
         phoneme_prefix: ""
         phoneme_case: "lower"
@@ -204,8 +202,8 @@ model:
         ascii_letter_case: "upper"
       german:
         _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
-        phoneme_dict: "/home/jasoli/gitrepos/NeMo/scripts/tts_dataset_files/de/de_nv240125.dict"
-        heteronyms: "/home/jasoli/gitrepos/NeMo/scripts/tts_dataset_files/de/de_nv230119.heteronym"
+        phoneme_dict: "scripts/tts_dataset_files/de/de_nv230119.dict"
+        heteronyms: "scripts/tts_dataset_files/de/de_nv230119.heteronym"
         phoneme_probability: 0.8
         ignore_ambiguous_words: False
         use_chars: True

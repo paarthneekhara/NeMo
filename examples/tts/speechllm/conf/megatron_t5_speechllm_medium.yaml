@@ -13,17 +13,18 @@ trainer:
   log_every_n_steps: 10
   val_check_interval: null
   check_val_every_n_epoch: 1
-  gradient_clip_val: 1.0
 
 exp_manager:
+  explicit_log_dir: null
   exp_dir: null
   name: ${name}
+  create_wandb_logger: False
   resume_if_exists: True
   resume_ignore_no_checkpoint: True
   create_checkpoint_callback: True
   checkpoint_callback_params:
     monitor: val_loss
-    save_top_k: 2
+    save_top_k: 3
     mode: min
     save_nemo_on_train_end: False
     filename: "megatron_t5_speechllm_tts--{${exp_manager.checkpoint_callback_params.monitor}:.3f}-{step}"
@@ -61,6 +62,14 @@ model:
   save_nemo_on_validation_end: True # Saves an inference ready .nemo file every time a checkpoint is saved during training.
   existing_tasks: []
   new_tasks: ["squad"]
+  freeze_model: false
+  use_alignment_loss: true
+  codecmodel_type: nemo_codec
+  codecmodel_path: ???
+  english_only_model: true
+  context_conditioning: decoder
+  use_flash_attention: false
+  lm_vocab_size: 30000
 
   task_templates:
   - taskname: "squad"
@@ -83,11 +92,11 @@ model:
     grapheme_prefix: null
     train_ds: ???
     validation_ds: ???
-    max_seq_length: 512
+    max_seq_length: 2048
     sample_rate: 24000
     add_eos: true
     add_bos: false
-    use_attention_prior: false
+    use_attention_prior: true
     attention_prior_scaling_factor: 0.05
     cross_attention_epsilon: 0.0
     decoder_starts_with_pad: False
@@ -97,8 +106,12 @@ model:
     shuffle: true
     num_workers: 4
     pin_memory: true
-    speech_offset: 30000
+    speech_offset: 30128
     train_task: all
+    num_speech_codebooks: 8
+    codebook_fps: 86
+    context_duration_min: 2.9
+    context_duration_max: 2.9
     g2p:
       english:
         _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
@@ -141,7 +154,7 @@ model:
 
   optim:
     name: fused_adam
-    lr: 5e-5
+    lr: 1e-4
     weight_decay: 0.01
     betas:
     - 0.9

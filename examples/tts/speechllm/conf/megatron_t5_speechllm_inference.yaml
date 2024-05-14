@@ -63,7 +63,12 @@ model:
   save_nemo_on_validation_end: True # Saves an inference ready .nemo file every time a checkpoint is saved during training.
   existing_tasks: []
   new_tasks: ["squad"]
-
+  codecmodel_type: nemo_codec
+  codecmodel_path: ???
+  english_only_model: true
+  context_conditioning: decoder
+  use_flash_attention: false
+  lm_vocab_size: 30000
   task_templates:
   - taskname: "squad"
     prompt_template: "<|VIRTUAL_PROMPT_0|> {context} {question} {answer}"
@@ -100,6 +105,10 @@ model:
     speech_offset: 30000
     train_task: asr
     sup_data_path: None
+    num_speech_codebooks: 8
+    codebook_fps: 86
+    context_duration_min: 2.9
+    context_duration_max: 2.9
     g2p:
       english:
         _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
