@@ -133,7 +133,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         cross_attention_epsilon: Optional[float] = 0.0,
         lm_vocab_size: Optional[int] = None,
         num_speech_codebooks: Optional[int] = 8,
-        codebook_fps: Optional[int] = 75,
+        codebook_fps: Optional[int] = 86,
         add_special_tokens_to_only_first_codebook: Optional[bool] = False,
         context_pattern: Optional[str] = "parallel",
         context_duration_min: Optional[float] = 3.0,

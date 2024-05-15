@@ -1288,7 +1288,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             cross_attention_epsilon=self.cfg.data.get('cross_attention_epsilon', 0.0),
             lm_vocab_size=self.lm_vocab_size,
             num_speech_codebooks=self.num_speech_codebooks,
-            codebook_fps=self.cfg.data.get('codebook_fps', 75),
+            codebook_fps=self.cfg.data.get('codebook_fps', 86),
             add_special_tokens_to_only_first_codebook=self.cfg.data.get(
                 'add_special_tokens_to_only_first_codebook', False
             ),
@@ -1480,7 +1480,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 else:
                     output_logits_currtimestep = token_logits_currtimestep  # (B, V)
 
-                top_k = self.cfg.get('top_k', 10)
+                top_k = self.cfg.get('top_k', 80)
 
                 output_logits_currtimestep_topk = torch.topk(output_logits_currtimestep, top_k, dim=1)[0]
                 # (B*8, 10) or (B, 10)
