@@ -69,7 +69,7 @@ model:
   context_conditioning: decoder
   train_from_scratch: true
   override_tokenizer_vocab_file: ???
-  use_flash_attention: true
+  use_flash_attention: false
   lm_vocab_size: 30000
 
   frozen_model:
