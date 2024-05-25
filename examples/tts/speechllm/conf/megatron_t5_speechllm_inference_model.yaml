@@ -170,6 +170,7 @@ model:
     codebook_fps: 86
     context_duration_min: 2.9
     context_duration_max: 2.9
+    context_slice_method: "fixed"
     g2p:
       english:
         _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p

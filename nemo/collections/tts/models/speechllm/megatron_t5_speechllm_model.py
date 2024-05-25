@@ -887,7 +887,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         if batch_idx == 0 and self.is_rank_zero:
             self.frozen_model.enc_dec_model.logging_step = True
             self.predict_step_outputs = []
-            self.predict_step(batch=batch, batch_idx=batch_idx, log_metrics=False, global_step=self.global_step)
+            # log_scalars=False avoids logging scalar TTS metrics in the predict_step
+            # Images, audio and texts will still be logged
+            self.predict_step(batch=batch, batch_idx=batch_idx, log_scalars=False, global_step=self.global_step)
             for inf_key in self.predict_step_outputs[0]:
                 if self.predict_step_outputs[0][inf_key] is not None:
                     self.logger.experiment.add_scalar(
@@ -1300,6 +1302,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             english_only_model=self.cfg.get('english_only_model', False),
             context_conditioning=self.cfg.get('context_conditioning', "decoder"),
             use_beta_binomial_interpolator=self.cfg.get('use_beta_binomial_interpolator', False),
+            context_slice_method=self.cfg.data.get('context_slice_method', 'random'),
         )
 
         rank = parallel_state.get_data_parallel_rank()
@@ -1381,7 +1384,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
         return dataset, dataloader
 
-    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0, log_metrics=True, global_step=None) -> Any:
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0, log_scalars=True, global_step=None) -> Any:
         with torch.no_grad():
             (
                 virtual_tokens,
@@ -1500,7 +1503,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 output_tokens_curr_timestep = torch.multinomial(
                     output_logits_currtimestep_rescored, num_samples=1
                 )  # (B*8, 1)
-
+                
                 if torch.count_nonzero(speech_mask) > 0:
                     # Convert back to (B, 8)
                     output_tokens_curr_timestep = output_tokens_curr_timestep.view(
@@ -1623,6 +1626,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     pred_img = predicted_tokens.data.cpu().float().numpy()
                     dec_inp_img = dec_input_to_1024.data.cpu().float().numpy()
 
+                    
                     predicted_tokens = self.convert_tokens_to_range(predicted_tokens, apply_offset_correction=False)
                     predicted_wav = self.decode_wav_from_codec_model(predicted_tokens)
                     self.logger.experiment.add_audio("Inf Pred Wav", predicted_wav, step, self.sample_rate)
@@ -1639,6 +1643,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         wav_num = i
                     else:
                         wav_num = step
+                    
                     audio_fp_pred = os.path.join(_exp_dir_path, f'predicted_wav_{wav_num}.wav')
                     sf.write(audio_fp_pred, predicted_wav.cpu().numpy(), self.sample_rate)
                     audio_fp_gt = os.path.join(_exp_dir_path, f'dec_input_wav_{wav_num}.wav')
@@ -1653,7 +1658,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
                     )
                     
-                    if log_metrics:
+                    if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Individual Sample', similarity, step)
                     similarity_list.append(similarity)
 
@@ -1693,7 +1698,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     gt_similarity_context = np.dot(spk_embedding_context, spk_embedding_gt) / (
                         np.linalg.norm(spk_embedding_context) * np.linalg.norm(spk_embedding_gt)
                     )
-                    if log_metrics:
+                    if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Context Pred', pred_similarity_context, step)
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Context GT', gt_similarity_context, step)
                     pred_context_similarity_list.append(pred_similarity_context)
@@ -1730,16 +1735,18 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     h = output_tokens_combined[i].long() * nzm
                     h = h.tolist()
                     cur_wer_score = editdistance.eval(r, h)
-                    self.logger.experiment.add_scalar('WER', cur_wer_score, step)
-                    logging.info(f"current wer score : {cur_wer_score}")
+                    if log_scalars:
+                        self.logger.experiment.add_scalar('WER', cur_wer_score, step)
+                        logging.info(f"current wer score : {cur_wer_score}")
                     wer_score += cur_wer_score
             if wer_score > 0:
                 wer_score /= batch_size
-                self.logger.experiment.add_scalar('AVG WER', wer_score, step)
-                logging.info(f"average wer score : {wer_score}")
+                if log_scalars:
+                    self.logger.experiment.add_scalar('AVG WER', wer_score, step)
+                    logging.info(f"average wer score : {wer_score}")
 
             # compute token error rate for each layer
-            if log_metrics:
+            if log_scalars:
                 for layer_idx in range(self.num_speech_codebooks):
                     wer = word_error_rate(ter_dict[layer_idx]['hypothesis'], ter_dict[layer_idx]['gt'], use_cer=True)
                     self.logger.experiment.add_scalar(f'Inf TER Layer {layer_idx}', wer, 0)
@@ -1764,21 +1771,21 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 step = batch_idx * test_dataloader_batch_size + all_audio_to_pred[i]["step"]
                 cer_sample = word_error_rate([greedy_transcripts[i]], [greedy_transcripts[i + 1]], use_cer=True)
                 wer_sample = word_error_rate([greedy_transcripts[i]], [greedy_transcripts[i + 1]], use_cer=False)
-                if log_metrics:
-                    self.logger.experiment.add_text("Inf Predicted Text", greedy_transcripts[i], step)
-                    self.logger.experiment.add_text("Inf GT Text", greedy_transcripts[i + 1], step)
+                self.logger.experiment.add_text("Inf Predicted Text", greedy_transcripts[i], step)
+                self.logger.experiment.add_text("Inf GT Text", greedy_transcripts[i + 1], step)
+                if log_scalars:
                     self.logger.experiment.add_scalar(f'Inf CER Transcript', cer_sample, step)
                     self.logger.experiment.add_scalar(f'Inf WER Transcript', wer_sample, step)
                 cer_batch.append(cer_sample)
                 wer_batch.append(wer_sample)
                 if question_type[all_audio_to_pred[i]["step"]] == "Phoneme TTS":
-                    if log_metrics:
+                    if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf CER Phoneme Task', cer_sample, step)
                         self.logger.experiment.add_scalar(f'Inf WER Phoneme Task', wer_sample, step)
                     cer_phoneme.append(cer_sample)
                     wer_phoneme.append(wer_sample)
                 elif question_type[all_audio_to_pred[i]["step"]] == "Text to speech this":
-                    if log_metrics:
+                    if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf CER TTS Task', cer_sample, step)
                         self.logger.experiment.add_scalar(f'Inf WER TTS Task', wer_sample, step)
                     cer_tts.append(cer_sample)
@@ -1788,7 +1795,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             similarity_avg = np.mean(similarity_list)
             pred_context_similarity_avg = np.mean(pred_context_similarity_list)
             gt_context_similarity_avg = np.mean(gt_context_similarity_list)
-            if log_metrics:
+            if log_scalars:
                 self.logger.experiment.add_scalar(f'Inf SV Avg Cossim', similarity_avg, batch_idx)
             self.predict_step_outputs.append(
                 {

@@ -142,6 +142,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         english_only_model: Optional[bool] = False,
         context_conditioning: Optional[str] = "decoder", # encoder or decoder
         use_beta_binomial_interpolator: Optional[str] = False, # encoder or decoder
+        context_slice_method: Optional[str] = "random", # random or fixed
         **kwargs,
     ):
         """
@@ -240,6 +241,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.skip_datasets = skip_datasets
 
         self.beta_binomial_interpolator = BetaBinomialInterpolator(scaling_factor=self.attention_prior_scaling_factor) if use_beta_binomial_interpolator else None
+        self.context_slice_method = context_slice_method
 
         super().__init__(
             datasets=datasets,
@@ -778,7 +780,14 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         return codec_codes
 
     def _get_tokens(self, doc, field, field_data):
-        rng = random.Random()  # Custom random generator (since random uses fixed seeds)
+        if self.context_slice_method == "random":
+            # During training, we want a random slice of the context
+            rng = random.Random()  # Custom random generator (since random uses fixed seeds)
+        elif self.context_slice_method == "fixed":
+            # During inference, we want a fixed slice of the context
+            rng = random
+        else:
+            raise ValueError(f"Invalid context_slice_method {self.context_slice_method}")
         if f"{field}_type" not in doc.keys():
             field_tokens = self._get_text_tokens(field_data.strip(" "))  # list of ids
         elif doc[f"{field}_type"] == 'TEXT':
