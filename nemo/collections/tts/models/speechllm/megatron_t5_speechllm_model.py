@@ -14,6 +14,7 @@
 import itertools
 import json
 import os
+import string
 from typing import Any, List
 
 import editdistance
@@ -501,7 +502,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
     def get_forward_output_and_loss_func(self, validation_step=False):
         def fwd_output_and_loss_func(dataloader_iter, model):
             batch = next(dataloader_iter)
-            batch = [x.cuda(non_blocking=True) for x in batch]
+            batch = [x.cuda(non_blocking=True) if isinstance(x, torch.Tensor) else x for x in batch]
             (
                 virtual_tokens,
                 context_and_question_tokens,
@@ -517,6 +518,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 cross_attention_prior,
                 text_limits,
                 _,  # TODO: text limit and lang not in tarred dataset
+                _,
             ) = batch
 
             if self.trainer.global_step % self.train_check_interval == 0 and not validation_step and self.is_rank_zero:
@@ -871,6 +873,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             _,
             cross_attention_prior,
             text_limits,
+            _,
             _,
         ) = batch
         # loss_mask (b, t)
@@ -1384,6 +1387,27 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
         return dataset, dataloader
 
+    def process_text(self, input_text):
+        """
+        Normalizes text for CER/WER calculation.
+        Taken from hallucination_eval.py
+        """
+        # Convert text to lowercase
+        lower_case_text = input_text.lower()
+        
+        # Remove commas from text
+        no_comma_text = lower_case_text.replace(",", "")
+        
+        # Replace "-" with spaces
+        no_dash_text = no_comma_text.replace("-", " ")
+        
+        # Replace double spaces with single space
+        single_space_text = " ".join(no_dash_text.split())
+
+        single_space_text = single_space_text.translate(str.maketrans('', '', string.punctuation))
+        
+        return single_space_text
+
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0, log_scalars=True, global_step=None) -> Any:
         with torch.no_grad():
             (
@@ -1401,7 +1425,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 cross_attention_prior,
                 text_limits,
                 lang,
+                question_texts, 
             ) = batch
+
             dec_input = dec_input_raw * 1  # (B, 8, T)
             dec_input_mask = dec_input_mask_raw * 1  # (B, T)
             dec_input_mask[:, :] = 1  # Does not really matter
@@ -1759,37 +1785,66 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
             all_audio_to_pred = audio_to_pred + audio_to_pred_zh
             # Note WER over the batch is not equal to WER(sample) / batch_size, but approx. here
+
+            # These are between ASR outputs of GT audio and predicted audio
             wer_batch = []
             cer_batch = []
             cer_phoneme = []
             wer_phoneme = []
             cer_tts = []
             wer_tts = []
+            
+            # These are between ASR output of Pred audio and GT text
+            wer_batch_gt = []
+            cer_batch_gt = []
+            cer_phoneme_gt = []
+            wer_phoneme_gt = []
+            cer_tts_gt = []
+            wer_tts_gt = []
+
             for i in range(0, len(greedy_transcripts) - 1, 2):
                 assert all_audio_to_pred[i]["step"] == all_audio_to_pred[i + 1]["step"]
                 # step = batch_idx * self.test_dataloader().batch_size + all_audio_to_pred[i]["step"]
                 step = batch_idx * test_dataloader_batch_size + all_audio_to_pred[i]["step"]
+                question_text = question_texts[i//2]
+                
+                # No need to process text since both are ASR outputs
                 cer_sample = word_error_rate([greedy_transcripts[i]], [greedy_transcripts[i + 1]], use_cer=True)
                 wer_sample = word_error_rate([greedy_transcripts[i]], [greedy_transcripts[i + 1]], use_cer=False)
+
+                # Processing text since one is ASR output and the other is the GT text
+                cer_gt = word_error_rate([self.process_text(greedy_transcripts[i])], [self.process_text(question_text)], use_cer=True)
+                wer_gt = word_error_rate([self.process_text(greedy_transcripts[i])], [self.process_text(question_text)], use_cer=False)
+
                 self.logger.experiment.add_text("Inf Predicted Text", greedy_transcripts[i], step)
                 self.logger.experiment.add_text("Inf GT Text", greedy_transcripts[i + 1], step)
+                self.logger.experiment.add_text("Inf Question Text", question_text, step)
                 if log_scalars:
                     self.logger.experiment.add_scalar(f'Inf CER Transcript', cer_sample, step)
                     self.logger.experiment.add_scalar(f'Inf WER Transcript', wer_sample, step)
+                    self.logger.experiment.add_scalar(f'Inf CER GT Transcript', cer_gt, step)
                 cer_batch.append(cer_sample)
                 wer_batch.append(wer_sample)
+                cer_batch_gt.append(cer_gt)
+                wer_batch_gt.append(wer_gt)
                 if question_type[all_audio_to_pred[i]["step"]] == "Phoneme TTS":
                     if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf CER Phoneme Task', cer_sample, step)
                         self.logger.experiment.add_scalar(f'Inf WER Phoneme Task', wer_sample, step)
+                        self.logger.experiment.add_scalar(f'Inf CER GT Phoneme Task', cer_gt, step)
                     cer_phoneme.append(cer_sample)
                     wer_phoneme.append(wer_sample)
+                    cer_phoneme_gt.append(cer_gt)
+                    wer_phoneme_gt.append(wer_gt)
                 elif question_type[all_audio_to_pred[i]["step"]] == "Text to speech this":
                     if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf CER TTS Task', cer_sample, step)
                         self.logger.experiment.add_scalar(f'Inf WER TTS Task', wer_sample, step)
+                        self.logger.experiment.add_scalar(f'Inf CER GT TTS Task', cer_gt, step)
                     cer_tts.append(cer_sample)
                     wer_tts.append(wer_sample)
+                    cer_tts_gt.append(cer_gt)
+                    wer_tts_gt.append(wer_gt)
 
             # compute average similarity
             similarity_avg = np.mean(similarity_list)
@@ -1808,6 +1863,12 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     'wer_phoneme': np.mean(wer_phoneme) if len(wer_phoneme) > 0 else None,
                     'cer_tts': np.mean(cer_tts) if len(cer_tts) > 0 else None,
                     'wer_tts': np.mean(wer_tts) if len(wer_tts) > 0 else None,
+                    'cer_transcript_gt': np.mean(cer_batch_gt),
+                    'wer_transcript_gt': np.mean(wer_batch_gt),
+                    'cer_phoneme_gt': np.mean(cer_phoneme_gt) if len(cer_phoneme_gt) > 0 else None,
+                    'wer_phoneme_gt': np.mean(wer_phoneme_gt) if len(wer_phoneme_gt) > 0 else None,
+                    'cer_tts_gt': np.mean(cer_tts_gt) if len(cer_tts_gt) > 0 else None,
+                    'wer_tts_gt': np.mean(wer_tts_gt) if len(wer_tts_gt) > 0 else None,
                 }
             )
 

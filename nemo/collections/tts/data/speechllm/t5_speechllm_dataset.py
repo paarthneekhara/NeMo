@@ -413,6 +413,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
 
         # Format the input example according to the template
         # Get context, question and answer codes in a dict.
+        question_text = doc["question"].replace("Phoneme TTS", "").replace("Text to speech this", "").strip()
         input_dict = self._insert_data_in_template(prompt_template_fields, doc, answer_field)
         lang = Lang[doc.get("lang", "en")]
         context_tokens = input_dict['context']
@@ -606,6 +607,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             is_speech,
             cross_attention_prior,
             lang.value,
+            question_text
         )
 
     def _truncate_input_speech(self, context_tokens, question_tokens, virtual_tokens):
@@ -964,6 +966,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             data_dict['cross_attention_prior'],
             data_dict['text_limits'],
             data_dict['lang'],
+            data_dict['question_texts'],
         )
 
     def pad_batch_and_build_loss_mask(self, batch):
@@ -982,6 +985,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             _,
             _,
             _,
+            question_texts,
         ) = zip(*batch)
 
         taskname_ids = self.pad_taskname_ids(taskname_ids)
@@ -1041,6 +1045,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
                 is_speech,
                 cross_attention_prior,
                 lang,
+                _,
             ) = sample_tuple
 
             virtual_tokens_list.append(
@@ -1135,6 +1140,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             else None,
             "text_limits": torch.stack(text_limits) if len(text_limits) > 0 else None,
             "lang": torch.stack(lang_list),
+            "question_texts": question_texts,
         }
 
         return data_dict
