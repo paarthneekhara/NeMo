@@ -1306,6 +1306,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             context_conditioning=self.cfg.get('context_conditioning', "decoder"),
             use_beta_binomial_interpolator=self.cfg.get('use_beta_binomial_interpolator', False),
             context_slice_method=self.cfg.data.get('context_slice_method', 'random'),
+            phoneme_probability=self.cfg.data.get('phoneme_probability', 0.5),
         )
 
         rank = parallel_state.get_data_parallel_rank()
@@ -1409,6 +1410,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         return single_space_text
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0, log_scalars=True, global_step=None) -> Any:
+        
         with torch.no_grad():
             (
                 virtual_tokens,
@@ -1526,6 +1528,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 output_logits_currtimestep_rescored = torch.nn.functional.softmax(
                     output_logits_currtimestep_rescored, dim=1
                 )
+                
                 output_tokens_curr_timestep = torch.multinomial(
                     output_logits_currtimestep_rescored, num_samples=1
                 )  # (B*8, 1)

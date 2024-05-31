@@ -51,7 +51,7 @@ class G2PConfig:
     _target_: str = "nemo.collections.tts.g2p.models.en_us_arpabet.EnglishG2p"
     phoneme_dict: str = "scripts/tts_dataset_files/cmudict-0.7b_nv22.10"
     heteronyms: str = "scripts/tts_dataset_files/heteronyms-052722"
-    phoneme_probability: float = 0.5
+    phoneme_probability: float = 1.0
 
 
 @dataclass
@@ -71,8 +71,10 @@ class TextTokenizerConfig:
     text_tokenizer: TextTokenizer = TextTokenizer()
 
 
-def _get_default_text_tokenizer_conf():
-    text_tokenizer: TextTokenizerConfig = TextTokenizerConfig()
+def _get_default_text_tokenizer_conf(phoneme_probability=0.5):
+    g2p = G2PConfig(phoneme_probability=phoneme_probability)
+    _text_tokenizer = TextTokenizer(g2p=g2p)
+    text_tokenizer: TextTokenizerConfig = TextTokenizerConfig(text_tokenizer=_text_tokenizer)
     return OmegaConf.create(OmegaConf.to_yaml(text_tokenizer))
 
 
@@ -143,6 +145,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         context_conditioning: Optional[str] = "decoder", # encoder or decoder
         use_beta_binomial_interpolator: Optional[str] = False, # encoder or decoder
         context_slice_method: Optional[str] = "random", # random or fixed
+        phoneme_probability: Optional[float] = 0.5,
         **kwargs,
     ):
         """
@@ -198,7 +201,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.english_only_model = english_only_model
         self.phoneme_tokenizer = None
         if english_only_model:
-            self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf()).text_tokenizer
+            self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf(phoneme_probability=phoneme_probability)).text_tokenizer
         else:
             self.g2p = {"fr": lambda x: x}
             if kwargs.get("g2p", None):
