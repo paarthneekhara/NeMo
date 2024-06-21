@@ -55,11 +55,12 @@ class GPTMultiEncoderSpeechDataset(Dataset):
             batch_first=True,
             padding_value=self.tokenizer.pad_id,
         ).transpose(1, 2)
-        question_tokens = torch.nn.utils.rnn.pad_sequence(
-            [x['question_tokens'] for x in batch],
+        text_tokens = torch.nn.utils.rnn.pad_sequence(
+            [x['text_tokens'] for x in batch],
             batch_first=True,
             padding_value=self.tokenizer.pad_id,
         )
+        text_mask = (text_tokens != self.tokenizer.pad_id).float()
         
         max_length = answer_codes_BCT.size(2) - 1
         position_ids = [list(range(max_length)) for _ in batch]
@@ -77,7 +78,8 @@ class GPTMultiEncoderSpeechDataset(Dataset):
         }
 
         gpt_batch['context_BCT'] = context_code_BCT
-        gpt_batch['question_tokens'] = question_tokens
+        gpt_batch['text_tokens'] = text_tokens
+        gpt_batch['text_mask'] = text_mask
 
         return gpt_batch
     
@@ -121,13 +123,13 @@ class GPTMultiEncoderSpeechDataset(Dataset):
         )
         
         question_text = record['question']
-        question_tokens = self.tokenizer.text_to_ids(question_text)
+        text_tokens = self.tokenizer.text_to_ids(question_text)
         # Add bos and eos tokens
-        question_tokens = [self.tokenizer.bos_id] + question_tokens + [self.tokenizer.eos_id]
-        question_tokens = torch.tensor(question_tokens).long()
+        text_tokens = text_tokens + [self.tokenizer.eos_id]
+        text_tokens = torch.tensor(text_tokens).long()
         
         return {
             'answer_codes_TC': answer_codes_TC,
             'context_codes_TC': context_codes_TC,
-            'question_tokens': question_tokens,
+            'text_tokens': text_tokens,
         }

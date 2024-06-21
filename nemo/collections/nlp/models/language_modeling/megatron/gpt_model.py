@@ -18,13 +18,17 @@ import torch
 
 from nemo.collections.nlp.modules.common.megatron.language_model import get_language_model
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
+from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.utils import (
     ApexGuardDefaults,
     init_method_normal,
     parallel_lm_logits,
     scaled_init_method_normal,
+    attn_mask_postprocess,
+    build_attention_mask_3d
 )
 from nemo.utils.decorators import deprecated_warning
+from nemo.collections.tts.modules.transformer import FFTransformerEncoder
 
 try:
     from apex.transformer.enums import AttnMaskType
@@ -197,10 +201,7 @@ class GPTModel(MegatronModule):
         use_flash_attention=False,
         seq_len_interpolation_factor=None,
         rotary_base=10000,
-        is_speech_output=False,
-        speech_token_offset=None,
-        num_speech_codebooks=None,
-        speech_codebook_size=None,
+        layer_type=LayerType.encoder,
     ):
         # deprecation warning
         deprecated_warning("GPTModel", "McoreGPTModel")
@@ -213,11 +214,6 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.sequence_parallel = self.config.sequence_parallel
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.is_speech_output = is_speech_output
-        if is_speech_output:
-            self.speech_token_offset = speech_token_offset
-            self.num_speech_codebooks = num_speech_codebooks
-            self.speech_codebook_size = speech_codebook_size
 
         if kv_channels is None:
             assert (
@@ -289,6 +285,7 @@ class GPTModel(MegatronModule):
             use_flash_attention=use_flash_attention,
             seq_len_interpolation_factor=seq_len_interpolation_factor,
             rotary_base=rotary_base,
+            layer_type=layer_type
         )
 
         if self.share_embeddings_and_output_weights:
@@ -356,10 +353,6 @@ class GPTModel(MegatronModule):
                 return_logits=encoder_input is not None,
                 sequence_parallel=self.sequence_parallel,
                 gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-                is_speech_output=self.is_speech_output,
-                speech_token_offset=self.speech_token_offset,
-                num_speech_codebooks=self.num_speech_codebooks,
-                speech_codebook_size=self.speech_codebook_size,
             )
             if loss_mask is not None:
                 if isinstance(post_process_result, tuple):
@@ -377,6 +370,141 @@ class GPTModel(MegatronModule):
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
 
+        state_dict_ = {}
+        state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars
+        )
+        # Save word_embeddings.
+        if self.post_process and not self.pre_process:
+            state_dict_[self._word_embeddings_for_head_key] = self.word_embeddings.state_dict(
+                destination, prefix, keep_vars
+            )
+        return state_dict_
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customized load."""
+
+        # Load word_embeddings.
+        if self.post_process and not self.pre_process:
+            self.word_embeddings.load_state_dict(state_dict[self._word_embeddings_for_head_key], strict=strict)
+        if self._language_model_key in state_dict:
+            state_dict = state_dict[self._language_model_key]
+        self.language_model.load_state_dict(state_dict, strict=strict)
+
+
+class MultiEncoderSpeechGPTModel(GPTModel):
+    def __init__(
+            self, 
+            speech_token_offset=None,
+            num_speech_codebooks=None,
+            speech_codebook_size=None, 
+            **kwargs
+        ):
+        self.speech_token_offset = speech_token_offset
+        self.num_speech_codebooks = num_speech_codebooks
+        self.speech_codebook_size = speech_codebook_size
+        super().__init__(**kwargs)
+
+        self.text_encoder = FFTransformerEncoder(
+            n_layer=6,
+            n_head=1,
+            d_model=768,
+            d_head=64,
+            d_inner=1536,
+            kernel_size=3,
+            dropout=0.1,
+            dropatt=0.1,
+            dropemb=0.0,
+            n_embed=self.speech_token_offset,
+            d_embed=768
+        )
+    
+    def forward(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        loss_mask=None,
+        labels=None,
+        token_type_ids=None,
+        layer_past=None,
+        get_key_value=False,
+        forward_method_parallel_output=None,
+        encoder_input=None,
+        set_inference_key_value_memory=False,
+        inference_max_sequence_len=None,
+        checkpoint_activations_all_layers=None,
+        text_tokens=None,
+        context_tokens=None,
+        text_mask=None,
+        context_mask=None,
+    ):
+        # input_ids: [b, s]
+        # position_ids: [b, s]
+        # attention_mask: [1, 1, s, s]
+        text_embedding_BTC = self.text_encoder(text_tokens)[0] # B, T, C
+        text_embedding_TBC = text_embedding_BTC.transpose(0, 1).contiguous()
+        
+        # import ipdb; ipdb.set_trace()
+        text_enc_dec_mask = build_attention_mask_3d(
+            source_mask=loss_mask, target_mask=text_mask, attn_mask_type=AttnMaskType.padding
+        )
+        text_enc_dec_mask = attn_mask_postprocess(text_enc_dec_mask)
+
+        lm_output = self.language_model(
+            input_ids,
+            position_ids,
+            attention_mask,
+            layer_past=layer_past,
+            get_key_value=get_key_value,
+            encoder_input=encoder_input,
+            set_inference_key_value_memory=set_inference_key_value_memory,
+            inference_max_sequence_len=inference_max_sequence_len,
+            checkpoint_activations_all_layers=checkpoint_activations_all_layers,
+            multi_encoder_outputs=[text_embedding_TBC],
+            multi_encoder_to_layer_mapping=[[3, 4, 5, 6, 7]],
+            multi_encoder_enc_dec_attn_masks=[text_enc_dec_mask],
+        )
+
+        if self.post_process:
+            loss_lm_output = lm_output
+            loss_labels = labels
+            post_process_result = post_language_model_processing(
+                loss_lm_output,
+                loss_labels,
+                (
+                    self.language_model.output_layer.weight
+                    if not self.share_embeddings_and_output_weights
+                    else self.word_embeddings_weight()
+                ),
+                get_key_value,
+                self.parallel_output,
+                forward_method_parallel_output,
+                self.fp16_lm_cross_entropy,
+                return_logits=encoder_input is not None,
+                sequence_parallel=self.sequence_parallel,
+                gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                is_speech_output=True,
+                speech_token_offset=self.speech_token_offset,
+                num_speech_codebooks=self.num_speech_codebooks,
+                speech_codebook_size=self.speech_codebook_size,
+            )
+            if loss_mask is not None:
+                if isinstance(post_process_result, tuple):
+                    loss, logits = post_process_result
+                else:
+                    loss, logits = post_process_result, None
+                
+                res = loss_mask * loss
+                
+                return res if logits is None else (res, logits)
+            else:
+                return post_process_result
+        else:
+            return lm_output
+    
+
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
         state_dict_ = {}
         state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
             destination, prefix, keep_vars

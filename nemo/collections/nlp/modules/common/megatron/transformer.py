@@ -581,7 +581,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     checkpoint_core_attention=checkpoint_core_attention,
                 )
             else:
-
                 attention_output, attention_bias = self.inter_attention(
                     normalization_output,
                     enc_dec_attn_mask,
@@ -1495,7 +1494,16 @@ class ParallelTransformer(MegatronModule):
         self_attention_relative_position_bias=None,
         cross_attention_relative_position_bias=None,
         checkpoint_activations_all_layers=None,
+        return_all_crossattention_probs=False,
+        return_all_selfattention_probs=False,
+        multi_encoder_outputs=None,
+        multi_encoder_to_layer_mapping=None,
+        multi_encoder_enc_dec_attn_masks=None
     ):
+        layer_idx_to_encoder_idx = {}
+        for encoder_idx, layers in enumerate(multi_encoder_to_layer_mapping):
+            for layer_idx in layers:
+                layer_idx_to_encoder_idx[layer_idx] = encoder_idx
         # Checks.
         if inference_max_sequence_len:
             assert self.activations_checkpoint_method is None, 'inference does not work with activation checkpointing'
@@ -1589,6 +1597,12 @@ class ParallelTransformer(MegatronModule):
                         layer = self._get_layer(index)
                         past = None
 
+                        _encoder_output = encoder_output
+                        _enc_dec_attn_mask = enc_dec_attn_mask
+                        if index in layer_idx_to_encoder_idx:
+                            _encoder_output = multi_encoder_outputs[layer_idx_to_encoder_idx[index]]
+                            _enc_dec_attn_mask = multi_encoder_enc_dec_attn_masks[layer_idx_to_encoder_idx[index]]
+
                         if layer_past is not None:
                             past = layer_past[index]
 
@@ -1622,8 +1636,8 @@ class ParallelTransformer(MegatronModule):
                             hidden_states = layer(
                                 hidden_states,
                                 attention_mask,
-                                encoder_output=encoder_output,
-                                enc_dec_attn_mask=enc_dec_attn_mask,
+                                encoder_output=_encoder_output,
+                                enc_dec_attn_mask=_enc_dec_attn_mask,
                                 inference_params=self.inference_params,
                                 is_first_microbatch=is_first_microbatch,
                                 checkpoint_core_attention=checkpoint_core_attention,
@@ -1632,8 +1646,8 @@ class ParallelTransformer(MegatronModule):
                             hidden_states = layer(
                                 hidden_states,
                                 attention_mask,
-                                encoder_output=encoder_output,
-                                enc_dec_attn_mask=enc_dec_attn_mask,
+                                encoder_output=_encoder_output,
+                                enc_dec_attn_mask=_enc_dec_attn_mask,
                                 layer_past=past,
                                 get_key_value=get_key_value,
                                 set_inference_key_value_memory=set_inference_key_value_memory,

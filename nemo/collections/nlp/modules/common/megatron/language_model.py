@@ -126,6 +126,7 @@ def get_language_model(
     use_flash_attention=False,
     seq_len_interpolation_factor=None,
     rotary_base=10000,
+    layer_type=LayerType.encoder,
 ):
     """Build language model and return along with the key to save."""
 
@@ -202,6 +203,7 @@ def get_language_model(
         use_flash_attention=use_flash_attention,
         seq_len_interpolation_factor=seq_len_interpolation_factor,
         rotary_base=rotary_base,
+        layer_type=layer_type,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -513,6 +515,7 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
         use_flash_attention=False,
         seq_len_interpolation_factor=None,
         rotary_base=10000,
+        layer_type=LayerType.encoder,
     ):
         super(TransformerLanguageModel, self).__init__(
             config=config, share_token_embeddings=share_embeddings_and_output_weights
@@ -614,6 +617,7 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
             num_attention_heads=num_attention_heads,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             kv_channels=kv_channels,
+            layer_type=layer_type,
             ffn_hidden_size=ffn_hidden_size,
             self_attn_mask_type=self.encoder_attn_mask_type,
             pre_process=self.pre_process,
@@ -757,6 +761,9 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
         set_inference_key_value_memory=False,
         inference_max_sequence_len=None,
         checkpoint_activations_all_layers=None,
+        multi_encoder_outputs=None,
+        multi_encoder_to_layer_mapping=None,
+        multi_encoder_enc_dec_attn_masks=None,
     ):
         # Embeddings.
         if self.pre_process and encoder_input is None:
@@ -843,6 +850,9 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
                 if rotary_pos_emb is not None
                 else None,  # This assumes that this being used as a GPT/BERT model only (no cross-attention)
                 self_attention_relative_position_bias=encoder_self_attention_relative_position_bias,
+                multi_encoder_outputs=multi_encoder_outputs,
+                multi_encoder_to_layer_mapping=multi_encoder_to_layer_mapping,
+                multi_encoder_enc_dec_attn_masks=multi_encoder_enc_dec_attn_masks,
             )
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
