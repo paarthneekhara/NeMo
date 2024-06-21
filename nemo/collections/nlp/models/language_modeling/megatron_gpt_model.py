@@ -36,6 +36,7 @@ from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingSampler,
 )
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_multi_encoder_dataset import GPTMultiEncoderSpeechDataset
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from nemo.collections.nlp.models.language_modeling.megatron.falcon.falcon_spec import get_falcon_layer_spec
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_full_te_layer_autocast_spec import (
@@ -2075,3 +2076,143 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             setattr(transformer_config, key, value)
 
         return transformer_config
+
+class MultiEncoderGPTModel(MegatronGPTModel):
+    def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
+        super().__init__(cfg=cfg, trainer=trainer)
+    
+    def model_provider_func(self, pre_process, post_process):
+        if self.mcore_gpt:
+            raise NotImplementedError("No mcore for multiencoder gpt model")
+        assert self.cfg.get('num_query_groups', None) is None or self.cfg.get(
+            'num_query_groups', None
+        ) == self.cfg.get(
+            'num_attention_heads', None
+        ), "Group Query Attention is only supported in Megatron Core. Set 'mcore_gpt' to use GQA."
+
+        model = GPTModel(
+            config=self.model_parallel_config,
+            vocab_size=self.cfg.get('override_vocab_size', self.padded_vocab_size),
+            hidden_size=self.cfg.hidden_size,
+            max_position_embeddings=self.cfg.max_position_embeddings,
+            num_layers=self.cfg.num_layers,
+            num_attention_heads=self.cfg.num_attention_heads,
+            apply_query_key_layer_scaling=self.cfg.get('apply_query_key_layer_scaling', True),
+            kv_channels=self.cfg.get('kv_channels', None),
+            ffn_hidden_size=self.cfg.ffn_hidden_size,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process,
+            init_method_std=self.cfg.get('init_method_std', 0.02),
+            use_scaled_init_method=self.cfg.get('use_scaled_init_method', True),
+            fp16_lm_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
+            hidden_dropout=self.cfg.get('hidden_dropout', 0.1),
+            attention_dropout=self.cfg.get('attention_dropout', 0.1),
+            ffn_dropout=self.cfg.get('ffn_dropout', 0.0),
+            precision=self.cfg.get('precision', 16),
+            fp32_residual_connection=self.cfg.get('fp32_residual_connection', False),
+            activations_checkpoint_granularity=self.cfg.get('activations_checkpoint_granularity', None),
+            activations_checkpoint_method=self.cfg.get('activations_checkpoint_method', None),
+            activations_checkpoint_num_layers=self.cfg.get('activations_checkpoint_num_layers', 1),
+            activations_checkpoint_layers_per_pipeline=self.cfg.get(
+                'activations_checkpoint_layers_per_pipeline', None
+            ),
+            normalization=self.cfg.get('normalization', 'layernorm'),
+            layernorm_epsilon=self.cfg.get('layernorm_epsilon', 1e-5),
+            onnx_safe=self.cfg.get('onnx_safe', False),
+            bias=self.cfg.get('bias', True),
+            bias_activation_fusion=self.cfg.get('bias_activation_fusion', True),
+            bias_dropout_add_fusion=self.cfg.get('bias_dropout_add_fusion', True),
+            activation=self.cfg.get('activation', 'gelu'),
+            headscale=self.cfg.get('headscale', False),
+            transformer_block_type=self.cfg.get('transformer_block_type', 'pre_ln'),
+            openai_gelu=self.cfg.get('openai_gelu', False),
+            normalize_attention_scores=self.cfg.get('normalize_attention_scores', True),
+            position_embedding_type=self.cfg.get('position_embedding_type', 'learned_absolute'),
+            rotary_percentage=self.cfg.get('rotary_percentage', 1.0),
+            share_embeddings_and_output_weights=self.cfg.get('share_embeddings_and_output_weights', True),
+            attention_type=self.cfg.get('attention_type', 'multihead'),
+            masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
+            persist_layer_norm=self.cfg.get('persist_layer_norm', False),
+            transformer_engine=self.cfg.get('transformer_engine', False),
+            fp8=self.cfg.get('fp8', False),
+            fp8_e4m3=self.cfg.get('fp8_e4m3', False),
+            fp8_hybrid=self.cfg.get('fp8_hybrid', False),
+            fp8_margin=self.cfg.get('fp8_margin', 0),
+            fp8_interval=self.cfg.get('fp8_interval', 1),
+            fp8_amax_history_len=self.cfg.get('fp8_amax_history_len', 1024),
+            fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'max'),
+            reduce_amax=self.cfg.get('reduce_amax', True),
+            use_emha=self.cfg.get('use_emha', False),
+            ub_tp_comm_overlap=self.cfg.get('ub_tp_comm_overlap', False),
+            use_flash_attention=self.cfg.get('use_flash_attention', False),
+            megatron_legacy=self.cfg.get('megatron_legacy', False),
+            seq_len_interpolation_factor=self.cfg.get('seq_len_interpolation_factor', None),
+            rotary_base=self.cfg.get('rotary_base', 10000),
+            is_speech_output=True,
+            speech_token_offset=self.cfg.speech_token_offset,
+            num_speech_codebooks=self.cfg.num_speech_codebooks,
+            speech_codebook_size=self.cfg.speech_codebook_size,
+        )
+
+        return model
+    
+    def build_train_valid_test_datasets(self):
+        pass
+    
+    def setup_training_data(self, cfg):
+        self._train_ds, self._train_dl = self._build_speech_dataset(
+            dataset_paths=self.cfg.data.train_ds,
+            batch_size=self.cfg.global_batch_size,
+            drop_last=True,
+            shuffle=True,
+            num_workers=self.cfg.data.num_workers,
+            pin_memory=True,
+        )
+    
+    def setup_validation_data(self, cfg):
+        self._validation_ds, self._validation_dl = self._build_speech_dataset(
+            dataset_paths=self.cfg.data.validation_ds,
+            batch_size=self.cfg.get("validation_global_batch_size", self.cfg.global_batch_size),
+            drop_last=self.cfg.get("validation_drop_last", True),
+            shuffle=False,
+            num_workers=self.cfg.data.num_workers,
+            pin_memory=True,
+        )
+    
+    def setup_test_data(self, cfg):
+        pass
+
+    def _build_speech_dataset(self, dataset_paths, batch_size, shuffle, drop_last, num_workers, pin_memory):
+        dataset = GPTMultiEncoderSpeechDataset(
+            dataset_paths=dataset_paths,
+            tokenizer=self.tokenizer,
+            speech_token_offset=self.cfg.speech_token_offset,
+            num_speech_codebooks=self.cfg.num_speech_codebooks,
+            speech_codebook_size=self.cfg.speech_codebook_size,
+            codebook_fps=self.cfg.codebook_fps,
+            max_seq_length=self.cfg.data.seq_length,
+        )
+
+        rank = parallel_state.get_data_parallel_rank()
+        world_size = parallel_state.get_data_parallel_world_size()
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=self.cfg.seed
+        )
+
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            collate_fn=dataset.collate_fn,
+            sampler=sampler,
+            batch_size=batch_size // world_size,
+            drop_last=drop_last,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=True
+            if num_workers > 0
+            else False,
+        )
+
+        print('build success', len(dataloader), dataset_paths)
+        return dataset, dataloader

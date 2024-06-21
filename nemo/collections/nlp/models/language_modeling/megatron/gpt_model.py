@@ -61,6 +61,10 @@ def post_language_model_processing(
     return_logits=False,
     sequence_parallel=False,
     gradient_accumulation_fusion=False,
+    is_speech_output=False,
+    speech_token_offset=None,
+    num_speech_codebooks=None,
+    speech_codebook_size=None,
 ):
     if get_key_value:
         lm_output, presents = lm_output
@@ -88,16 +92,42 @@ def post_language_model_processing(
         return output.transpose(0, 1).contiguous()
     else:
         # [b s] -> [s b]
-        labels = labels.transpose(0, 1).contiguous()
+        if not is_speech_output:
+            labels = labels.transpose(0, 1).contiguous()
 
-        if fp16_lm_cross_entropy:
-            assert output.dtype == torch.half
-            loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
+            if fp16_lm_cross_entropy:
+                assert output.dtype == torch.half
+                loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
+            else:
+                loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
+
+            # [s b] -> [b, s]
+            loss = loss.transpose(0, 1).contiguous()
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
+            # labels is (b, c, s)
+            loss = None
+            labels_mask = labels[:,0,:] > 0
+            for _c in range(num_speech_codebooks):
+                _si = speech_token_offset + speech_codebook_size * _c
+                _ei = speech_token_offset + speech_codebook_size * (_c + 1)
+                output_codebook = output[:, :, _si:_ei]
+                
+                labels_codebook = (labels[:, _c, :] - _si) * labels_mask
+                labels_codebook = labels_codebook.transpose(0, 1).contiguous()
+                
+                if fp16_lm_cross_entropy:
+                    assert output_codebook.dtype == torch.half
+                    codebook_loss = tensor_parallel.vocab_parallel_cross_entropy(output_codebook, labels_codebook)
+                else:
+                    codebook_loss = tensor_parallel.vocab_parallel_cross_entropy(output_codebook.float(), labels_codebook)
 
-        # [s b] -> [b, s]
-        loss = loss.transpose(0, 1).contiguous()
+                if loss is None:
+                    loss = codebook_loss
+                else:
+                    loss += codebook_loss
+            
+            loss = loss.transpose(0, 1).contiguous()
+
 
         if return_logits:
             return loss, output
@@ -167,6 +197,10 @@ class GPTModel(MegatronModule):
         use_flash_attention=False,
         seq_len_interpolation_factor=None,
         rotary_base=10000,
+        is_speech_output=False,
+        speech_token_offset=None,
+        num_speech_codebooks=None,
+        speech_codebook_size=None,
     ):
         # deprecation warning
         deprecated_warning("GPTModel", "McoreGPTModel")
@@ -179,6 +213,11 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.sequence_parallel = self.config.sequence_parallel
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.is_speech_output = is_speech_output
+        if is_speech_output:
+            self.speech_token_offset = speech_token_offset
+            self.num_speech_codebooks = num_speech_codebooks
+            self.speech_codebook_size = speech_codebook_size
 
         if kv_channels is None:
             assert (
@@ -317,6 +356,10 @@ class GPTModel(MegatronModule):
                 return_logits=encoder_input is not None,
                 sequence_parallel=self.sequence_parallel,
                 gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                is_speech_output=self.is_speech_output,
+                speech_token_offset=self.speech_token_offset,
+                num_speech_codebooks=self.num_speech_codebooks,
+                speech_codebook_size=self.speech_codebook_size,
             )
             if loss_mask is not None:
                 if isinstance(post_process_result, tuple):
