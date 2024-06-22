@@ -29,6 +29,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 )
 from nemo.utils.decorators import deprecated_warning
 from nemo.collections.tts.modules.transformer import FFTransformerEncoder
+from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
 
 try:
     from apex.transformer.enums import AttnMaskType
@@ -397,13 +398,26 @@ class MultiEncoderSpeechGPTModel(GPTModel):
             self, 
             speech_token_offset=None,
             num_speech_codebooks=None,
-            speech_codebook_size=None, 
+            speech_codebook_size=None,
+            use_alignment_loss=False,
+            alignment_loss_scale=0.1,
+            attn_prior_scaledown_start_step=10000,
+            attn_prior_end_step=20000,
             **kwargs
         ):
         self.speech_token_offset = speech_token_offset
         self.num_speech_codebooks = num_speech_codebooks
         self.speech_codebook_size = speech_codebook_size
+        self.attn_prior_scaledown_start_step = attn_prior_scaledown_start_step
+        self.attn_prior_end_step = attn_prior_end_step
+        self.num_attention_heads = kwargs['num_attention_heads']
+        self.use_alignment_loss = use_alignment_loss
+        
         super().__init__(**kwargs)
+
+        if self.use_alignment_loss:
+            self.alignment_loss_scale = alignment_loss_scale
+            self.forward_sum_loss = ForwardSumLoss(loss_scale=alignment_loss_scale)
 
         self.text_encoder = FFTransformerEncoder(
             n_layer=6,
@@ -418,7 +432,35 @@ class MultiEncoderSpeechGPTModel(GPTModel):
             n_embed=self.speech_token_offset,
             d_embed=768
         )
+
+        self.context_encoder = FFTransformerEncoder(
+            n_layer=6,
+            n_head=1,
+            d_model=768,
+            d_head=64,
+            d_inner=1536,
+            kernel_size=3,
+            dropout=0.1,
+            dropatt=0.1,
+            dropemb=0.0,
+            n_embed=self.speech_codebook_size,
+            d_embed=768,
+            multi_codebook_embedding=True,
+            n_codebooks=self.num_speech_codebooks,
+        )
     
+    def prepare_encoder_outputs(self, text_tokens, context_tokens):
+        text_embedding_BTC = self.text_encoder(text_tokens)[0] # B, T, C
+        text_embedding_TBC = text_embedding_BTC.transpose(0, 1).contiguous()
+        
+        context_embeddings_BTC = self.context_encoder(context_tokens)[0] # B, T, C
+        context_embeddings_TBC = context_embeddings_BTC.transpose(0, 1).contiguous()
+
+        return (
+            text_embedding_TBC, 
+            context_embeddings_TBC,
+        )
+
     def forward(
         self,
         input_ids,
@@ -438,20 +480,54 @@ class MultiEncoderSpeechGPTModel(GPTModel):
         context_tokens=None,
         text_mask=None,
         context_mask=None,
+        cross_attention_text_prior=None,
+        return_logits=False,
+        text_embedding_TBC=None,
+        context_embeddings_TBC=None,
+        global_step=None,
     ):
         # input_ids: [b, s]
         # position_ids: [b, s]
         # attention_mask: [1, 1, s, s]
-        text_embedding_BTC = self.text_encoder(text_tokens)[0] # B, T, C
-        text_embedding_TBC = text_embedding_BTC.transpose(0, 1).contiguous()
-        
-        # import ipdb; ipdb.set_trace()
-        text_enc_dec_mask = build_attention_mask_3d(
-            source_mask=loss_mask, target_mask=text_mask, attn_mask_type=AttnMaskType.padding
-        )
-        text_enc_dec_mask = attn_mask_postprocess(text_enc_dec_mask)
+        if text_embedding_TBC is None or context_embeddings_TBC is None:
+            text_embedding_TBC, context_embeddings_TBC = self.prepare_encoder_outputs(text_tokens, context_tokens)
 
-        lm_output = self.language_model(
+        text_enc_dec_mask = attn_mask_postprocess(build_attention_mask_3d(
+            source_mask=loss_mask, target_mask=text_mask, attn_mask_type=AttnMaskType.padding
+        ))
+
+        context_enc_dec_mask = attn_mask_postprocess(build_attention_mask_3d(
+            source_mask=loss_mask, target_mask=context_mask, attn_mask_type=AttnMaskType.padding
+        ))
+
+        text_cross_attention_layers = [5, 6, 7]
+        context_cross_attention_layers = [3, 4]
+        
+        if cross_attention_text_prior is not None:
+            if global_step is not None:
+                if global_step >= self.attn_prior_end_step:
+                    cross_attention_text_prior = None
+                elif global_step <= self.attn_prior_scaledown_start_step:
+                    cross_attention_text_prior = cross_attention_text_prior.unsqueeze(1).repeat(
+                        1, self.num_attention_heads, 1, 1
+                    )
+                    cross_attention_text_prior = torch.log(cross_attention_text_prior + 1e-8)
+                else:
+                    assert self.attn_prior_end_step > self.attn_prior_scaledown_start_step
+                    total_anneal_steps = self.attn_prior_end_step - self.attn_prior_scaledown_start_step
+                    current_step = global_step - self.attn_prior_scaledown_start_step
+                    cross_attention_text_prior = cross_attention_text_prior + (
+                        (1.0 - cross_attention_text_prior) * current_step / total_anneal_steps
+                    )
+                    cross_attention_text_prior = cross_attention_text_prior.unsqueeze(1).repeat(
+                        1, self.num_attention_heads, 1, 1
+                    )
+                    cross_attention_text_prior = torch.log(cross_attention_text_prior + 1e-8)
+            else:
+                # Not training, prior should be None
+                cross_attention_text_prior = None
+
+        lm_output, cross_attention_probs_layerwise = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -461,47 +537,60 @@ class MultiEncoderSpeechGPTModel(GPTModel):
             set_inference_key_value_memory=set_inference_key_value_memory,
             inference_max_sequence_len=inference_max_sequence_len,
             checkpoint_activations_all_layers=checkpoint_activations_all_layers,
-            multi_encoder_outputs=[text_embedding_TBC],
-            multi_encoder_to_layer_mapping=[[3, 4, 5, 6, 7]],
-            multi_encoder_enc_dec_attn_masks=[text_enc_dec_mask],
+            multi_encoder_outputs=[text_embedding_TBC, context_embeddings_TBC],
+            multi_encoder_to_layer_mapping=[text_cross_attention_layers, context_cross_attention_layers],
+            multi_encoder_enc_dec_attn_masks=[text_enc_dec_mask, context_enc_dec_mask],
+            multi_encoder_cross_attention_priors=[cross_attention_text_prior, None],
+            return_cross_attention_scores=True,
         )
 
-        if self.post_process:
-            loss_lm_output = lm_output
-            loss_labels = labels
-            post_process_result = post_language_model_processing(
-                loss_lm_output,
-                loss_labels,
-                (
-                    self.language_model.output_layer.weight
-                    if not self.share_embeddings_and_output_weights
-                    else self.word_embeddings_weight()
-                ),
-                get_key_value,
-                self.parallel_output,
-                forward_method_parallel_output,
-                self.fp16_lm_cross_entropy,
-                return_logits=encoder_input is not None,
-                sequence_parallel=self.sequence_parallel,
-                gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-                is_speech_output=True,
-                speech_token_offset=self.speech_token_offset,
-                num_speech_codebooks=self.num_speech_codebooks,
-                speech_codebook_size=self.speech_codebook_size,
+        alignment_loss = None
+        text_attention_probs = [torch.softmax(cross_attention_probs_layerwise[lidx], dim=-1) for lidx in text_cross_attention_layers ]
+        if self.use_alignment_loss:
+            text_attention_scores = [ cross_attention_probs_layerwise[lidx] for lidx in text_cross_attention_layers ]
+            attention_scores_combined = torch.cat(text_attention_scores, dim=1)
+            attention_logprobs = torch.mean(attention_scores_combined, dim=1, keepdim=True)
+
+            enc_len = torch.sum(text_mask, dim=1).long()
+            dec_len = torch.sum(loss_mask, dim=1).long()
+            
+            alignment_loss = self.forward_sum_loss(
+                attn_logprob=attention_logprobs.float(), in_lens=enc_len, out_lens=dec_len
             )
-            if loss_mask is not None:
-                if isinstance(post_process_result, tuple):
-                    loss, logits = post_process_result
-                else:
-                    loss, logits = post_process_result, None
-                
-                res = loss_mask * loss
-                
-                return res if logits is None else (res, logits)
-            else:
-                return post_process_result
+
+        loss_lm_output = lm_output
+        loss_labels = labels
+        post_process_result = post_language_model_processing(
+            loss_lm_output,
+            loss_labels,
+            (
+                self.language_model.output_layer.weight
+                if not self.share_embeddings_and_output_weights
+                else self.word_embeddings_weight()
+            ),
+            get_key_value,
+            self.parallel_output,
+            forward_method_parallel_output,
+            self.fp16_lm_cross_entropy,
+            return_logits=return_logits,
+            sequence_parallel=self.sequence_parallel,
+            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+            is_speech_output=True,
+            speech_token_offset=self.speech_token_offset,
+            num_speech_codebooks=self.num_speech_codebooks,
+            speech_codebook_size=self.speech_codebook_size,
+        )
+        logits = None
+        if return_logits:
+            loss, logits = post_process_result
         else:
-            return lm_output
+            loss = post_process_result
+
+        if loss_mask is not None:
+            loss = loss_mask * loss
+        
+        return [loss, alignment_loss], [logits, text_attention_probs]
+
     
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):

@@ -37,7 +37,7 @@ from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingSampler,
 )
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
-from nemo.collections.nlp.data.language_modeling.megatron.gpt_multi_encoder_dataset import GPTMultiEncoderSpeechDataset
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_multi_encoder_dataset import GPTMultiEncoderSpeechDataset, phoneme_tokenizer
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from nemo.collections.nlp.models.language_modeling.megatron.falcon.falcon_spec import get_falcon_layer_spec
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_full_te_layer_autocast_spec import (
@@ -78,7 +78,10 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, NeuralType
 from nemo.utils import logging
 from nemo.utils.te_utils import is_float8tensor
-
+from nemo.collections.tts.models import AudioCodecModel
+from nemo.collections.tts.parts.utils.helpers import plot_alignment_to_numpy_for_speechllm
+import numpy as np
+from nemo.utils import AppState
 
 try:
     import apex.transformer.pipeline_parallel.utils
@@ -2083,7 +2086,113 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 class MegatronMultiEncoderGPTModel(MegatronGPTModel):
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
         super().__init__(cfg=cfg, trainer=trainer)
+        codec_model = AudioCodecModel.restore_from(cfg.get('codecmodel_path'))
+        codec_model.to('cuda')
+        codec_model.eval()
+        self.sample_rate = 22050
+        self.additional_models = {'codec': codec_model}
+        app_state = AppState()
+        self.is_rank_zero = app_state.global_rank == 0
     
+    def decode_wav_from_codec_model(self, codes):
+        # codes: [C, T]
+        codec_model = self.additional_models['codec']
+        codec_len = torch.Tensor([codes.shape[1]]).long().cuda()
+        wav, _ = codec_model.decode(tokens=codes.unsqueeze(0), tokens_len=codec_len)
+        wav = wav[0]    
+        return wav
+    
+    def custom_autoregressive_inference(self, batch, prompt_len=10, pred_steps=2000):
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=False):
+                curr_tokens = batch['tokens'][:,:,:prompt_len] # (B, 8, T)
+                curr_position_ids = batch['position_ids'][:,:prompt_len]
+                curr_attention_mask = None
+                if batch['attention_mask'] is not None:
+                    curr_attention_mask = batch['attention_mask'][:,:,:prompt_len,:prompt_len]
+                output_token_list = []
+                text_tokens = batch['text_tokens']
+                context_tokens = batch['context_BCT']
+                curr_loss_mask = batch['loss_mask'][:, :prompt_len]
+                curr_labels = batch['labels'][:,:,:prompt_len]
+                # import ipdb; ipdb.set_trace()
+                text_embedding_TBC, context_embeddings_TBC = self.model.module.prepare_encoder_outputs(text_tokens, context_tokens)
+                
+                speech_codebook_size = self.cfg.speech_codebook_size
+                speech_token_offset = self.cfg.speech_token_offset
+
+                pred_steps = min(pred_steps, batch['tokens'].shape[2] - prompt_len)
+                for _t in range(pred_steps):
+                    print("Inference Step: ", _t)
+                    _, additional_tensors = self.model(
+                        input_ids=curr_tokens,
+                        position_ids=curr_position_ids,
+                        attention_mask=curr_attention_mask,
+                        loss_mask=curr_loss_mask,
+                        labels=curr_labels,
+                        text_mask=batch['text_mask'],
+                        context_mask=batch['context_mask'],
+                        cross_attention_text_prior=None,
+                        return_logits=True,
+                        text_embedding_TBC=text_embedding_TBC,
+                        context_embeddings_TBC=context_embeddings_TBC,
+                    )
+                    logits, _ = additional_tensors
+                    
+                    logits = logits.transpose(0, 1).contiguous()
+                    all_speech_logits = []
+                    all_speech_token_preds = []
+                    for _i in range(self.cfg.num_speech_codebooks):
+                        
+                        logit_si = speech_token_offset + speech_codebook_size * _i
+                        layer_logits = logits[:,:,logit_si:logit_si+speech_codebook_size]
+                        all_speech_token_preds.append(layer_logits.argmax(dim=-1))
+                        all_speech_logits.append(layer_logits)
+                    
+                    all_speech_logits = torch.stack(all_speech_logits, dim=-1) # (T, B, 1024, 8)
+                    
+                    output_logits_currtimestep = (
+                        all_speech_logits[:,-1, :, :].permute(0, 2, 1).contiguous().view(-1, self.cfg.speech_codebook_size)
+                    )  # (B*8, V)
+                    top_k = self.cfg.get('top_k', 80)
+                    output_logits_currtimestep_topk = torch.topk(output_logits_currtimestep, top_k, dim=1)[0] # (B*8, 10) or (B, 10)
+                    # find indices which are not top k
+                    indices_to_remove = output_logits_currtimestep < output_logits_currtimestep_topk[:, -1].unsqueeze(1)
+                    output_logits_currtimestep_rescored = output_logits_currtimestep.clone()
+                    output_logits_currtimestep_rescored[indices_to_remove] = -float('Inf')
+
+                    temperature = self.cfg.get('temperature', 0.85)  # Set temp 0.01 for greedy decoding
+                    output_logits_currtimestep_rescored = output_logits_currtimestep_rescored / temperature
+                    output_logits_currtimestep_rescored = torch.nn.functional.softmax(
+                        output_logits_currtimestep_rescored, dim=1
+                    )
+                    
+                    output_tokens_curr_timestep = torch.multinomial(
+                        output_logits_currtimestep_rescored, num_samples=1
+                    )  # (B*8, 1)
+
+                    output_tokens_curr_timestep = output_tokens_curr_timestep.view(
+                        logits.shape[0], self.cfg.num_speech_codebooks
+                    )
+
+                    output_token_list.append(output_tokens_curr_timestep)
+
+                    output_tokens_curr_timestep_adjusted = (output_tokens_curr_timestep * 1).long()
+                    for _i in range(self.cfg.num_speech_codebooks):
+                        output_tokens_curr_timestep_adjusted[:, _i] = output_tokens_curr_timestep_adjusted[:, _i] + speech_token_offset + (speech_codebook_size * _i)
+                        
+                    curr_tokens = torch.cat([curr_tokens, output_tokens_curr_timestep_adjusted.unsqueeze(2)], dim=2)
+                    curr_position_ids = batch['position_ids'][:,:prompt_len+_t+1]
+                    curr_attention_mask = batch['attention_mask'][:,:,:prompt_len+_t+1,:prompt_len+_t+1]
+                    curr_loss_mask = torch.cat([curr_loss_mask, torch.ones_like(curr_loss_mask[:,0]).unsqueeze(1)], dim=1)
+                    curr_labels = batch['labels'][:,:,:prompt_len+_t+1]
+
+                output_tokens_combined = torch.stack(output_token_list)  # (T, B, 8)
+                output_tokens_combined = output_tokens_combined.permute(1, 2, 0)  # (B, 8, T)
+
+                return output_tokens_combined
+
+
     def model_provider_func(self, pre_process, post_process):
         if self.mcore_gpt:
             raise NotImplementedError("No mcore for multiencoder gpt model")
@@ -2115,6 +2224,10 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
             speech_token_offset=self.cfg.speech_token_offset,
             num_speech_codebooks=self.cfg.num_speech_codebooks,
             speech_codebook_size=self.cfg.speech_codebook_size,
+            use_alignment_loss=self.cfg.use_alignment_loss,
+            alignment_loss_scale=self.cfg.alignment_loss_scale,
+            attn_prior_scaledown_start_step=self.cfg.attn_prior_scaledown_start_step,
+            attn_prior_end_step=self.cfg.attn_prior_end_step,
             config=self.model_parallel_config,
             vocab_size=self.cfg.get('override_vocab_size', self.padded_vocab_size),
             hidden_size=self.cfg.hidden_size,
@@ -2214,6 +2327,8 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
             speech_codebook_size=self.cfg.speech_codebook_size,
             codebook_fps=self.cfg.codebook_fps,
             max_seq_length=self.cfg.data.seq_length,
+            attention_prior_scaling_factor=self.cfg.attention_prior_scaling_factor,
+            lm_vocab_size=self.cfg.lm_vocab_size,
         )
 
         rank = parallel_state.get_data_parallel_rank()
@@ -2277,6 +2392,10 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
                 'loss_mask': batch['loss_mask'],
                 'text_tokens': batch.get('text_tokens', None),
                 'text_mask': batch.get('text_mask', None),
+                'cross_attention_text_prior': batch.get('cross_attention_text_prior', None),
+                'context_tokens': batch.get('context_BCT', None),
+                'context_mask': batch.get('context_mask', None),
+                'return_logits': validation_step,
             }
 
             if not self.mcore_gpt:
@@ -2314,11 +2433,19 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
                         qkv_format='thd',
                     )
 
-            output_tensor = model(**forward_args)
-
-            def loss_func(output_tensor):
+            output_tensors, logits = model(**forward_args)
+            if not validation_step:
+                alignment_loss = output_tensors[1]
+                if alignment_loss is not None and self.global_step % 10 == 0:
+                    self.logger.experiment.add_scalar('train_alignment_loss', alignment_loss, self.global_step)
+                
+            def loss_func(output_tensors):
                 # Loss for a micro-batch (ub)
+                output_tensor, alignment_loss = output_tensors[0], output_tensors[1]
                 loss_for_ub = self.loss_func(batch['loss_mask'], batch['num_valid_tokens_in_ub'], output_tensor)
+                if alignment_loss is not None:
+                    loss_for_ub += alignment_loss
+
                 cp_size = parallel_state.get_context_parallel_world_size()
                 if self.return_output_tensors:
                     # TODO: need a better way to check if loss_func is returning more stuff than just loss... (@adithyare)
@@ -2364,7 +2491,7 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
                     reduced_loss = average_losses_across_data_parallel_group([loss_for_ub])
                     return loss_for_ub * cp_size, {'avg': reduced_loss}
 
-            return output_tensor, loss_func
+            return output_tensors, loss_func
 
         return fwd_output_and_loss_func
 
@@ -2405,6 +2532,10 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
             
             extra_arg['text_tokens'] = batch.get('text_tokens', None)
             extra_arg['text_mask'] = batch.get('text_mask', None)
+            extra_arg['cross_attention_text_prior'] = batch.get('cross_attention_text_prior', None)
+            extra_arg['context_tokens'] = batch.get('context_BCT', None)
+            extra_arg['context_mask'] = batch.get('context_mask', None)
+
             # Currently for all MCore transformer layer specs causal attention mask
             # is used so we can delegate creating it to MCore/TE and pass None below
             if (
@@ -2429,3 +2560,167 @@ class MegatronMultiEncoderGPTModel(MegatronGPTModel):
             return output_tensor, id_func
 
         return fwd_output_only_func
+
+
+    def validation_step(self, dataloader_iter, dataloader_idx=0):
+        """
+        Our dataloaders produce a micro-batch and then we fetch
+        a number of microbatches depending on the global batch size and model parallel size
+        from the dataloader to produce a list of microbatches.
+        The list of microbatches is then piped through the pipeline using megatron-core fwd/bwd functions.
+        """
+        print("Validation Step", dataloader_idx, dataloader_idx)
+        mode = 'test' if self.trainer.testing else 'val'
+        # Initialize userbuffer communicators.
+        if self.initialize_ub:
+            self.initialize_ub_func()
+
+        if isinstance(self.model, list):
+            for model_module in self.model:
+                model_module.eval()
+        else:
+            self.model.eval()
+
+        if self.cfg.get('fp8', False):
+            first_val_step = self.prev_step_training and not self.training
+            self.prev_step_training = self.training
+        else:
+            first_val_step = None
+
+        with torch.no_grad():
+            # loss = self.fwd_bwd_step(dataloader_iter, True, first_val_step)
+            dataloader_iter = self._make_data_iterator_list(dataloader_iter)
+            batch, batch_idx, _ = next(dataloader_iter)
+            
+            batch = {
+                key: val.cuda(non_blocking=True) if isinstance(val, torch.Tensor) else None
+                for key, val in batch.items()
+            }
+
+            batch = self.get_batch_on_this_context_parallel_rank(batch)
+
+            forward_args = {
+                'input_ids': batch['tokens'],
+                'position_ids': batch['position_ids'],
+                'attention_mask': None if self.get_attention_mask_from_fusion else batch['attention_mask'],
+                'labels': batch['labels'] if 'labels' in batch else None,
+                'loss_mask': batch['loss_mask'],
+                'text_tokens': batch.get('text_tokens', None),
+                'text_mask': batch.get('text_mask', None),
+                'cross_attention_text_prior': batch.get('cross_attention_text_prior', None),
+                'context_tokens': batch.get('context_BCT', None),
+                'context_mask': batch.get('context_mask', None),
+                'return_logits': True,
+            }
+
+            if not self.mcore_gpt:
+                forward_args['checkpoint_activations_all_layers'] = None
+                if not self.use_loss_mask:
+                    forward_args.pop('loss_mask')
+            else:
+                # TODO: @eharper can we add this to mcore?
+                forward_args.pop('loss_mask')
+            
+            forward_args['global_step'] = self.global_step
+            output_tensors, additional_tensors = self.model(**forward_args)
+            # logits # (T, B, V)
+            logits, text_cross_attention_probs = additional_tensors[0], additional_tensors[1]
+            layerwise_metrics = {}
+            loss_total = 0.0
+            all_preds = []
+            labels_1024 = []
+            labels_mask = batch['labels'][:,0,:] > 0
+            print("batch idx", batch_idx)
+            for _i in range(self.cfg.num_speech_codebooks):
+                speech_codebook_size = self.cfg.speech_codebook_size
+                speech_token_offset = self.cfg.speech_token_offset
+                logit_si = speech_token_offset + speech_codebook_size * _i
+                logit_ei = speech_token_offset + speech_codebook_size * (_i + 1)
+                
+                labels_codebook = (batch['labels'][:,_i,:] - logit_si) * labels_mask
+                layer_logits = logits[:,:,logit_si:logit_ei]
+                
+                layer_preds = layer_logits.argmax(dim=-1).permute(1, 0) # (B, T)
+                if batch_idx == 0 and self.is_rank_zero:
+                    all_preds.append(layer_preds)
+                    labels_1024.append(labels_codebook)
+
+                layer_acc = (((layer_preds == labels_codebook).float() * batch['loss_mask']).sum() / batch['loss_mask'].sum()).item()
+                layer_logits_bvt = layer_logits.permute(1, 2, 0) # (B, 1024, T)
+                layer_loss = torch.nn.functional.cross_entropy(layer_logits_bvt, labels_codebook, reduction='none')
+                layer_loss = ((layer_loss * batch['loss_mask']).sum() / batch['loss_mask'].sum()).item()
+
+                layerwise_metrics[f'layer_{_i}_acc'] = layer_acc
+                layerwise_metrics[f'layer_{_i}_loss'] = layer_loss
+                loss_total += layer_loss
+            
+            if batch_idx == 0 and self.is_rank_zero:
+                labels_1024 = torch.stack(labels_1024, dim=1)
+                preds_1024 = torch.stack(all_preds, dim=1)
+                audio_len = int(labels_mask[0].sum().item())
+                text_len = int(batch['text_mask'][0].sum().item())
+                labels_single = labels_1024[0,:,:audio_len-1]
+                preds_single = preds_1024[0,:,:audio_len-1]
+
+                label_audio = self.decode_wav_from_codec_model(labels_single)
+                pred_audio = self.decode_wav_from_codec_model(preds_single)
+
+                self.logger.experiment.add_audio("val_label_wav", label_audio, self.global_step, self.sample_rate)
+                self.logger.experiment.add_audio("val_pred_wav_TF", pred_audio, self.global_step, self.sample_rate)
+
+                text_cross_attention_probs_stacked = torch.cat(text_cross_attention_probs, dim=1)
+                text_cross_attention_probs_example = text_cross_attention_probs_stacked[0]
+                text_cross_attention_probs_example_mean = text_cross_attention_probs_example.mean(dim=0)
+                text_cross_attention_probs_example_mean_sliced = text_cross_attention_probs_example_mean[:audio_len,:text_len] # (audio_len, enc_len)
+                alignment_image_sliced = plot_alignment_to_numpy_for_speechllm(
+                    text_cross_attention_probs_example_mean_sliced.cpu().float().numpy().T,
+                    phoneme_seq=None,
+                    phoneme_ver=2,
+                    vmin=0.0,
+                    phone_offset=0,
+                    h_offset=False,
+                )
+                self.logger.experiment.add_image("val_alignment", alignment_image_sliced, self.global_step, dataformats='HWC')
+
+                if self.cfg.get('autoregressive_validation', False):    
+                    autoregressive_tokens = self.custom_autoregressive_inference(batch, prompt_len=1, pred_steps=500) # (B, 8, T)
+                    # Clamp to 0-1023
+                    autoregressive_tokens = torch.clamp(autoregressive_tokens, 0, 1024)
+                    autoregressive_audio = self.decode_wav_from_codec_model(autoregressive_tokens[0,:,:audio_len-1])
+                    self.logger.experiment.add_audio("val_autoregressive_wav", autoregressive_audio, self.global_step, self.sample_rate)
+
+
+        if isinstance(self.model, list):
+            for model_module in self.model:
+                model_module.train()
+        else:
+            self.model.train()
+
+        self.validation_step_outputs.append({
+            'loss': loss_total,
+            'layerwise_metrics': layerwise_metrics,
+        })
+        
+        # Clears memory
+        torch.cuda.empty_cache()
+        
+        return loss_total
+
+    def on_validation_epoch_end(self):
+        if parallel_state.is_pipeline_last_stage():
+            # only the last pipeline parallel stages return loss with their batch size
+            for _i in range(8):
+                layer_acc = np.mean([x['layerwise_metrics'][f'layer_{_i}_acc'] for x in self.validation_step_outputs]).item()
+                layer_loss = np.mean([x['layerwise_metrics'][f'layer_{_i}_loss'] for x in self.validation_step_outputs]).item()
+                self.log(f'val_layer_{_i}_acc', layer_acc, prog_bar=True, rank_zero_only=True, batch_size=1)
+                self.log(f'val_layer_{_i}_loss', layer_loss, prog_bar=True, rank_zero_only=True, batch_size=1)
+            
+            loss_list = [x['loss'] for x in self.validation_step_outputs]
+            averaged_loss = np.mean(loss_list).item()
+            self.log('val_loss', averaged_loss, prog_bar=True, rank_zero_only=True, batch_size=1)
+                
+        self.validation_step_outputs.clear()
+        torch.cuda.empty_cache()
+        return averaged_loss
+
+    

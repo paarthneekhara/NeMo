@@ -764,6 +764,8 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
         multi_encoder_outputs=None,
         multi_encoder_to_layer_mapping=None,
         multi_encoder_enc_dec_attn_masks=None,
+        multi_encoder_cross_attention_priors=None,
+        return_cross_attention_scores=False,
     ):
         # Embeddings.
         if self.pre_process and encoder_input is None:
@@ -850,10 +852,14 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
                 if rotary_pos_emb is not None
                 else None,  # This assumes that this being used as a GPT/BERT model only (no cross-attention)
                 self_attention_relative_position_bias=encoder_self_attention_relative_position_bias,
+                return_all_crossattention_probs=return_cross_attention_scores,
                 multi_encoder_outputs=multi_encoder_outputs,
                 multi_encoder_to_layer_mapping=multi_encoder_to_layer_mapping,
                 multi_encoder_enc_dec_attn_masks=multi_encoder_enc_dec_attn_masks,
+                multi_encoder_cross_attention_priors=multi_encoder_cross_attention_priors,
             )
+            if return_cross_attention_scores:
+                encoder_output, cross_attention_scores_list = encoder_output
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
 
@@ -868,7 +874,10 @@ class TransformerLanguageModel(MegatronModule, adapter_mixins.AdapterModuleMixin
             if self.add_pooler and self.post_process:
                 return encoder_output, pooled_output
             else:
-                return encoder_output
+                if return_cross_attention_scores:
+                    return encoder_output, cross_attention_scores_list
+                else:
+                    return encoder_output
 
         # Decoder Embedding
         dec_embedding_output = self.embedding(dec_input_ids, dec_position_ids)

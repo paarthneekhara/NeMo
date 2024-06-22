@@ -16,7 +16,7 @@ trainer:
   max_epochs: -1 # PTL default. In practice, max_steps will be reached first.
   max_steps: 100000 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
   log_every_n_steps: 10
-  val_check_interval: 100
+  val_check_interval: 500
   limit_val_batches: 50
   limit_test_batches: 500
   accumulate_grad_batches: 1 # do not modify, grad acc is automatic for training megatron models
@@ -71,8 +71,8 @@ model:
   use_loss_mask: True
   # specify micro_batch_size, global_batch_size, and model parallelism
   # gradient accumulation will be done automatically based on data_parallel_size
-  micro_batch_size: 2 # limited by GPU memory
-  global_batch_size: 4 # will use more micro batches to reach global batch size
+  micro_batch_size: 4 # limited by GPU memory
+  global_batch_size: 8 # will use more micro batches to reach global batch size
   rampup_batch_size: null # Should be a list of 3 values: [<start_batch_size>, <batch_size_increment>, <rampup_samples>]
   tensor_model_parallel_size: 1 # intra-layer model parallelism
   pipeline_model_parallel_size: 1 # inter-layer model parallelism
@@ -142,7 +142,7 @@ model:
   bias_activation_fusion: True # Use a kernel that fuses the bias addition from weight matrices with the subsequent activation function.
   bias_dropout_add_fusion: True # Use a kernel that fuses the bias addition, dropout and residual connection addition.
   masked_softmax_fusion: True # Use a kernel that fuses the attention softmax with it's mask.
-  get_attention_mask_from_fusion: True # When using fused softmax it will create the attention mask so we won't copy it to the pipeline stages.
+  get_attention_mask_from_fusion: False # When using fused softmax it will create the attention mask so we won't copy it to the pipeline stages.
   apply_rope_fusion: False # Use a kernel to add rotary positional embeddings. Only used if position_embedding_type=rope
 
 
@@ -244,12 +244,19 @@ model:
   num_speech_codebooks: 8
   speech_codebook_size: 1152 # Some extra tokens beyond 1024, keeping it divisible by 128
   codebook_fps: 86
+  use_alignment_loss: True
+  attention_prior_scaling_factor: 0.1
+  attn_prior_scaledown_start_step: 10000
+  attn_prior_end_step: 15000
+  alignment_loss_scale: 0.01
+  codecmodel_path: "/datap/misc/Checkpoints/SpeechCodec_2402.nemo"
+  autoregressive_validation: True
 
   data:
-    train_ds: ["/datap/misc/speechllm_codecdatasets/manifests/LibriValOrig_nemo_codec_bw_6.0_phoneme_tts.json"]
-    validation_ds: ["/datap/misc/speechllm_codecdatasets/manifests/LibriValOrig_nemo_codec_bw_6.0_phoneme_tts.json"]
+    train_ds: ["/datap/misc/speechllm_codecdatasets/manifests/riva_local_train.json"]
+    validation_ds: ["/datap/misc/speechllm_codecdatasets/manifests/riva_local_val.json"]
     seq_length: ${model.encoder_seq_length}
-    num_workers: 0
+    num_workers: 4
     dataloader_type: single # cyclic
 
   # Nsys profiling options
@@ -262,16 +269,16 @@ model:
 
   optim:
     name: fused_adam
-    lr: 2e-4
+    lr: 1e-4
     weight_decay: 0.01
     betas:
     - 0.9
     - 0.98
-    sched:
-      name: CosineAnnealing
-      warmup_steps: 500
-      constant_steps: 0
-      min_lr: 2e-5
+    # sched:
+    #   name: CosineAnnealing
+    #   warmup_steps: 500
+    #   constant_steps: 0
+    #   min_lr: 2e-5
 
   gc_interval: 0
   # Interval of the host memory garbage collection. When it is zero, collectiion relies on the automatic garbage collector.

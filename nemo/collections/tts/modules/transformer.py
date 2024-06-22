@@ -274,6 +274,8 @@ class FFTransformerEncoder(FFTransformerDecoder):
         d_embed=None,
         padding_idx=0,
         condition_types=[],
+        multi_codebook_embedding=False,
+        n_codebooks=1,
     ):
         super(FFTransformerEncoder, self).__init__(
             n_layer,
@@ -290,7 +292,16 @@ class FFTransformerEncoder(FFTransformerDecoder):
         )
 
         self.padding_idx = padding_idx
-        self.word_emb = nn.Embedding(n_embed, d_embed or d_model, padding_idx=self.padding_idx)
+        if not multi_codebook_embedding:
+            self.word_emb = nn.Embedding(n_embed, d_embed or d_model, padding_idx=self.padding_idx)
+        else:
+            self.word_emb = nn.ModuleList(
+                [
+                    nn.Embedding(n_embed, d_embed or d_model, padding_idx=self.padding_idx)
+                    for _ in range(n_codebooks)
+                ]
+            )
+
 
     @property
     def input_types(self):
@@ -299,9 +310,24 @@ class FFTransformerEncoder(FFTransformerDecoder):
             "conditioning": NeuralType(('B', 'T', 'D'), EncodedRepresentation(), optional=True),
         }
 
-    def forward(self, input, conditioning=0):
+    def embed_input(self, input):
+        if isinstance(self.word_emb, nn.Embedding):
+            return self.word_emb(input)
+        else:
+            embed = None
+            for c in range(input.size(1)):
+                if embed is None:
+                    embed = self.word_emb[c](input[:,c,:])
+                else:
+                    embed += self.word_emb[c](input[:,c,:])
+            return embed
 
-        return self._forward(self.word_emb(input), (input != self.padding_idx).unsqueeze(2), conditioning)  # (B, L, 1)
+    def forward(self, input, conditioning=0):
+        if input.dim() == 2:
+            mask = (input != self.padding_idx).unsqueeze(2)
+        else:
+            mask = (input[:,0,:] != self.padding_idx).unsqueeze(2)
+        return self._forward(self.embed_input(input), mask, conditioning)  # (B, L, 1)
 
 
 class FFTransformer(nn.Module):

@@ -706,7 +706,7 @@ def check_resume(
         files_to_move = []
         if Path(log_dir).exists():
             for child in Path(log_dir).iterdir():
-                if child.is_file():
+                if child.is_file() and not child.name.startswith("events.out.tfevents"):
                     files_to_move.append(child)
 
         if len(files_to_move) > 0:
@@ -827,7 +827,7 @@ def get_log_dir(
                 os.environ[NEMO_ENV_VARNAME_VERSION] = "" if version is None else version
 
     log_dir = Path(_exp_dir) / Path(str(name)) / Path("" if version is None else str(version))
-    return log_dir, str(_exp_dir), name, version
+    return log_dir, str(_exp_dir), name, "" if version is None else str(version)
 
 
 def get_git_hash():

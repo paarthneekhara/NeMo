@@ -481,6 +481,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self_attention_relative_position_bias=None,
         cross_attention_relative_position_bias=None,
         checkpoint_core_attention=False,
+        return_crossattention_scores=False,
     ):
         # Self attention.
         if rotary_pos_emb is not None:
@@ -588,7 +589,10 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     rotary_pos_emb=cross_attention_pos_emb,
                     relative_position_bias=cross_attention_relative_position_bias,
                     checkpoint_core_attention=checkpoint_core_attention,
+                    return_scores=return_crossattention_scores,
                 )
+                if return_crossattention_scores:
+                    attention_output, attention_probs = attention_output
 
             # If normformer, apply norm on the output of the self attention.
             if self.transformer_block_type == 'normformer':
@@ -632,6 +636,9 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
 
         if get_key_value:
             output = [output, presents]
+
+        if return_crossattention_scores and self.layer_type == LayerType.decoder:
+            output = [output, attention_probs]
 
         return output
 
@@ -736,6 +743,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         self_attention_relative_position_bias=None,
         cross_attention_relative_position_bias=None,
         checkpoint_core_attention=False,
+        return_crossattention_scores=False,
     ):
         if self.dtype == torch.float32:
             return super().forward(
@@ -751,6 +759,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
                 self_attention_relative_position_bias,
                 cross_attention_relative_position_bias,
                 checkpoint_core_attention,
+                return_crossattention_scores=return_crossattention_scores,
             )
         with torch.autocast(device_type="cuda", dtype=self.dtype):
             return super().forward(
@@ -766,6 +775,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
                 self_attention_relative_position_bias,
                 cross_attention_relative_position_bias,
                 checkpoint_core_attention,
+                return_crossattention_scores=return_crossattention_scores,
             )
 
 
@@ -1498,12 +1508,16 @@ class ParallelTransformer(MegatronModule):
         return_all_selfattention_probs=False,
         multi_encoder_outputs=None,
         multi_encoder_to_layer_mapping=None,
-        multi_encoder_enc_dec_attn_masks=None
+        multi_encoder_enc_dec_attn_masks=None,
+        multi_encoder_cross_attention_priors=None,
     ):
         layer_idx_to_encoder_idx = {}
         for encoder_idx, layers in enumerate(multi_encoder_to_layer_mapping):
             for layer_idx in layers:
                 layer_idx_to_encoder_idx[layer_idx] = encoder_idx
+        
+        if len(multi_encoder_outputs) > 0:
+            assert not self.transformer_engine, 'multi-encoder is not supported with transformer engine'
         # Checks.
         if inference_max_sequence_len:
             assert self.activations_checkpoint_method is None, 'inference does not work with activation checkpointing'
@@ -1593,15 +1607,18 @@ class ParallelTransformer(MegatronModule):
                             logging.warning("Returning embeddings states only!")
                             return hidden_states
 
+                    cross_attention_probs_layerwise = {}
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
                         past = None
 
                         _encoder_output = encoder_output
                         _enc_dec_attn_mask = enc_dec_attn_mask
+                        _cross_attention_relative_position_bias = cross_attention_relative_position_bias
                         if index in layer_idx_to_encoder_idx:
                             _encoder_output = multi_encoder_outputs[layer_idx_to_encoder_idx[index]]
                             _enc_dec_attn_mask = multi_encoder_enc_dec_attn_masks[layer_idx_to_encoder_idx[index]]
+                            _cross_attention_relative_position_bias = multi_encoder_cross_attention_priors[layer_idx_to_encoder_idx[index]]
 
                         if layer_past is not None:
                             past = layer_past[index]
@@ -1654,9 +1671,13 @@ class ParallelTransformer(MegatronModule):
                                 inference_max_sequence_len=inference_max_sequence_len,
                                 rotary_pos_emb=rotary_pos_emb,
                                 self_attention_relative_position_bias=self_attention_relative_position_bias,
-                                cross_attention_relative_position_bias=cross_attention_relative_position_bias,
+                                cross_attention_relative_position_bias=_cross_attention_relative_position_bias,
                                 checkpoint_core_attention=checkpoint_core_attention,
+                                return_crossattention_scores=return_all_crossattention_probs,
                             )
+                            if return_all_crossattention_probs and layer.layer_type == LayerType.decoder:
+                                hidden_states, cross_attention_probs = hidden_states
+                                cross_attention_probs_layerwise[index] = cross_attention_probs
 
                         if self.return_select_layer < 0:
                             assert (
@@ -1689,5 +1710,8 @@ class ParallelTransformer(MegatronModule):
 
         if get_key_value:
             output = [output, presents]
+        
+        if return_all_crossattention_probs:
+            output = [output, cross_attention_probs_layerwise]
 
         return output
