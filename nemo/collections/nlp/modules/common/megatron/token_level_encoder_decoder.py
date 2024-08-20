@@ -534,23 +534,14 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
         # In order of precedence, we use enc_output, enc_input, and then enc_input_ids to determine the encoder sequence length.
         if enc_output is not None:
             # If enc_output is provided in `batch_for_pipeline`, we need to transpose it from [B x S x H] -> [S x B x H].
-            if isinstance(enc_output, list):
-                enc_output = [x.transpose(0, 1) for x in enc_output]
-                enc_seq_length = [x.size(0) for x in enc_output]
-            else:
-                enc_output = enc_output.transpose(0, 1)
-                enc_seq_length = enc_output.size(0)
+            enc_output = enc_output.transpose(0, 1)
+            enc_seq_length = enc_output.size(0)
         elif enc_input is not None:
             # If enc_input is provided, we need to transpose it from [B x S x H] -> [S x B x H].
-            if isinstance(enc_input, list):
-                enc_input = [x.transpose(0, 1) for x in enc_input]
-                enc_seq_length = [x.size(0) for x in enc_input]
-            else:
-                enc_input = enc_input.transpose(0, 1)
-                enc_seq_length = enc_input.size(0)
+            enc_input = enc_input.transpose(0, 1)
+            enc_seq_length = enc_input.size(0)
         # Only need to run encoder embedding and position ids if enc_input or enc_output is not provided.
         elif enc_input_ids is not None:
-            assert False, "This should not be reached."
             enc_seq_length = enc_input_ids.size(1)
             if self.pre_process and self.add_encoder:
                 # We don't need position ids for RPE, because the embedding layer does not have position embeddings.

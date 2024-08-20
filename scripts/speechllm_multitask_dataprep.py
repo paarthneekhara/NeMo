@@ -38,7 +38,7 @@ class AudioDataset(Dataset):
     def __init__(
         self,
         manifest_paths,
-        min_duration=1.0,
+        min_duration=0.0,
         max_duration=22.0,
         sample_rate=24000,
         noise_manifest_path=None,
