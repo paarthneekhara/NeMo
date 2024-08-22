@@ -440,7 +440,10 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             t5_cfg.precision = trainer.precision
             t5_cfg.tokenizer.num_sentinel_tokens = cfg.get('num_sentinel_tokens', 39184 - 29056)
             t5_cfg.seq_length = cfg.data.max_seq_length
-            t5_cfg.max_position_embeddings = cfg.data.max_seq_length
+            if cfg.get('max_position_embeddings', None) is None:
+                t5_cfg.max_position_embeddings = cfg.data.max_seq_length
+            else:
+                t5_cfg.max_position_embeddings = cfg.get('max_position_embeddings')
             t5_cfg.use_flash_attention = cfg.get('use_flash_attention', False)
             if cfg.get('override_token_model', None):
                 t5_cfg.tokenizer.model = cfg['override_token_model']
