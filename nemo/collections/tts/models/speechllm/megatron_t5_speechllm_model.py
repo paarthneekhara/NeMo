@@ -72,6 +72,8 @@ except (ImportError, ModuleNotFoundError):
 
 
 import time
+import torchaudio
+from torchaudio.pipelines import SQUIM_OBJECTIVE, SQUIM_SUBJECTIVE
 from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 import librosa
 
@@ -1782,10 +1784,20 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 wavlm_sv_model = self.additional_models['wavlm_sv_model']
                 wavlm_sv_extractor = self.additional_models['wavlm_sv_extractor']
 
+            if 'squim_mos_model' not in self.additional_models:
+                squim_mos_model = SQUIM_SUBJECTIVE.get_model().to(device)
+                self.additional_models['squim_mos_model'] = squim_mos_model
+            else:
+                squim_mos_model = self.additional_models['squim_mos_model']
+
             _exp_dir_path = self.logger.log_dir
             _exp_dir_path = _exp_dir_path + '/Sample_Audios'
             if not os.path.exists(_exp_dir_path):
                 os.mkdir(_exp_dir_path)
+
+            squim_mos_list = []
+            squim_mos_list_context_gt = []
+            squim_mos_list_context_pred = []
             similarity_list = []
             similarity_list_wavlm = []
             pred_context_similarity_list = []
@@ -1896,12 +1908,12 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     similarity_list.append(similarity)
 
                     # speaker verification evaluation using wavlm model
-                    ref_wavlm_wav, _ = librosa.load(audio_fp_gt, sr=16000)
-                    pred_wavlm_wav, _ = librosa.load(audio_fp_pred, sr=16000)
-                    inputs_wavlm = wavlm_sv_extractor([pred_wavlm_wav, ref_wavlm_wav], padding=True, return_tensors="pt")
+                    gt_16khz_wav, _ = librosa.load(audio_fp_gt, sr=16000)
+                    pred_16khz_wav, _ = librosa.load(audio_fp_pred, sr=16000)
+                    inputs_wavlm = wavlm_sv_extractor([pred_16khz_wav, gt_16khz_wav], padding=True, return_tensors="pt")
                     for key in inputs_wavlm.keys():
                         inputs_wavlm[key] = inputs_wavlm[key].to(device)
-        
+
                     with torch.no_grad():
                         wavlm_embeddings = wavlm_sv_model(**inputs_wavlm).embeddings
                         wavlm_embeddings = torch.nn.functional.normalize(wavlm_embeddings, dim=-1).cpu()
@@ -1912,6 +1924,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         np.linalg.norm(spk_embedding_pred_wavlm) * np.linalg.norm(spk_embedding_gt_wavlm)
                     )
                     similarity_list_wavlm.append(similarity_wavlm)
+
+                    squim_mos_score = squim_mos_model(torch.from_numpy(pred_16khz_wav).to(device).unsqueeze(0), torch.from_numpy(gt_16khz_wav).to(device).unsqueeze(0)).item()
+                    squim_mos_list.append(squim_mos_score)
 
                     if lang[i] == Lang.zh.value:
                         audio_to_pred_zh.append({"step": i, "audio": audio_fp_pred})
@@ -1997,6 +2012,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     gt_similarity_context_wavlm = np.dot(spk_embedding_context_wavlm, spk_embedding_gt_wavlm) / (
                         np.linalg.norm(spk_embedding_context_wavlm) * np.linalg.norm(spk_embedding_gt_wavlm)
                     )
+
+                    squim_mos_score_context_gt = squim_mos_model(torch.from_numpy(gt_16khz_wav).to(device).unsqueeze(0), context_wav.to(device).unsqueeze(0)).item()
+                    squim_mos_score_context_pred = squim_mos_model(torch.from_numpy(pred_16khz_wav).to(device).unsqueeze(0), context_wav.to(device).unsqueeze(0)).item()
+                    squim_mos_list_context_gt.append(squim_mos_score_context_gt)
+                    squim_mos_list_context_pred.append(squim_mos_score_context_pred)
 
                     if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Context Pred', pred_similarity_context, step)
@@ -2130,6 +2150,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             pred_context_similarity_avg_wavlm = np.mean(pred_context_similarity_list_wavlm)
             gt_context_similarity_avg_wavlm = np.mean(gt_context_similarity_list_wavlm)
 
+
+            squim_mos_avg = np.mean(squim_mos_list)
+            squim_mos_context_gt_avg = np.mean(squim_mos_list_context_gt)
+            squim_mos_context_pred_avg = np.mean(squim_mos_list_context_pred)
+
             if log_scalars:
                 self.logger.experiment.add_scalar(f'Inf SV Avg Cossim', similarity_avg, batch_idx)
             self.predict_step_outputs.append(
@@ -2140,6 +2165,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     'wavlm_avg_cossim': similarity_avg_wavlm,
                     'wavlm_avg_cossim_context_pred': pred_context_similarity_avg_wavlm,
                     'wavlm_avg_cossim_context_gt': gt_context_similarity_avg_wavlm,
+                    'squim_mos_pred_GT': squim_mos_avg,
+                    'squim_mos_GT_context': squim_mos_context_gt_avg,
+                    'squim_mos_pred_context': squim_mos_context_pred_avg,
                     'cer_transcript': np.mean(cer_batch),
                     'wer_transcript': np.mean(wer_batch),
                     'cer_phoneme': np.mean(cer_phoneme) if len(cer_phoneme) > 0 else None,
