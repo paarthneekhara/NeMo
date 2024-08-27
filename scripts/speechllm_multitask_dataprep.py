@@ -393,7 +393,7 @@ def save_batch_audios(batch, bidx, temp_dir, codec_model, codec_model_type='enco
                     elif codec_model_type == 'dac':
                         _z = codec_model.quantizer.from_codes(codec.unsqueeze(0))[0]
                         codec_decoded_audio = codec_model.decoder(_z)[0][0]
-                    elif codec_model_type in ['nemo_codec', 'nemo_codec21', 'nemo_codec211k']:
+                    elif codec_model_type in ['nemo_codec', 'nemo_codec21', 'nemo_codec211k', 'nemo_codec214k']:
                         codec_len = torch.Tensor([codec.shape[1]]).long().cuda()
                         codec_decoded_audio, _ = codec_model.decode(tokens=codec.unsqueeze(0), tokens_len=codec_len)
                         codec_decoded_audio = codec_decoded_audio[0]
@@ -431,7 +431,7 @@ def main():
     parser.add_argument('--dataset_name', type=str, default='LibriTTSCorrectContext_train')
     parser.add_argument('--codec_model_path', type=str, default='/Data/Checkpoints/rlang_codec/SpeechCodec.nemo')
     parser.add_argument('--codec_bw', type=float, default=6.0)  # 6 for 8 codebooks, 1.5 for 3 codebooks
-    parser.add_argument('--codec_model', type=str, default='nemo_codec')  # encodec, uniaudio_codec, dac, nemo_codec, nemo_codec21, nemo_codec211k
+    parser.add_argument('--codec_model', type=str, default='nemo_codec')  # encodec, uniaudio_codec, dac, nemo_codec, nemo_codec21, nemo_codec211k, nemo_codec214k
     parser.add_argument('--use_context_as_same_speaker_audio', action='store_true')
     parser.add_argument('--save_only_tts_records', action='store_true')
     parser.add_argument('--shuffle', action='store_true')
@@ -470,7 +470,7 @@ def main():
         codec_model.eval()
         codec_model_sample_rate = 22050
         codec_model_downsampling_factor = 256.0
-    elif args.codec_model in ['nemo_codec21', 'nemo_codec211k']:
+    elif args.codec_model in ['nemo_codec21', 'nemo_codec211k', 'nemo_codec214k']:
         model_path = args.codec_model_path
         codec_model = AudioCodecModel.restore_from(model_path)
         codec_model.to('cuda')
@@ -545,7 +545,7 @@ def main():
                 if not args.save_only_tts_records:
                     _, perturbed_codec_codes, _, _, _ = codec_model.encode(batch["perturbed_audio"].unsqueeze(1))
                     _, mixed_codec_codes, _, _, _ = codec_model.encode(batch["mixed_audio"].unsqueeze(1))
-            elif args.codec_model in ['nemo_codec', 'nemo_codec21', 'nemo_codec211k']:
+            elif args.codec_model in ['nemo_codec', 'nemo_codec21', 'nemo_codec211k', 'nemo_codec214k']:
                 original_codec_codes, _ = codec_model.encode(audio=batch["audio"], audio_len=batch["audio_len"])
                 if not args.save_only_tts_records:
                     perturbed_codec_codes, _ = codec_model.encode(
