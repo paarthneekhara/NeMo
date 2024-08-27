@@ -49,6 +49,7 @@ from nemo.collections.tts.models.speechllm.megatron_base_speechllm_prompt_model 
 from nemo.collections.tts.parts.utils.helpers import plot_alignment_to_numpy_for_speechllm, plot_codec_to_numpy
 from nemo.utils import AppState, logging
 import imageio
+import time
 
 try:
     from apex.transformer.pipeline_parallel.utils import get_micro_batch_size, get_num_microbatches
@@ -1575,7 +1576,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             fwd_bwd_function = get_forward_backward_func()
             encoder_output = None
             atention_probs_all = []
-            
+            start_time = time.time()
             for t in range(self.decoder_context_len + 1, dec_input.shape[2] - 1):
                 # Start at 0 if encoder context, else context_len
                 if t % 100 == 0:
@@ -1714,6 +1715,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 output_tokens_combined = output_tokens_combined.squeeze(2)
                 output_tokens_combined = output_tokens_combined.permute(1, 0)  # (B, T)
 
+            # consider only autoregressive time, disconsider loading eval models for RTF time
+            total_process_time = time.time() - start_time
+
             # Layerwise token error rate
             ter_dict = {}
             for i in range(self.num_speech_codebooks):
@@ -1780,6 +1784,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             wer_score = 0
             audio_to_pred = []
             audio_to_pred_zh = []
+            total_audio_seconds = 0
             for i in range(batch_size):
                 text_end_step = text_limits[i,1].item()
                 text_start_step = text_limits[i,0].item()
@@ -1829,9 +1834,14 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     pred_img = predicted_tokens.data.cpu().float().numpy()
                     dec_inp_img = dec_input_to_1024.data.cpu().float().numpy()
 
-                    
+
+                    start_time = time.time()
                     predicted_tokens = self.convert_tokens_to_range(predicted_tokens, apply_offset_correction=False)
                     predicted_wav = self.decode_wav_from_codec_model(predicted_tokens)
+                    # acummulate audio length in seconds and process time in seconds to the RTF
+                    total_process_time = total_process_time + (time.time() - start_time)
+                    total_audio_seconds = total_audio_seconds + predicted_wav.size(-1) / self.sample_rate
+
                     self.logger.experiment.add_audio("Inf Pred Wav", predicted_wav, step, self.sample_rate)
                     self.logger.experiment.add_image(
                         "Inf Pred Tokens", plot_codec_to_numpy(pred_img), step, dataformats="HWC",
@@ -2074,6 +2084,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     'wer_phoneme_gt': np.mean(wer_phoneme_gt) if len(wer_phoneme_gt) > 0 else None,
                     'cer_tts_gt': np.mean(cer_tts_gt) if len(cer_tts_gt) > 0 else None,
                     'wer_tts_gt': np.mean(wer_tts_gt) if len(wer_tts_gt) > 0 else None,
+                    "RTF": total_process_time / total_audio_seconds,
                 }
             )
 
