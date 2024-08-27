@@ -49,7 +49,6 @@ from nemo.collections.tts.models.speechllm.megatron_base_speechllm_prompt_model 
 from nemo.collections.tts.parts.utils.helpers import plot_alignment_to_numpy_for_speechllm, plot_codec_to_numpy
 from nemo.utils import AppState, logging
 import imageio
-import time
 
 try:
     from apex.transformer.pipeline_parallel.utils import get_micro_batch_size, get_num_microbatches
@@ -70,6 +69,11 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+
+
+import time
+from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+import librosa
 
 __all__ = ['MegatronT5SpeechLMModel']
 
@@ -1765,13 +1769,29 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     self.additional_models['asr_model_zh'] = asr_model_zh
                 else:
                     asr_model_zh = self.additional_models['asr_model_zh']
+            
+            if 'wavlm_sv_model' not in self.additional_models:
+                wavlm_sv_extractor = Wav2Vec2FeatureExtractor.from_pretrained('microsoft/wavlm-base-plus-sv')
+                wavlm_sv_model = WavLMForXVector.from_pretrained('microsoft/wavlm-base-plus-sv')
+                wavlm_sv_model = wavlm_sv_model.to(device)
+                wavlm_sv_model = wavlm_sv_model.eval()
+                self.additional_models['wavlm_sv_model'] = wavlm_sv_model
+                self.additional_models['wavlm_sv_extractor'] = wavlm_sv_extractor
+                logging.info(f"Loaded SV Model: {wavlm_sv_model}")
+            else:
+                wavlm_sv_model = self.additional_models['wavlm_sv_model']
+                wavlm_sv_extractor = self.additional_models['wavlm_sv_extractor']
+
             _exp_dir_path = self.logger.log_dir
             _exp_dir_path = _exp_dir_path + '/Sample_Audios'
             if not os.path.exists(_exp_dir_path):
                 os.mkdir(_exp_dir_path)
             similarity_list = []
+            similarity_list_wavlm = []
             pred_context_similarity_list = []
+            pred_context_similarity_list_wavlm = []
             gt_context_similarity_list = []
+            gt_context_similarity_list_wavlm = []
             question_type = []
 
             # predicting audio
@@ -1862,7 +1882,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     audio_fp_gt = os.path.join(_exp_dir_path, f'dec_input_wav_{wav_num}.wav')
                     sf.write(audio_fp_gt, dec_input_wav.cpu().numpy(), self.sample_rate)
 
-                    # speaker verification evaluation
+                    # speaker verification evaluation using nemo model
                     spk_embedding_pred = nemo_sv_model.get_embedding(audio_fp_pred)
                     spk_embedding_pred = spk_embedding_pred.cpu().detach().numpy().flatten()
                     spk_embedding_gt = nemo_sv_model.get_embedding(audio_fp_gt)
@@ -1874,6 +1894,24 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Individual Sample', similarity, step)
                     similarity_list.append(similarity)
+
+                    # speaker verification evaluation using wavlm model
+                    ref_wavlm_wav, _ = librosa.load(audio_fp_gt, sr=16000)
+                    pred_wavlm_wav, _ = librosa.load(audio_fp_pred, sr=16000)
+                    inputs_wavlm = wavlm_sv_extractor([pred_wavlm_wav, ref_wavlm_wav], padding=True, return_tensors="pt")
+                    for key in inputs_wavlm.keys():
+                        inputs_wavlm[key] = inputs_wavlm[key].to(device)
+        
+                    with torch.no_grad():
+                        wavlm_embeddings = wavlm_sv_model(**inputs_wavlm).embeddings
+                        wavlm_embeddings = torch.nn.functional.normalize(wavlm_embeddings, dim=-1).cpu()
+
+                    spk_embedding_pred_wavlm = wavlm_embeddings[0].cpu().detach().numpy().flatten()
+                    spk_embedding_gt_wavlm = wavlm_embeddings[1].cpu().detach().numpy().flatten()
+                    similarity_wavlm = np.dot(spk_embedding_pred_wavlm, spk_embedding_gt_wavlm) / (
+                        np.linalg.norm(spk_embedding_pred_wavlm) * np.linalg.norm(spk_embedding_gt_wavlm)
+                    )
+                    similarity_list_wavlm.append(similarity_wavlm)
 
                     if lang[i] == Lang.zh.value:
                         audio_to_pred_zh.append({"step": i, "audio": audio_fp_pred})
@@ -1905,6 +1943,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         context_tokens = context_and_question_tokens[i][:, :context_end_step]
 
                     spk_embedding_context = spk_embedding_gt
+                    spk_embedding_context_wavlm = spk_embedding_gt_wavlm
                     if self.decoder_context_len > 0:
                         context_tokens = dec_input_to_1024[:, :self.decoder_context_len+1]
                         context_wav = self.decode_wav_from_codec_model(context_tokens)
@@ -1929,21 +1968,43 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         self.logger.experiment.add_audio("Context Wav", context_wav, step, self.sample_rate)
                         context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{wav_num}.wav')
                         sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
-
+                        
+                        # titanet
                         spk_embedding_context = nemo_sv_model.get_embedding(context_wav_fp)
                         spk_embedding_context = spk_embedding_context.cpu().detach().numpy().flatten()
-                        
+                        # wavlm
+                        context_wavlm_wav, _ = librosa.load(context_wav_fp, sr=16000)
+                        inputs_wavlm = wavlm_sv_extractor([context_wavlm_wav], padding=True, return_tensors="pt")
+                        for key in inputs_wavlm.keys():
+                            inputs_wavlm[key] = inputs_wavlm[key].to(device)
+            
+                        with torch.no_grad():
+                            wavlm_embeddings = wavlm_sv_model(**inputs_wavlm).embeddings
+                            wavlm_embeddings = torch.nn.functional.normalize(wavlm_embeddings, dim=-1).cpu()
+
+                        spk_embedding_context_wavlm = wavlm_embeddings[0].cpu().detach().numpy().flatten()
+
                     pred_similarity_context = np.dot(spk_embedding_context, spk_embedding_pred) / (
                         np.linalg.norm(spk_embedding_context) * np.linalg.norm(spk_embedding_pred)
                     )
                     gt_similarity_context = np.dot(spk_embedding_context, spk_embedding_gt) / (
                         np.linalg.norm(spk_embedding_context) * np.linalg.norm(spk_embedding_gt)
                     )
+
+                    pred_similarity_context_wavlm = np.dot(spk_embedding_context_wavlm, spk_embedding_pred_wavlm) / (
+                        np.linalg.norm(spk_embedding_context_wavlm) * np.linalg.norm(spk_embedding_pred_wavlm)
+                    )
+                    gt_similarity_context_wavlm = np.dot(spk_embedding_context_wavlm, spk_embedding_gt_wavlm) / (
+                        np.linalg.norm(spk_embedding_context_wavlm) * np.linalg.norm(spk_embedding_gt_wavlm)
+                    )
+
                     if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Context Pred', pred_similarity_context, step)
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Context GT', gt_similarity_context, step)
                     pred_context_similarity_list.append(pred_similarity_context)
                     gt_context_similarity_list.append(gt_similarity_context)
+                    pred_context_similarity_list_wavlm.append(pred_similarity_context_wavlm)
+                    gt_context_similarity_list_wavlm.append(gt_similarity_context_wavlm)
 
                     task_question = self.frozen_model.tokenizer.ids_to_text(
                         [v[1] for v in input_token_list if v[1] < self.lm_vocab_size]
@@ -2065,13 +2126,20 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             similarity_avg = np.mean(similarity_list)
             pred_context_similarity_avg = np.mean(pred_context_similarity_list)
             gt_context_similarity_avg = np.mean(gt_context_similarity_list)
+            similarity_avg_wavlm = np.mean(similarity_list_wavlm)
+            pred_context_similarity_avg_wavlm = np.mean(pred_context_similarity_list_wavlm)
+            gt_context_similarity_avg_wavlm = np.mean(gt_context_similarity_list_wavlm)
+
             if log_scalars:
                 self.logger.experiment.add_scalar(f'Inf SV Avg Cossim', similarity_avg, batch_idx)
             self.predict_step_outputs.append(
                 {
-                    'sv_avg_cossim': similarity_avg,
-                    'sv_avg_cossim_context_pred': pred_context_similarity_avg,
-                    'sv_avg_cossim_context_gt': gt_context_similarity_avg,
+                    'titanet_avg_cossim': similarity_avg,
+                    'titanet_avg_cossim_context_pred': pred_context_similarity_avg,
+                    'titanet_avg_cossim_context_gt': gt_context_similarity_avg,
+                    'wavlm_avg_cossim': similarity_avg_wavlm,
+                    'wavlm_avg_cossim_context_pred': pred_context_similarity_avg_wavlm,
+                    'wavlm_avg_cossim_context_gt': gt_context_similarity_avg_wavlm,
                     'cer_transcript': np.mean(cer_batch),
                     'wer_transcript': np.mean(wer_batch),
                     'cer_phoneme': np.mean(cer_phoneme) if len(cer_phoneme) > 0 else None,
