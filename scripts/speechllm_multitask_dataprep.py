@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-# from encodec import EncodecModel
+from encodec import EncodecModel
 from omegaconf import OmegaConf
 from tqdm import tqdm
 

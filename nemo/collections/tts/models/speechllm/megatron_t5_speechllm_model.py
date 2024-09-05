@@ -280,6 +280,9 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         codec_model = self.additional_models['codec']
         if self.codecmodel_type == 'nemo_codec':
             codec_len = torch.Tensor([codes.shape[1]]).long().cuda()
+            if codec_len < 10:
+                # return a one second silence
+                return torch.zeros(24000).cuda()
             wav, _ = codec_model.decode(tokens=codes.unsqueeze(0), tokens_len=codec_len)
             wav = wav[0]
         else:
@@ -1861,7 +1864,10 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     predicted_tokens = output_tokens_combined[i]  # Should not contain context even if decoder context
                     if i in end_indices:
                         logging.info(f"Clipping until end index for audio {i}")
-                        predicted_tokens = predicted_tokens[:, 0 : end_indices[i] - (1 + self.decoder_context_len)]  # trim to audio length
+                        if self.cfg.get('seq_pattern', 'parallel') == 'delay_parallel':
+                            predicted_tokens = predicted_tokens[:, 0 : end_indices[i] - (1 + self.decoder_context_len) + self.num_speech_codebooks]  # trim to audio length
+                        else:
+                            predicted_tokens = predicted_tokens[:, 0 : end_indices[i] - (1 + self.decoder_context_len)]  # trim to audio length
 
                     pred_img = predicted_tokens.data.cpu().float().numpy()
                     dec_inp_img = dec_input_to_1024.data.cpu().float().numpy()
