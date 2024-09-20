@@ -17,18 +17,17 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import ClassVar, List, Optional, Union
 
 import numpy as np
 import torch
-
-# from encodec import EncodecModel
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
+from nemo.collections.common.tokenizers.text_to_speech.ipa_lexicon import get_ipa_punctuation_list
 from nemo.collections.common.tokenizers.text_to_speech.tokenizer_utils import any_locale_text_preprocessing
 from nemo.collections.nlp.data.language_modeling.megatron.base_prompt_learning_dataset import BasePromptLearningDataset
 from nemo.collections.nlp.models.language_modeling.megatron_t5_model import T5Sentinel
@@ -46,12 +45,33 @@ from nemo.utils import logging
 __all__ = ['T5SpeechLMDataset']
 
 
+def get_full_list_puncts():
+    punct_set = set()
+    for locale_id in ["en-US", "de-DE", "fr-FR"]:
+        punct_list = get_ipa_punctuation_list(locale=locale_id)
+        punct_set.update(punct_list)
+    return sorted(punct_set)
+
+
 @dataclass
 class G2PConfig:
     _target_: str = "nemo.collections.tts.g2p.models.en_us_arpabet.EnglishG2p"
     phoneme_dict: str = "scripts/tts_dataset_files/cmudict-0.7b_nv22.10"
     heteronyms: str = "scripts/tts_dataset_files/heteronyms-052722"
     phoneme_probability: float = 0.5
+
+
+@dataclass
+class EnglishIpaG2pConfig:
+    _target_: str = "nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p"
+    phoneme_dict: str = "scripts/tts_dataset_files/ipa_cmudict-0.7b_nv23.01.txt"
+    locale: str = "en-US"
+    heteronyms: str = "scripts/tts_dataset_files/heteronyms-052722"
+    phoneme_probability: float = 0.5
+    grapheme_case: str = "upper"
+    use_stresses: bool = True
+    use_chars: bool = True
+    ignore_ambiguous_words: bool = False
 
 
 @dataclass
@@ -67,14 +87,37 @@ class TextTokenizer:
 
 
 @dataclass
+class EnglishIpaTextTokenizer:
+    _target_: str = "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer"
+    locale: str = "en-US"
+    punct: bool = True
+    # Define non_default_punct_list as a ClassVar to explicitly mark it as a class variable
+    non_default_punct_list: ClassVar[List[str]] = get_full_list_puncts()
+    apostrophe: bool = True
+    pad_with_space: bool = True
+    add_blank_at: bool = True
+    g2p: EnglishIpaG2pConfig = EnglishIpaG2pConfig()
+
+
+@dataclass
 class TextTokenizerConfig:
     text_tokenizer: TextTokenizer = TextTokenizer()
 
 
-def _get_default_text_tokenizer_conf(phoneme_probability=0.5):
-    g2p = G2PConfig(phoneme_probability=phoneme_probability)
-    _text_tokenizer = TextTokenizer(g2p=g2p)
-    text_tokenizer: TextTokenizerConfig = TextTokenizerConfig(text_tokenizer=_text_tokenizer)
+@dataclass
+class EnglishIpaTextTokenizerConfig:
+    text_tokenizer: EnglishIpaTextTokenizer = EnglishIpaTextTokenizer()
+
+
+def _get_default_text_tokenizer_conf(phoneme_probability: float = 0.5, use_ipa: bool = False):
+    if use_ipa:
+        g2p = EnglishIpaG2pConfig(phoneme_probability=phoneme_probability)
+        _text_tokenizer = EnglishIpaTextTokenizer(g2p=g2p)
+        text_tokenizer: EnglishIpaTextTokenizerConfig = EnglishIpaTextTokenizerConfig(text_tokenizer=_text_tokenizer)
+    else:
+        g2p = G2PConfig(phoneme_probability=phoneme_probability)
+        _text_tokenizer = TextTokenizer(g2p=g2p)
+        text_tokenizer: TextTokenizerConfig = TextTokenizerConfig(text_tokenizer=_text_tokenizer)
     return OmegaConf.create(OmegaConf.to_yaml(text_tokenizer))
 
 
@@ -147,6 +190,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         context_slice_method: Optional[str] = "random", # random or fixed
         phoneme_probability: Optional[float] = 0.5,
         encoder_type: Optional[str] = "single_transformer",
+        use_ipa: bool = False,
         **kwargs,
     ):
         """
@@ -162,6 +206,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         sup_data_path: Optional[Union[Path, str]] = None, - Supplementary folder path where codecs are stored.
         speech_offset: Optional[int] = None, - if speech tokens then add this offset to the token indices to distinguish between text and speech tokens.
         lm_vocab_size: Optional[int] = None, - vocab size of the original language model (phoneme tokens start from this index)
+        english_only_model: Optional[bool] = False, specify if monolingual or multi-lingual modeling.
+        use_ipa: bool = False, specify if using IPA tokens or default ARPABET tokens. Either choice still mixes chars.
         **kwargs,
         """
         # These two variables need to be set before calling super().__init__() because the parent class calls `load_data()` which requires these attributes.
@@ -202,7 +248,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.english_only_model = english_only_model
         self.phoneme_tokenizer = None
         if english_only_model:
-            self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf(phoneme_probability=phoneme_probability)).text_tokenizer
+            self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf(phoneme_probability=phoneme_probability, use_ipa=use_ipa)).text_tokenizer
         else:
             self.g2p = {"fr": lambda x: x}
             if kwargs.get("g2p", None):
@@ -421,7 +467,15 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
 
         # Format the input example according to the template
         # Get context, question and answer codes in a dict.
-        question_text = doc["question"].replace("Phoneme TTS", "").replace("Text to speech this", "").strip()
+        # TODO @xueyang: declare the instructions when initializing the dataset so that they can be re-used. Temporally
+        #  hardcode them here.
+        question_text = doc["question"].strip()
+        instructions = ["Phoneme TTS", "Text to speech this"]
+        for prefix in instructions:
+            if doc["question"].startswith(prefix):
+                question_text = doc["question"][len(prefix):].strip()
+                break
+
         input_dict = self._insert_data_in_template(prompt_template_fields, doc, answer_field)
         lang = Lang[doc.get("lang", "en")]
         context_tokens = input_dict['context']
@@ -631,7 +685,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             is_speech,
             cross_attention_prior,
             lang.value,
-            question_text
+            question_text,
         )
 
     def _truncate_input_speech(self, context_tokens, question_tokens, virtual_tokens):
@@ -821,12 +875,12 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             if _text.startswith("Phoneme TTS"):
                 lang = doc.get("lang", "en")
                 instruction_tokens = self._get_text_tokens("Phoneme TTS")
-                field_tokens = self._get_phoneme_tokens(_text.replace("Phoneme TTS ", ""), lang=lang)
+                field_tokens = self._get_phoneme_tokens(_text[len("Phoneme TTS"):].strip(), lang=lang)
                 field_tokens = instruction_tokens + field_tokens
             elif _text.startswith("Edit Speech"):
                 # Always use phoneme tokenizer for edit speech
                 instruction_tokens = self._get_text_tokens("Edit Speech")
-                field_tokens = self._get_phoneme_tokens(_text.replace("Edit Speech ", ""))
+                field_tokens = self._get_phoneme_tokens(_text[len("Edit Speech"):].strip())
                 field_tokens = instruction_tokens + field_tokens
             elif _text.startswith("TEXT CONTEXT:"):
                 # Speaker id conditioning

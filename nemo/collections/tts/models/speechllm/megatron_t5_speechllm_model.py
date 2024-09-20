@@ -416,11 +416,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         return output, encoder_input, out_logits
 
     def load_frozen_model(self, cfg, trainer):
-        self.megatron_amp_O2 = cfg.get('megatron_amp_o2', None)
-        if self.megatron_amp_O2 == None:
-            self.megatron_amp_O2 = cfg.get('megatron_amp_O2', None)
-        if self.megatron_amp_O2 == None:
-            self.megatron_amp_O2 = False
+        self.megatron_amp_O2 = cfg.get('megatron_amp_o2', False)
 
         # TODO: Fix this once apex patches FusedScaledMaskedSoftmax.
         # This is a workaround for the fact that `masked_softmax_fusion` has issues with certain input sizes that may be present while finetuning.
@@ -471,7 +467,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 'num_attention_heads',  # 12
                 'hidden_dropout',  # 0.1
                 'attention_dropout',  # 0.1
-                'kv_channels' 'ffn_hidden_size',  # 64  # 2048
+                'kv_channels',  # 64
+                'ffn_hidden_size',  # 2048
             ]
             # Defaults for 220m model
             for k in overide_keys:
@@ -1439,6 +1436,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             g2p=self.cfg.data.get('g2p', None),
             skip_datasets=self.cfg.data.get('skip_datasets', []),
             english_only_model=self.cfg.get('english_only_model', False),
+            use_ipa=self.cfg.data.get('use_ipa', False),
             context_conditioning=self.cfg.get('context_conditioning', "decoder"),
             use_beta_binomial_interpolator=self.cfg.get('use_beta_binomial_interpolator', False),
             context_slice_method=self.cfg.data.get('context_slice_method', 'random'),
@@ -1532,22 +1530,22 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         """
         # Convert text to lowercase
         lower_case_text = input_text.lower()
-        
+
         # Remove commas from text
         no_comma_text = lower_case_text.replace(",", "")
-        
+
         # Replace "-" with spaces
         no_dash_text = no_comma_text.replace("-", " ")
-        
+
         # Replace double spaces with single space
         single_space_text = " ".join(no_dash_text.split())
 
         single_space_text = single_space_text.translate(str.maketrans('', '', string.punctuation))
-        
+
         return single_space_text
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0, log_scalars=True, global_step=None) -> Any:
-        
+
         with torch.no_grad():
             (
                 virtual_tokens,
@@ -1564,7 +1562,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 cross_attention_prior,
                 text_limits,
                 lang,
-                question_texts, 
+                question_texts,
             ) = batch
 
             dec_input = dec_input_raw * 1  # (B, 8, T)
@@ -1683,11 +1681,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 output_logits_currtimestep_rescored = torch.nn.functional.softmax(
                     output_logits_currtimestep_rescored, dim=1
                 )
-                
+
                 output_tokens_curr_timestep = torch.multinomial(
                     output_logits_currtimestep_rescored, num_samples=1
                 )  # (B*8, 1)
-                
+
                 if torch.count_nonzero(speech_mask) > 0:
                     # Convert back to (B, 8)
                     output_tokens_curr_timestep = output_tokens_curr_timestep.view(
@@ -1871,8 +1869,6 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
                     pred_img = predicted_tokens.data.cpu().float().numpy()
                     dec_inp_img = dec_input_to_1024.data.cpu().float().numpy()
-
-
                     start_time = time.time()
                     predicted_tokens = self.convert_tokens_to_range(predicted_tokens, apply_offset_correction=False)
                     predicted_wav = self.decode_wav_from_codec_model(predicted_tokens)
@@ -1894,7 +1890,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         wav_num = i
                     else:
                         wav_num = step
-                    
+
                     audio_fp_pred = os.path.join(_exp_dir_path, f'predicted_wav_{wav_num}.wav')
                     sf.write(audio_fp_pred, predicted_wav.cpu().numpy(), self.sample_rate)
                     audio_fp_gt = os.path.join(_exp_dir_path, f'dec_input_wav_{wav_num}.wav')
@@ -1908,7 +1904,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     similarity = np.dot(spk_embedding_pred, spk_embedding_gt) / (
                         np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
                     )
-                    
+
                     if log_scalars:
                         self.logger.experiment.add_scalar(f'Inf SV Cossim Individual Sample', similarity, step)
                     similarity_list.append(similarity)
@@ -1983,13 +1979,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                             
                     else:
                         context_wav = None
-
                         # raise NotImplementedError("During prediction, there was no context found.")
                     if context_wav is not None:
                         self.logger.experiment.add_audio("Context Wav", context_wav, step, self.sample_rate)
                         context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{wav_num}.wav')
                         sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
-                        
                         # titanet
                         spk_embedding_context = nemo_sv_model.get_embedding(context_wav_fp)
                         spk_embedding_context = spk_embedding_context.cpu().detach().numpy().flatten()
@@ -2095,7 +2089,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             wer_phoneme = []
             cer_tts = []
             wer_tts = []
-            
+
             # These are between ASR output of Pred audio and GT text
             wer_batch_gt = []
             cer_batch_gt = []
@@ -2109,7 +2103,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 # step = batch_idx * self.test_dataloader().batch_size + all_audio_to_pred[i]["step"]
                 step = batch_idx * test_dataloader_batch_size + all_audio_to_pred[i]["step"]
                 question_text = question_texts[i//2]
-                
+
                 # No need to process text since both are ASR outputs
                 cer_sample = word_error_rate([greedy_transcripts[i]], [greedy_transcripts[i + 1]], use_cer=True)
                 wer_sample = word_error_rate([greedy_transcripts[i]], [greedy_transcripts[i + 1]], use_cer=False)

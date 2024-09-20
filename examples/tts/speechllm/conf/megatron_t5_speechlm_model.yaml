@@ -149,6 +149,7 @@ model:
     new_prompt_init_text: ['some init text goes here'] # some init text if init method is text, or None if init method is random
 
   data:
+    use_ipa: false
     grapheme_prefix: null
     train_ds: ???
     validation_ds: ???
