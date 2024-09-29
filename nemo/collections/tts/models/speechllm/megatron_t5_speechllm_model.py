@@ -1471,7 +1471,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             json.dump(average_metrics, f)
 
     def build_virtual_prompt_dataset(
-        self, dataset_paths, batch_size, for_train, drop_last, shuffle, num_workers, pin_memory
+        self, dataset_paths, batch_size, for_train, drop_last, shuffle, num_workers, pin_memory, dropout_decoder_input_ids=0.0,
     ):
         dataset = T5SpeechLMDataset(
             datasets=dataset_paths,
@@ -1524,6 +1524,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             context_slice_method=self.cfg.data.get('context_slice_method', 'random'),
             phoneme_probability=self.cfg.data.get('phoneme_probability', 0.5),
             encoder_type=self.cfg.data.get('encoder_type', 'single_transformer'),
+            dropout_decoder_input_ids=dropout_decoder_input_ids,
+            speech_mask_token=self.cfg.data.get('speech_mask_token', 0),
         )
 
         rank = parallel_state.get_data_parallel_rank()

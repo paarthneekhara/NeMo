@@ -191,6 +191,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         phoneme_probability: Optional[float] = 0.5,
         encoder_type: Optional[str] = "single_transformer",
         use_ipa: bool = False,
+        dropout_decoder_input_ids: Optional[float] = 0.0,
+        speech_mask_token: Optional[int] = 0,
         **kwargs,
     ):
         """
@@ -247,6 +249,8 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.context_duration_max = context_duration_max
         self.english_only_model = english_only_model
         self.phoneme_tokenizer = None
+        self.dropout_decoder_input_ids = dropout_decoder_input_ids
+        self.speech_mask_token = speech_mask_token
         if english_only_model:
             self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf(phoneme_probability=phoneme_probability, use_ipa=use_ipa)).text_tokenizer
         else:
@@ -674,6 +678,23 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             context_and_question_len = [context_tokens_len, question_tokens_len]
         else:
             context_and_question_len = context_tokens_len + question_tokens_len
+        
+        # Roll a die to decide whether we should mask out input or not
+        rng = random.Random()
+        die_outcome = rng.random()
+        if die_outcome < 0.5 and self.dropout_decoder_input_ids > 0.0:
+            # dec_input (8, T)
+            # replace random time steps with pad token
+
+            # get the number of time steps to replace
+            num_time_steps = int(self.dropout_decoder_input_ids * dec_input.shape[1])
+            # get the time steps to replace
+            time_steps_to_replace = torch.randperm(dec_input.shape[1])[:num_time_steps]
+            # replace the time steps
+            dec_input[:, time_steps_to_replace] = self.speech_mask_token
+            # Since codebook 0 starts from speech_offset.
+            dec_input[0, time_steps_to_replace] += self.speech_offset
+
         return (
             taskname_id,  # List, only one item. token id for "squad"
             virtual_tokens,  # Tensor, shape=(3,). token id for ['<prompt_0>', '<prompt_1>', '<prompt_2>']
