@@ -711,6 +711,9 @@ def main():
         with open(status_file, "w") as f:
             json.dump({"status": "processing", "prcessed_batch_idx": bidx + start_batch_idx}, f)
 
+    with open(status_file, "w") as f:
+        json.dump({"status": "completed", "prcessed_batch_idx": bidx + start_batch_idx}, f)
+
     if args.shuffle:
         # To ensure same split for encodec and uniaudio_codec
         random.seed(21)

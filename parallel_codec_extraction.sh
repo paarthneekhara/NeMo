@@ -29,7 +29,7 @@ DATASET_NAME_PREFIX=$5
 ADDITIONAL_ARGS="${@:6}"
 
 # Number of parts (should match the number of GPUs you want to use)
-N=2
+N=8
 
 # Split the manifest file into N parts
 split -n l/$N --numeric-suffixes=1 --additional-suffix=.json $MANIFEST_PATH ${MANIFEST_PATH%.json}_${DATASET_NAME_PREFIX}_part
@@ -41,14 +41,14 @@ do
   MANIFEST_PART="${MANIFEST_PATH%.json}_${DATASET_NAME_PREFIX}_part$(printf "%02d" $i).json"
   
   # Print the command instead of running it
-  echo "CUDA_VISIBLE_DEVICES=$GPU_ID python scripts/speechllm_multitask_dataprep.py \
+  CUDA_VISIBLE_DEVICES=$GPU_ID python scripts/speechllm_multitask_dataprep.py \
     --manifest_paths $MANIFEST_PART \
     --batch_size $BATCH_SIZE \
     --split_num $i \
     --codec_model_path $CODEC_MODEL_PATH \
     --out_dir $OUT_DIR \
     --dataset_name ${DATASET_NAME_PREFIX}_$i \
-    $ADDITIONAL_ARGS &"
+    $ADDITIONAL_ARGS &
 done
 
 wait
