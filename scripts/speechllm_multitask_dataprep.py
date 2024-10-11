@@ -440,6 +440,7 @@ def main():
     parser.add_argument('--codec_model', type=str, default='nemo_codec')  # encodec, uniaudio_codec, dac, nemo_codec, nemo_codec21, nemo_codec211k, nemo_codec214k
     parser.add_argument('--use_context_as_same_speaker_audio', action='store_true')
     parser.add_argument('--save_only_tts_records', action='store_true')
+    parser.add_argument('--save_only_codec_files', action='store_true')
     parser.add_argument('--shuffle', action='store_true')
     parser.add_argument('--split_into_train_val', action='store_true')
     parser.add_argument('--num_val_records', type=int, default=500)
@@ -491,7 +492,7 @@ def main():
     temp_dir = os.path.join(args.out_dir, "temp_{}_{}".format(_exp_name, args.split_num))
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
-    status_file = os.path.join(temp_dir, "prcess_status.json")
+    status_file = os.path.join(temp_dir, "process_status.json")
     start_batch_idx = 0
     if os.path.exists(status_file):
         with open(status_file, "r") as f:
@@ -534,6 +535,7 @@ def main():
     sentencepiece_tts_records = []
     phoneme_plus_sentencepiece_tts_records = []
 
+    total_batches = len(dataloader) + start_batch_idx
     for bidx, batch in enumerate(tqdm(dataloader)):
         # print("bidx", bidx+1, "of", len(dataloader))
         # Update status file
@@ -709,10 +711,13 @@ def main():
             save_batch_audios(batch, bidx, temp_dir, codec_model, args.codec_model, codec_model_sample_rate)
         
         with open(status_file, "w") as f:
-            json.dump({"status": "processing", "prcessed_batch_idx": bidx + start_batch_idx}, f)
+            json.dump({"status": "processing", "prcessed_batch_idx": bidx + start_batch_idx, 'total_batches': total_batches}, f)
 
     with open(status_file, "w") as f:
-        json.dump({"status": "completed", "prcessed_batch_idx": bidx + start_batch_idx}, f)
+        json.dump({"status": "completed", "prcessed_batch_idx": bidx + start_batch_idx, 'total_batches': total_batches}, f)
+        if args.save_only_codec_files:
+            print("Saved only codec files")
+            return
 
     if args.shuffle:
         # To ensure same split for encodec and uniaudio_codec
