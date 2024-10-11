@@ -29,7 +29,7 @@ DATASET_NAME_PREFIX=$5
 ADDITIONAL_ARGS="${@:6}"
 
 # Number of parts (should match the number of GPUs you want to use)
-N=4
+N=8
 
 # Split the manifest file into N parts
 split -n l/$N --numeric-suffixes=1 --additional-suffix=.json $MANIFEST_PATH ${MANIFEST_PATH%.json}_${DATASET_NAME_PREFIX}_part
