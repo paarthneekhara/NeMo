@@ -435,23 +435,23 @@ def main():
     args = parser.parse_args()
 
     nemo_codec_specs = {
-        'nemo_spectral_86fps_8codebooks_1kcodes_v2': {
+        'nemo_spectral_86fps_8codebooks_1kcodes_v2b': {
             'downsampling_factor': 256.0,
             'sample_rate': 22050,
         },
-        'nemo_audio_86fps_8codebooks_1kcodes_v2': {
+        'nemo_audio_86fps_8codebooks_1kcodes_v2b': {
             'downsampling_factor': 256.0,
             'sample_rate': 22050,
         },
-        'nemo_audio_21fps_8codebooks_1kcodes_v2': {
+        'nemo_audio_21fps_8codebooks_1kcodes_v2b': {
             'downsampling_factor': 1024.0,
             'sample_rate': 22050,
         },
-        'nemo_audio_21fps_8codebooks_2kcodes_v2': {
+        'nemo_audio_21fps_8codebooks_2kcodes_v2b': {
             'downsampling_factor': 1024.0,
             'sample_rate': 22050,
         },
-        'nemo_audio_21fps_8codebooks_4kcodes_v2': {
+        'nemo_audio_21fps_8codebooks_4kcodes_v2b': {
             'downsampling_factor': 1024.0,
             'sample_rate': 22050,
         },
