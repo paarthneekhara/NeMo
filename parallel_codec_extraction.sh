@@ -29,7 +29,7 @@ DATASET_NAME_PREFIX=$5
 ADDITIONAL_ARGS="${@:6}"
 
 # Number of parts (should match the number of GPUs you want to use)
-N=8
+N=4
 
 # Split the manifest file into N parts
 split -n l/$N --numeric-suffixes=1 --additional-suffix=.json $MANIFEST_PATH ${MANIFEST_PATH%.json}_${DATASET_NAME_PREFIX}_part
@@ -47,8 +47,11 @@ do
     --split_num $i \
     --codec_model_path $CODEC_MODEL_PATH \
     --out_dir $OUT_DIR \
-    --dataset_name ${DATASET_NAME_PREFIX}_$i \
+    --dataset_name $DATASET_NAME_PREFIX \
     $ADDITIONAL_ARGS &
+  
+  # Sleep for 10 seconds befor launching next job.
+  sleep 10
 done
 
 wait
