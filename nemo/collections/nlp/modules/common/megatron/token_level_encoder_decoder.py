@@ -43,6 +43,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 from nemo.collections.nlp.modules.common.megatron.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.utils import logging
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 
 try:
     from apex.transformer.enums import AttnMaskType, ModelType
@@ -1037,6 +1038,10 @@ class MegatronTokenLevelEncoderDecoderSpeechLLMModule(MegatronTokenLevelEncoderD
                     
                     pred_embedding = self.dec_out_to_code_embedding(dec_output)[0]  # T, B, 32
                     pred_embedding_BCT = pred_embedding.permute(1, 2, 0)  # B, 32, T
+
+                    speech_token_mask = get_mask_from_lengths(answer_lens, x=dec_attn_mask)
+                    pred_embedding_BCT = pred_embedding_BCT * speech_token_mask.unsqueeze(1)
+                    labels_dequantized = labels_dequantized * speech_token_mask.unsqueeze(1)
 
                     # Compute L2 loss between pred_embedding_BCT and labels_dequantized
                     embedding_loss = torch.mean((pred_embedding_BCT - labels_dequantized) ** 2)
