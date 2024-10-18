@@ -256,10 +256,22 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 # params_dtype=self.frozen_model.enc_dec_model.dtype,
             )
             list_of_speech_heads.append(_speech_head)
-
+        
+        
         self.frozen_model.enc_dec_model.speech_tokens_heads = torch.nn.ModuleList(list_of_speech_heads)
         self.frozen_model.enc_dec_model.speech_tokens_embeddings = torch.nn.ModuleList(
             list_of_speech_tokens_embeddings
+        )
+
+        self.frozen_model.enc_dec_model.dec_out_to_code_embedding = tensor_parallel.ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=32,
+            bias=True,
+            gather_output=not self.frozen_model.enc_dec_model.parallel_output,
+            init_method=init_method_normal(init_method_std),
+            config=self.model_parallel_config,
+            # use_cpu_initialization=False,
+            # params_dtype=self.frozen_model.enc_dec_model.dtype,
         )
 
         self.sample_rate = 24000
@@ -278,6 +290,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
         self.is_rank_zero = app_state.global_rank == 0
         self.predict_step_outputs = []
         self.phoneme_tokenizer = None
+        self.frozen_model.enc_dec_model.additional_models = self.additional_models
 
         # classifier-free guidance (CFG) option during training. The probability (0.0 <= ε <= 1.0) is used to trigger the action that the
         # question tokens in a batch are replaced by [UNK] tokens, such that mimicking the transcript-free scenario.
@@ -648,8 +661,11 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             output_tensor = output_tensor.contiguous()
 
             alignment_loss = out_logits[3]
+            embedding_loss = out_logits[4]
             if alignment_loss is not None:
                 self.logger.experiment.add_scalar('train_alignment_loss', alignment_loss, self.global_step)
+            if embedding_loss is not None:
+                self.logger.experiment.add_scalar('train_embedding_loss', embedding_loss, self.global_step)
 
             if self.trainer.global_step % self.train_check_interval == 0 and not validation_step and self.is_rank_zero:
                 self.frozen_model.enc_dec_model.logging_step = False
@@ -832,6 +848,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             def loss_func(loss_args):
                 output_tensor, out_logits, curr_step = loss_args
                 alignment_loss = out_logits[3]
+                embedding_loss = out_logits[4]
                 loss = self.frozen_model.loss_func(loss_mask, output_tensor)
                 if (
                     (alignment_loss is not None)
@@ -840,6 +857,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                 ):
                     logging.debug(f"Adding alignment loss. cur:{curr_step} start:{self.alignment_loss_start_step}")
                     loss = loss + alignment_loss
+                if embedding_loss is not None:
+                    loss = loss + self.cfg.get('embedding_loss_scale', 0.0) * embedding_loss
                 reduced_loss = average_losses_across_data_parallel_group([loss])
                 return loss, {'avg': reduced_loss}
 

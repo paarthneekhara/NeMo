@@ -888,7 +888,8 @@ class MegatronTokenLevelEncoderDecoderSpeechLLMModule(MegatronTokenLevelEncoderD
             else:
                 # Note: This is when the decoder itself is split across PP ranks.
                 dec_input = None
-
+            
+            
             if self.add_decoder and self.decoder_relative_position_embedding is not None:
                 assert False, "This should not be reached."
                 decoder_self_attention_relative_position_bias = self.decoder_relative_position_embedding(
@@ -1024,7 +1025,22 @@ class MegatronTokenLevelEncoderDecoderSpeechLLMModule(MegatronTokenLevelEncoderD
                 else:
                     token_logits = self.tokens_head(dec_output)[0]  # T, B, WordEmbSize
 
+                embedding_loss = None
                 if labels is not None:
+                    labels_codebook_values = labels + 0
+                    labels_codebook_values[:,0,:] = labels_codebook_values[:,0,:] - self.speech_offset
+                    labels_codebook_values = labels_codebook_values.clamp(0, self.speech_codebook_size - 1)
+                    answer_lens = dec_attn_mask.sum(dim=1) - 1 # To remove EOS
+                    
+                    with torch.no_grad():
+                        labels_dequantized = self.additional_models['codec'].dequantize(tokens=labels_codebook_values, tokens_len=answer_lens) # B, C, T
+                    
+                    pred_embedding = self.dec_out_to_code_embedding(dec_output)[0]  # T, B, 32
+                    pred_embedding_BCT = pred_embedding.permute(1, 2, 0)  # B, 32, T
+
+                    # Compute L2 loss between pred_embedding_BCT and labels_dequantized
+                    embedding_loss = torch.mean((pred_embedding_BCT - labels_dequantized) ** 2)
+
                     if labels.dim() == 2:
                         # [b, s] -> [s, b]
                         labels = labels.transpose(0, 1).contiguous()
@@ -1076,7 +1092,7 @@ class MegatronTokenLevelEncoderDecoderSpeechLLMModule(MegatronTokenLevelEncoderD
                     if self.hiddens_cfg is not None:
                         raise NotImplementedError("Not currently implemented for speechllm")
                     else:
-                        return tokens_loss, [token_logits, speech_logits_list, attention_probs, alignment_loss]
+                        return tokens_loss, [token_logits, speech_logits_list, attention_probs, alignment_loss, embedding_loss]
                 else:
                     # else return token logits (and hiddens if needed)
                     # [s, b, h] -> [b, s, h]
