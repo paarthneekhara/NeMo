@@ -447,7 +447,15 @@ def main():
             'downsampling_factor': 1024.0,
             'sample_rate': 22050,
         },
-        'nemo_audio_21fps_8codebooks_2kcodes_v2b': {
+        'nemo_audio_21fps_8codebooks_2kcodes_v2bWithWavLM': {
+            'downsampling_factor': 1024.0,
+            'sample_rate': 22050,
+        },
+        'nemo_audio_21fps_8codebooks_2kcodes_v2bNoWavLM': {
+            'downsampling_factor': 1024.0,
+            'sample_rate': 22050,
+        },
+        'nemo_audio_21fps_8codebooks_2kcodes_v1': {
             'downsampling_factor': 1024.0,
             'sample_rate': 22050,
         },
@@ -519,7 +527,7 @@ def main():
     )
 
     dataloader = torch.utils.data.DataLoader(
-        dataset=dataset, batch_size=args.batch_size, collate_fn=dataset.pad_collate_fn, shuffle=False, num_workers=4,
+        dataset=dataset, batch_size=args.batch_size, collate_fn=dataset.pad_collate_fn, shuffle=False, num_workers=8,
     )
 
     codec_base_dir = os.path.join(args.out_dir, "codecs")
