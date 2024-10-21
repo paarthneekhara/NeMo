@@ -192,6 +192,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         encoder_type: Optional[str] = "single_transformer",
         use_ipa: bool = False,
         dropout_decoder_input_ids: Optional[float] = 0.0,
+        dropout_decoder_input_use_random: Optional[bool] = False,
         speech_mask_token: Optional[int] = 0,
         **kwargs,
     ):
@@ -250,6 +251,7 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
         self.english_only_model = english_only_model
         self.phoneme_tokenizer = None
         self.dropout_decoder_input_ids = dropout_decoder_input_ids
+        self.dropout_decoder_input_use_random = dropout_decoder_input_use_random
         self.speech_mask_token = speech_mask_token
         if english_only_model:
             self.phoneme_tokenizer = instantiate(_get_default_text_tokenizer_conf(phoneme_probability=phoneme_probability, use_ipa=use_ipa)).text_tokenizer
@@ -690,10 +692,14 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             num_time_steps = int(self.dropout_decoder_input_ids * dec_input.shape[1])
             # get the time steps to replace
             time_steps_to_replace = torch.randperm(dec_input.shape[1])[:num_time_steps]
-            # replace the time steps
-            dec_input[:, time_steps_to_replace] = self.speech_mask_token
-            # Since codebook 0 starts from speech_offset.
-            dec_input[0, time_steps_to_replace] += self.speech_offset
+            if not self.dropout_decoder_input_use_random:
+                # replace the time steps
+                dec_input[:, time_steps_to_replace] = self.speech_mask_token
+                # Since codebook 0 starts from speech_offset.
+                dec_input[0, time_steps_to_replace] += self.speech_offset
+            else: # TODO: remove hard-coded codebook size of 1000
+                # replace with random tokens from the codec codebooks
+                dec_input[:, time_steps_to_replace] = torch.randint(low=0, high=1000, size=(self.num_speech_codebooks,num_time_steps))
 
         return (
             taskname_id,  # List, only one item. token id for "squad"

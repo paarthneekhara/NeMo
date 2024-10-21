@@ -2,6 +2,7 @@ import glob
 import soundfile as sf
 import json
 import argparse
+import os
 
 def write_manifest(manifest_path, records):
     with open(manifest_path, 'w') as f:
@@ -27,9 +28,14 @@ def main():
     wav_files = [ f for f in wav_files ]
     print("Found {} wav files in {}".format(len(wav_files), data_dir))
     records = []
+    skipped = []
     for aidx, audio_file in enumerate(wav_files):
         if aidx % 100 == 0:
             print("Processed {} files out of {}".format(aidx, len(wav_files)))
+        if not os.access(audio_file, os.R_OK):
+            print(f"Could not read {audio_file}. Skipping...")
+            skipped.append(audio_file)
+            continue
         audio_duration = sf.info(audio_file).duration
         record = {
             'audio_filepath' : audio_file,
@@ -41,6 +47,9 @@ def main():
         }
         records.append(record)
     
+    if len(skipped) > 0:
+        print(f"\nSkipped {len(skipped)} files that were not readable.\n    ")
+
     if len(records) > 0:
         write_manifest(manifest_path, records)
 

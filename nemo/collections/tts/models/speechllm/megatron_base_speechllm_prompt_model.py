@@ -322,6 +322,7 @@ class MegatronBaseSpeechLM(MegatronBaseModel, TextGeneration):
                 num_workers=self.cfg.data.num_workers,
                 pin_memory=True,
                 dropout_decoder_input_ids=self.cfg.data.get('dropout_decoder_input_ids', 0.0), # Only dropout for training
+                dropout_decoder_input_use_random=self.cfg.data.get('dropout_decoder_input_use_random', False)
             )
         elif self.cfg.data.get('train_manifest', None):
             self._train_ds, self._train_dl = self.build_virtual_prompt_tarred_dataset(
