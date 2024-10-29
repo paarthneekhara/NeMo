@@ -695,11 +695,12 @@ class T5SpeechLMDataset(BasePromptLearningDataset):
             if not self.dropout_decoder_input_use_random:
                 # replace the time steps
                 dec_input[:, time_steps_to_replace] = self.speech_mask_token
-                # Since codebook 0 starts from speech_offset.
-                dec_input[0, time_steps_to_replace] += self.speech_offset
             else: # TODO: remove hard-coded codebook size of 1000
                 # replace with random tokens from the codec codebooks
                 dec_input[:, time_steps_to_replace] = torch.randint(low=0, high=1000, size=(self.num_speech_codebooks,num_time_steps))
+            # Since codebook 0 starts from speech_offset.
+            dec_input[0, time_steps_to_replace] += self.speech_offset
+
 
         return (
             taskname_id,  # List, only one item. token id for "squad"
