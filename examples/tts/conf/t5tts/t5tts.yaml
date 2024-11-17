@@ -50,7 +50,7 @@ model:
 
   train_ds:
     dataset:
-      _target_: nemo.collections.tts.data.text_to_speech_dataset.T5TTSDataset
+      _target_: nemo.collections.tts.data.text_to_speech_dataset.DummyT5TTSDataset
       dataset_meta: ${train_ds_meta}
       weighted_sampling_steps_per_epoch: ${weighted_sampling_steps_per_epoch}
       sample_rate: ${sample_rate}
@@ -65,7 +65,7 @@ model:
 
   validation_ds:
     dataset:
-      _target_: nemo.collections.tts.data.text_to_speech_dataset.T5TTSDataset
+      _target_: nemo.collections.tts.data.text_to_speech_dataset.DummyT5TTSDataset
       dataset_meta: ${val_ds_meta}
       sample_rate: ${sample_rate}
       # speaker_path: ${speaker_path}

@@ -576,7 +576,11 @@ class T5TTS_Model(ModelPT):
         with phon_mode:
             dataset = self.get_dataset(cfg)
 
-        sampler = dataset.get_sampler(cfg.dataloader_params.batch_size, world_size=self.trainer.world_size)
+        # sampler = dataset.get_sampler(cfg.dataloader_params.batch_size, world_size=self.trainer.world_size)
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=self.world_size, rank=self.global_rank, shuffle=True
+        )
+
         data_loader = torch.utils.data.DataLoader(
             dataset, collate_fn=dataset.collate_fn, sampler=sampler, **cfg.dataloader_params
         )

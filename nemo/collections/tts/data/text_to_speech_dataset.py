@@ -35,7 +35,8 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
 from nemo.core.classes import Dataset
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
-
+from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
+import os
 
 @dataclass
 class DatasetMeta:
@@ -509,5 +510,214 @@ class T5TTSDataset(TextToSpeechDataset):
         for featurizer in self.featurizers:
             feature_dict = featurizer.collate_fn(batch)
             batch_dict.update(feature_dict)
+
+        return batch_dict
+
+class DummyT5TTSDataset(Dataset):
+    def __init__(
+        self,
+        dataset_meta: Dict,
+        sample_rate: int,
+        text_tokenizer: BaseTokenizer,
+        weighted_sampling_steps_per_epoch: Optional[int] = None,
+        min_duration: Optional[float] = None,
+        max_duration: Optional[float] = None,
+        codec_model_downsample_factor: int = None,
+        bos_id: int = None,
+        eos_id: int = None,
+        audio_bos_id: int = None,
+        audio_eos_id: int = None,
+        prior_scaling_factor: float = None,
+        load_cached_codes_if_available: bool = True,
+    ):
+        
+        self.sample_rate = sample_rate
+        self.text_tokenizer = text_tokenizer
+        self.weighted_sampling_steps_per_epoch = weighted_sampling_steps_per_epoch
+        self.codec_model_downsample_factor = codec_model_downsample_factor
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+        self.audio_bos_id = audio_bos_id
+        self.audio_eos_id = audio_eos_id
+        self.include_align_prior = prior_scaling_factor is not None
+        self.prior_scaling_factor = prior_scaling_factor
+        self.load_cached_codes_if_available = load_cached_codes_if_available
+        self.beta_binomial_interpolator = BetaBinomialInterpolator(scaling_factor=prior_scaling_factor)
+        self.samples = []
+        self.sample_weights = []
+        for dataset in dataset_meta:
+            samples, weights = self._preprocess_manifest(
+                dataset_name=dataset,
+                dataset_info=dataset_meta[dataset],
+                min_duration=min_duration,
+                max_duration=max_duration,
+            )
+            self.samples += samples
+            self.sample_weights += weights
+
+    def _preprocess_manifest(
+        self,
+        dataset_name,
+        dataset_info,
+        min_duration,
+        max_duration,
+    ):
+        entries = read_manifest(dataset_info['manifest_path'])
+        filtered_entries, total_hours, filtered_hours = filter_dataset_by_duration(
+            entries=entries, min_duration=min_duration, max_duration=max_duration
+        )
+
+        logging.info(dataset_name)
+        logging.info(f"Original # of files: {len(entries)}")
+        logging.info(f"Filtered # of files: {len(filtered_entries)}")
+        logging.info(f"Original duration: {total_hours:.2f} hours")
+        logging.info(f"Filtered duration: {filtered_hours:.2f} hours")
+
+        samples = []
+        sample_weights = []
+        for entry in filtered_entries:
+            entry['audio_filepath'] = os.path.join(dataset_info['audio_dir'], entry['audio_filepath'])
+            entry['dataset_name'] = dataset_name
+            samples.append(entry)
+            sample_weights.append(dataset_info.get('sample_weight', 1.0))
+
+        return samples, sample_weights
+    
+    def load_audio(self, audio_filepath, sample_rate):
+        features = AudioSegment.segment_from_file(
+            audio_filepath, target_sr=sample_rate, n_segments=-1, trim=False,
+        )
+        audio_samples = features.samples
+        audio = torch.tensor(audio_samples, dtype=torch.float32)
+        return audio
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        # choose random audio length between 22000 and 48000 based on index seed
+        _audio_len = 22000 + (index * 1000) % 26000
+        # random audio between 0 and 1
+        audio = torch.rand(_audio_len)
+
+        audio_len = audio.shape[0]
+        audio_16khz = torch.rand(int(audio_len * 16000 / 22050))
+        audio_len_16khz = audio_16khz.shape[0]
+        
+        # tokens = torch.randint(1, 10, (10,))
+        # text_len = tokens.shape[0]
+
+        tokens = self.text_tokenizer(sample['text'])
+        tokens = tokens + [self.eos_id] # Not adding BOS id
+        tokens = torch.tensor(tokens, dtype=torch.int32)
+        text_len = tokens.shape[0]
+
+        # audio_codes matrix of shape (8, 100) with values between 0 and 255
+        # _audio_codes_len = int(_audio_len / 1024)
+        # audio_codes = torch.randint(0, 256, (8, _audio_codes_len))
+        # audio_codes_len = audio_codes.shape[1]
+
+        example = {
+            "dataset_name": sample['dataset_name'],
+            "audio_filepath": sample['audio_filepath'],
+            "audio": audio,
+            "audio_len": audio_len,
+            "audio_16khz": audio_16khz,
+            "audio_len_16khz": audio_len_16khz,
+            "tokens": tokens,
+            "text_len": text_len,
+            # "audio_codes": audio_codes,
+            # "audio_codes_len": audio_codes_len,
+        }
+
+        if self.load_cached_codes_if_available and 'target_audio_codes_path' in sample:
+            audio_codes_path = sample['target_audio_codes_path']
+            audio_codes = torch.load(audio_codes_path).long() # (C, T)
+            spec_len = audio_codes.shape[1] + 1 # +1 for EOS
+            auidio_bos_tensor = torch.full((audio_codes.shape[0], 1), self.audio_bos_id, dtype=audio_codes.dtype)
+            audio_eos_tensor = torch.full((audio_codes.shape[0], 1), self.audio_eos_id, dtype=audio_codes.dtype)
+            audio_codes = torch.cat([auidio_bos_tensor, audio_codes, audio_eos_tensor], dim=1)
+            audio_codes_len = audio_codes.shape[1]
+            example['audio_codes'] = audio_codes
+            example['audio_codes_len'] = audio_codes_len
+        else:
+            spec_len = int(audio_len / self.codec_model_downsample_factor) + 1
+        
+        if self.include_align_prior:
+            align_prior = self.beta_binomial_interpolator(spec_len, text_len)
+            align_prior = torch.tensor(align_prior, dtype=torch.float32)
+            example["align_prior"] = align_prior
+
+        return example
+    
+    def __len__(self):
+        return len(self.samples)
+
+    def collate_fn(self, batch: List[dict]):
+        dataset_name_list = []
+        audio_filepath_list = []
+        audio_list = []
+        audio_len_list = []
+        audio_list_16khz = []
+        audio_len_list_16khz = []
+        token_list = []
+        token_len_list = []
+        speaker_list = []
+        prior_list = []
+        audio_codes_list = []
+        audio_codes_len_list = []
+
+        for example in batch:
+            dataset_name_list.append(example["dataset_name"])
+            audio_filepath_list.append(example["audio_filepath"])
+
+            audio_list.append(example["audio"])
+            audio_len_list.append(example["audio_len"])
+
+            audio_list_16khz.append(example["audio_16khz"])
+            audio_len_list_16khz.append(example["audio_len_16khz"])
+
+            token_list.append(example["tokens"])
+            token_len_list.append(example["text_len"])
+
+            if self.include_align_prior:
+                prior_list.append(example["align_prior"])
+            
+            if 'audio_codes' in example:
+                audio_codes_list.append(example['audio_codes'])
+                audio_codes_len_list.append(example['audio_codes_len'])
+
+        batch_audio_len = torch.IntTensor(audio_len_list)
+        audio_max_len = int(batch_audio_len.max().item())
+
+        batch_audio_len_16khz = torch.IntTensor(audio_len_list_16khz)
+        audio_max_len_16khz = int(batch_audio_len_16khz.max().item())
+
+        batch_token_len = torch.IntTensor(token_len_list)
+        token_max_len = int(batch_token_len.max().item())
+
+        batch_audio = stack_tensors(audio_list, max_lens=[audio_max_len])
+        batch_audio_16khz = stack_tensors(audio_list_16khz, max_lens=[audio_max_len_16khz])
+        batch_tokens = stack_tensors(token_list, max_lens=[token_max_len], pad_value=self.text_tokenizer.pad)
+
+        batch_dict = {
+            "dataset_names": dataset_name_list,
+            "audio_filepaths": audio_filepath_list,
+            "audio": batch_audio,
+            "audio_lens": batch_audio_len,
+            "audio_16khz": batch_audio_16khz,
+            "audio_lens_16khz": batch_audio_len_16khz,
+            "text": batch_tokens,
+            "text_lens": batch_token_len,
+        }
+
+        if len(audio_codes_list) > 0:
+            audio_codes_max_len = max([audio_codes.shape[1] for audio_codes in audio_codes_list])
+            batch_audio_codes = stack_tensors(audio_codes_list, max_lens=[audio_codes_max_len])
+            batch_dict['audio_codes'] = batch_audio_codes
+            batch_dict['audio_codes_lens'] = torch.IntTensor(audio_codes_len_list)
+
+        if self.include_align_prior:
+            spec_max_len = max([prior.shape[0] for prior in prior_list])
+            text_max_len = max([prior.shape[1] for prior in prior_list])
+            batch_dict["align_prior_matrix"] = stack_tensors(prior_list, max_lens=[text_max_len, spec_max_len],)
 
         return batch_dict
