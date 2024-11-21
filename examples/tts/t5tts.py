@@ -23,7 +23,7 @@ from nemo.utils.exp_manager import exp_manager
 @hydra_runner(config_path="conf/t5tts", config_name="t5tts")
 def main(cfg):
     logging.info('\nConfig Params:\n%s', OmegaConf.to_yaml(cfg, resolve=True))
-    if cfg.model.get('use_lthose', False):
+    if not cfg.model.get('use_lthose', False):
         import torch.multiprocessing as mp
         mp.set_start_method("spawn", force=True)
 
