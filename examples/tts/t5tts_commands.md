@@ -93,6 +93,35 @@ trainer.devices=1 \
 ~model.optim.sched ;
 ```
 
+
+### Command Lhotse dataset
+```
+python examples/tts/t5tts.py \
+    --config-name=t5tts_lhotse.yaml \
+    batch_size=32 \
+    micro_batch_size=32 \
+    max_steps=1000000 \
+    limit_val_batches=20 \
+    trainer.max_steps=1000000 \
+    trainer.val_check_interval=500 \
+    exp_manager.exp_dir="/datap/misc/Experiments/SimpleT5Explore/LocalTraining_LRH/" \
+    model.codecmodel_path="/home/ecasanova/Projects/Checkpoints/Audio_codec/21Hz-no-eliz/AudioCodec_21Hz_no_eliz.nemo" \
+    model.alignment_loss_scale=0.01 \
+    model.prior_scaling_factor=0.5 \
+    model.prior_scaledown_start_step=5000 \
+    model.prior_end_step=8000 \
+    model.t5_encoder.use_flash_self_attention=true \
+    model.t5_encoder.use_flash_x_attention=true \
+    model.t5_decoder.use_flash_self_attention=true \
+    model.t5_decoder.use_flash_x_attention=false \
+    trainer.devices=1 \
+    ++model.load_cached_codes_if_available=False \
+    ++model.num_audio_codebooks=8 \
+    ++model.num_audio_tokens_per_codebook=2048 \
+    ++model.codec_model_downsample_factor=1024 \
+    ~model.optim.sched ;
+
+```
 Set `model.model_type=multi_encoder_context_tts` for Multi Encoder T5TTS and `model.use_text_conditioning_encoder=true` if you are doing text context training.
 
 If you change the codec model, make sure to adjust these model config params in `t5tts.yaml`:
