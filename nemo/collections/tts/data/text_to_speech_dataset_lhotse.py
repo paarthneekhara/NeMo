@@ -13,47 +13,17 @@
 # limitations under the License.
 
 import copy
-import json
-import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import librosa
 import torch
-import torch.utils.data
-from lhotse import CutSet
-from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
 from megatron.core import parallel_state
 from omegaconf.omegaconf import OmegaConf
 
-from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import BaseTokenizer
-from nemo.collections.multimodal.speech_llm.data.audio_text_dataset import (
-    get_audio_text_dataset_from_config,
-    get_tarred_audio_text_dataset_from_config,
-)
-from nemo.collections.multimodal.speech_llm.data.lhotse_dataset import LhotseAudioQuestionAnswerDataset
-from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import TextProcessing
-from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import BlendableDataset
-from nemo.collections.nlp.data.language_modeling.megatron.megatron_batch_samplers import (
-    MegatronPretrainingBatchSampler,
-)
-from nemo.collections.tts.parts.preprocessing.feature_processors import FeatureProcessor
-from nemo.collections.tts.parts.preprocessing.features import Featurizer
-from nemo.collections.tts.parts.utils.tts_dataset_utils import (
-    BetaBinomialInterpolator,
-    _read_audio,
-    beta_binomial_prior_distribution,
-    filter_dataset_by_duration,
-    get_weighted_sampler,
-    load_audio,
-    stack_tensors,
-)
-from nemo.core.classes import Dataset
+from nemo.collections.tts.parts.utils.tts_dataset_utils import beta_binomial_prior_distribution, stack_tensors
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
 
@@ -139,27 +109,7 @@ def build_lhotse_dataloader(dataset, data_cfg, is_eval=False):
         return dls
 
 
-@dataclass
-class DatasetMeta:
-    manifest_path: Path
-    audio_dir: Path
-    feature_dir: Path
-    sample_weight: float = 1.0
-
-
-@dataclass
-class DatasetSample:
-    dataset_name: str
-    manifest_entry: Dict[str, Any]
-    audio_dir: Path
-    feature_dir: Path
-    text: str
-    speaker: str
-    speaker_index: int = None
-
-
 @experimental
-
 class T5TTSLhotseDataset(torch.utils.data.Dataset):
     """
     Class for processing and loading text to speech training examples.
@@ -222,9 +172,6 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
         cuts = cuts.sort_by_duration()
 
         logging.debug(f"Len: {len(cuts)}")
-
-        # Load source audio
-        # audio = [cut.resample(self.sample_rate).load_audio() for cut in cuts]
 
         # load audios and text
         num_codec_frames = []
