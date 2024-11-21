@@ -12,46 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import librosa
+import torch
 import torch.utils.data
-
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
-from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import BaseTokenizer
-from nemo.collections.tts.parts.preprocessing.feature_processors import FeatureProcessor
-from nemo.collections.tts.parts.preprocessing.features import Featurizer
-from nemo.collections.tts.parts.utils.tts_dataset_utils import (
-    BetaBinomialInterpolator,
-    beta_binomial_prior_distribution,
-    filter_dataset_by_duration,
-    get_weighted_sampler,
-    load_audio,
-    _read_audio,
-    stack_tensors,
-)
-from nemo.core.classes import Dataset
-from nemo.utils import logging
-from nemo.utils.decorators import experimental
-import os
-
-
 from lhotse import CutSet
 from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
-
-import copy
-from pathlib import Path
-
-import torch
 from megatron.core import parallel_state
 from omegaconf.omegaconf import OmegaConf
 
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
+from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import BaseTokenizer
 from nemo.collections.multimodal.speech_llm.data.audio_text_dataset import (
     get_audio_text_dataset_from_config,
     get_tarred_audio_text_dataset_from_config,
@@ -62,6 +42,20 @@ from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset impo
 from nemo.collections.nlp.data.language_modeling.megatron.megatron_batch_samplers import (
     MegatronPretrainingBatchSampler,
 )
+from nemo.collections.tts.parts.preprocessing.feature_processors import FeatureProcessor
+from nemo.collections.tts.parts.preprocessing.features import Featurizer
+from nemo.collections.tts.parts.utils.tts_dataset_utils import (
+    BetaBinomialInterpolator,
+    _read_audio,
+    beta_binomial_prior_distribution,
+    filter_dataset_by_duration,
+    get_weighted_sampler,
+    load_audio,
+    stack_tensors,
+)
+from nemo.core.classes import Dataset
+from nemo.utils import logging
+from nemo.utils.decorators import experimental
 
 
 def collate_vectors(items, max_length: int, padding_value):

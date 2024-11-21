@@ -11,35 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List
+import os
 from math import ceil
+from typing import List
+
 import numpy as np
 import omegaconf
+import soundfile as sf
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
-import os
+from torch.utils.data import get_worker_info
+from transformers import DistilBertModel, DistilBertTokenizer
 
-from nemo.collections.tts.parts.utils.helpers import (
-    get_mask_from_lengths,
-    plot_alignment_to_numpy,
-)
+import nemo.collections.asr as nemo_asr
+from nemo.collections.tts.data import text_to_speech_dataset
+from nemo.collections.tts.data.text_to_speech_dataset_lhotse import T5TTSLhotseDataset, build_lhotse_dataloader
+from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
+from nemo.collections.tts.models import AudioCodecModel
+from nemo.collections.tts.modules import t5tts_perceiver, t5tts_transformer
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths, plot_alignment_to_numpy
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
-from nemo.collections.tts.modules import t5tts_transformer, t5tts_perceiver
-from nemo.collections.tts.models import AudioCodecModel
-from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
-import nemo.collections.asr as nemo_asr
-import soundfile as sf
-from nemo.collections.tts.data import text_to_speech_dataset
-from nemo.collections.tts.data.text_to_speech_dataset_lhotse import build_lhotse_dataloader, T5TTSLhotseDataset
-
-from torch.utils.data import get_worker_info
-from transformers import DistilBertTokenizer, DistilBertModel
 
 HAVE_WANDB = True
 try:
