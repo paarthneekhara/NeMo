@@ -606,7 +606,7 @@ class T5TTS_Model(ModelPT):
             raise ValueError(f"Unsupported type for cond {type(cond)}")
         
         return dummy_cond, dummy_mask, dummy_additional_decoder_input, dummy_additional_dec_mask, attn_prior
-        
+
 
     def process_batch(self, batch, mode="train"):
         context_tensors = self.prepare_context_tensors(batch)
