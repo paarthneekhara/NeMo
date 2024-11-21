@@ -885,7 +885,7 @@ class T5TTS_Model(ModelPT):
 
     def _setup_train_dataloader(self, cfg):
         if cfg.get('use_lhotse', False):
-            dataset = T5TTSLthosDataset(
+            dataset = T5TTSLhotseDataset(
                 sample_rate=self.cfg.sample_rate,
                 bos_id=self.bos_id,
                 eos_id=self.eos_id,
@@ -897,9 +897,9 @@ class T5TTS_Model(ModelPT):
                 dataset_type='train', # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
             )
             dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
-            dataset.text_tokenizer = self.tokenizer
+            dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
             # ToDo: Add support for the dataset.text_conditioning_tokenizer on lhotse dataset
-            data_loader = build_lhotse_dataloader(dataset, cfg.dataset, worker_init_fn=worker_init_fn)
+            data_loader = build_lhotse_dataloader(dataset, cfg.dataset)
         else:
             dataset = self.get_dataset(cfg, dataset_type='train')
             sampler = dataset.get_sampler(cfg.dataloader_params.batch_size, world_size=self.trainer.world_size)
@@ -914,14 +914,30 @@ class T5TTS_Model(ModelPT):
         return data_loader
 
     def _setup_test_dataloader(self, cfg):
-        dataset = self.get_dataset(cfg, dataset_type='test')
-        persistent_workers = True
-        if cfg.dataloader_params.num_workers == 0:
-            persistent_workers = False
-            # For num workers > 0 tokenizer will be assigned in worker_init_fn (since it is not picklable)
-            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(self.cfg, mode='test')
+        if cfg.get('use_lhotse', False):
+            dataset = T5TTSLhotseDataset(
+                sample_rate=self.cfg.sample_rate,
+                bos_id=self.bos_id,
+                eos_id=self.eos_id,
+                audio_bos_id=self.audio_bos_id,
+                audio_eos_id=self.audio_eos_id,
+                codec_model_downsample_factor=self.cfg.codec_model_downsample_factor,
+                prior_scaling_factor=self.cfg.prior_scaling_factor,
+                load_cached_codes_if_available=self.cfg.load_cached_codes_if_available,
+                dataset_type='test', # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
+            )
+            dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
+            dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
+            data_loader = build_lhotse_dataloader(dataset, cfg.dataset, is_eval=True)
+        else:
+            dataset = self.get_dataset(cfg, dataset_type='test')
+            persistent_workers = True
+            if cfg.dataloader_params.num_workers == 0:
+                persistent_workers = False
+                # For num workers > 0 tokenizer will be assigned in worker_init_fn (since it is not picklable)
+                dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(self.cfg, mode='test')
 
-        data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **cfg.dataloader_params, worker_init_fn=worker_init_fn, persistent_workers=persistent_workers)
+            data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **cfg.dataloader_params, worker_init_fn=worker_init_fn, persistent_workers=persistent_workers)
         return data_loader
 
     def setup_training_data(self, cfg):

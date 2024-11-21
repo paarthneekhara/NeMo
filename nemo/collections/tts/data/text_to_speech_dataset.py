@@ -531,7 +531,7 @@ class T5TTSDataset(TextToSpeechDataset):
             context_text_len = context_tokens.shape[0]
             example['context_text_tokens'] = context_tokens
             example['context_text_len'] = context_text_len
-            
+
 
         if self.include_align_prior:
             # align_prior = self.beta_binomial_interpolator(spec_len, text_len)
