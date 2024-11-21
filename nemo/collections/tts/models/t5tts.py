@@ -35,6 +35,9 @@ from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
 import nemo.collections.asr as nemo_asr
 import soundfile as sf
+from nemo.collections.tts.data import text_to_speech_dataset
+from nemo.collections.tts.data.text_to_speech_dataset_lhotse import build_lhotse_dataloader, T5TTSLthosDataset
+
 from torch.utils.data import get_worker_info
 from transformers import DistilBertTokenizer, DistilBertModel
 
@@ -706,17 +709,35 @@ class T5TTS_Model(ModelPT):
         return dataset
 
     def _setup_train_dataloader(self, cfg):
-        dataset = self.get_dataset(cfg, dataset_type='train')
-        sampler = dataset.get_sampler(cfg.dataloader_params.batch_size, world_size=self.trainer.world_size)
-        if cfg.dataloader_params.num_workers == 0:
-            # For num workers > 0 tokenizer will be assigned in worker_init_fn (since it is not picklable)
-            dataset.text_tokenizer = self._setup_tokenizer(self.cfg)
-            if self.cfg.use_text_conditioning_encoder:
-                dataset.text_conditioning_tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+        if cfg.get('use_lhotse', False):
+            dataset = T5TTSLthosDataset(
+                sample_rate=self.cfg.sample_rate,
+                bos_id=self.bos_id,
+                eos_id=self.eos_id,
+                audio_bos_id=self.audio_bos_id,
+                audio_eos_id=self.audio_eos_id,
+                codec_model_downsample_factor=self.cfg.codec_model_downsample_factor,
+                prior_scaling_factor=self.cfg.prior_scaling_factor,
+                load_cached_codes_if_available=self.cfg.load_cached_codes_if_available,
+                dataset_type='train', # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
+            )
+            dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
+            dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
+            # data_loader = build_lhotse_dataloader(dataset, cfg.dataset, worker_init_fn=worker_init_fn)
+            data_loader = build_lhotse_dataloader(dataset, cfg.dataset, worker_init_fn=worker_init_fn)
+        else:
+            dataset = self.get_dataset(cfg, dataset_type='train')
+            sampler = dataset.get_sampler(cfg.dataloader_params.batch_size, world_size=self.trainer.world_size)
+            if cfg.dataloader_params.num_workers == 0:
+                # For num workers > 0 tokenizer will be assigned in worker_init_fn (since it is not picklable)
+                dataset.text_tokenizer = self._setup_tokenizer(self.cfg)
+                if self.cfg.use_text_conditioning_encoder:
+                    dataset.text_conditioning_tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
 
-        data_loader = torch.utils.data.DataLoader(
-            dataset, collate_fn=dataset.collate_fn, sampler=sampler, **cfg.dataloader_params, worker_init_fn=worker_init_fn
-        )
+            data_loader = torch.utils.data.DataLoader(
+                dataset, collate_fn=dataset.collate_fn, sampler=sampler, **cfg.dataloader_params, worker_init_fn=worker_init_fn
+            )
+
         return data_loader
 
     def _setup_test_dataloader(self, cfg):
