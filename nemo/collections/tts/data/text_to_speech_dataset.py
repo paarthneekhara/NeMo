@@ -14,6 +14,7 @@
 
 import json
 import random
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,18 +28,18 @@ from nemo.collections.tts.parts.preprocessing.feature_processors import FeatureP
 from nemo.collections.tts.parts.preprocessing.features import Featurizer
 from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     BetaBinomialInterpolator,
+    _read_audio,
     beta_binomial_prior_distribution,
     filter_dataset_by_duration,
     get_weighted_sampler,
     load_audio,
-    _read_audio,
     stack_tensors,
 )
 from nemo.core.classes import Dataset
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
-import os
 import numpy as np
+
 
 @dataclass
 class DatasetMeta:
