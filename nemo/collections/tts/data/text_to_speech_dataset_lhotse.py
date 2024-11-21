@@ -90,17 +90,17 @@ def normalize_volume_torch(audio, volume_level: float = 0.95):
 
     return volume_level * (audio / torch.max(torch.abs(audio)))
 
-def build_lhotse_dataloader(dataset, data_cfg, consumed_samples=0, is_predict=False, is_eval=False, worker_init_fn=None):
+def build_lhotse_dataloader(dataset, data_cfg, is_eval=False):
     """Buld dataloader given an input dataset."""
-    if is_eval == False and is_predict == False:
+    if not is_eval:
         return get_lhotse_dataloader_from_config(
             data_cfg,
             global_rank=parallel_state.get_data_parallel_rank(),
             world_size=parallel_state.get_data_parallel_world_size(),
             dataset=dataset,
         )
-    # for eval, we need to create separate dataset so as to report splitted numbers
     else:
+        # for eval, we need to create separate dataset so as to report splitted numbers
         dls = []
         if hasattr(data_cfg, 'manifest_filepath'):
             manifest_filepath = data_cfg.manifest_filepath
@@ -166,7 +166,7 @@ class DatasetSample:
 
 @experimental
 
-class T5TTSLthosDataset(torch.utils.data.Dataset):
+class T5TTSLhotseDataset(torch.utils.data.Dataset):
     """
     Class for processing and loading text to speech training examples.
 
