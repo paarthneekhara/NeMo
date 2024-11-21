@@ -5,6 +5,8 @@ limit_val_batches: ???
 # Adjust batch size based on GPU memory
 batch_size: 16
 micro_batch_size: 16
+batch_duration: ???
+eval_batch_size: ???
 
 # Dataset metadata for each manifest
 # https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/tts/data/vocoder_dataset.py#L39-L41
@@ -97,13 +99,14 @@ model:
       use_lhotse: ${model.use_lhotse}
       text_field : "text"
       seed: 'trng'
-      batch_duration : 100  # 0
+      batch_duration : ${batch_duration}  # 0
       quadratic_duration : 20
       num_buckets : 31
       buffer_size : 10000
       shuffle_buffer_size : 10000
       num_cuts_for_bins_estimate: 10000
       duration_bins: [3.155,3.76,4.27,4.74,5.1935,5.64,6.096,6.588,7.14,7.81,8.28,8.664,9.072,9.57,10.14,10.7335,11.3735,12.09,12.78,13.41,14.01,14.62,15.253375,15.96875,16.71,17.45,18.1335,18.7735,19.4,20.0]
+      # bucket_duration_bins: [3.155,3.76,4.27,4.74,5.1935,5.64,6.096,6.588,7.14,7.81,8.28,8.664,9.072,9.57,10.14,10.7335,11.3735,12.09,12.78,13.41,14.01,14.62,15.253375,15.96875,16.71,17.45,18.1335,18.7735,19.4,20.0]
 
   validation_ds:
     use_lhotse: ${model.use_lhotse}
@@ -143,7 +146,7 @@ model:
       drop_last: False
       use_bucketing: false
       is_tarred: false
-      batch_size: ${batch_size}
+      batch_size: ${eval_batch_size}
   
   t5_encoder:
     is_causal: false
@@ -232,6 +235,7 @@ trainer:
   benchmark: false
   max_steps: ${max_steps}
   limit_val_batches: ${limit_val_batches}
+  use_distributed_sampler: false
 
 exp_manager:
   exp_dir: null
