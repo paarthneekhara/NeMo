@@ -64,7 +64,7 @@ def create_shar_from_manifest(
         elif "language" in line:
             language = line["language"]
         elif "Language:" in line["speaker"]:
-            language = line["speaker"].split("Language:").split(" ")[0]
+            language = line["speaker"].split("Language:")[1].split(" ")[0]
         else:
             language = "en"
 
