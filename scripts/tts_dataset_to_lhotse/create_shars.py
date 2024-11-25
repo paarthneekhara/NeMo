@@ -26,7 +26,7 @@ def json_reader(filename):
 
 
 def create_shar_from_manifest(
-    manifest, out_shar_dir, num_shard=10
+    manifest, audio_root_path, out_shar_dir, num_shard=10
 ):
     in_manifest = list(json_reader(manifest))
     print(f"...loaded {manifest} # of datapoints {len(in_manifest)}")
@@ -44,34 +44,39 @@ def create_shar_from_manifest(
     for i, line in tqdm(enumerate(in_manifest)):
         # For single turn convs is a list of 2 elements
         # First element is user speech and second is agent speech
-        convs = line["conversations"]
+
         # User_Speech
-        user_recording = Recording.from_file(convs[0]['value'])
-        user_recordings.append(user_recording)
-        
-        # Instructions from the user. In case the question is part of the source audio this is a static text "Transcribe and answer",
-        # If not then this is the actual question from the user but in text.
-        # For direct_s2s instructions are always empty (else part)
-        if "instruction" in convs[0]:
-            instructions.append(convs[0]["instruction"])
+        # if context audio path exists uses it, otherwise uses the target audio path
+        if "context_audio_path" in line:
+            context_audio_path = line["context_audio_path"]
         else:
-            instructions.append("")
+            context_audio_path = line["audio_filepath"]
+
+        user_recording = Recording.from_file(os.path.join(audio_root_path, context_audio_path))
+        user_recordings.append(user_recording)
+
+        # This are the context text, this could be different things like a simple instruction or details about speaker voice
+        instructions.append("")
 
         # Language source
-        if "lang" in convs[0]:
-            source_language.append(convs[0]["lang"])
+        if "lang" in line:
+            language = line["lang"]
+        elif "language" in line:
+            language = line["language"]
+        elif "Language:" in line["speaker"]:
+            language = line["speaker"].split("Language:").split(" ")[0]
         else:
-            source_language.append("EN")
+            language = "en"
+
+        source_language.append(language)
 
         # Loading agent audio and using only the extracted features as nd.array
-        target_recordings.append(Recording.from_file(convs[1]['value']))
+        target_recordings.append(Recording.from_file(os.path.join(audio_root_path, line["audio_filepath"])))
         # Agent answer transcript
-        answer_list.append(convs[1]["transcript"])
+        answer_list.append(line["text"])
         # Language target
-        if "lang" in convs[1]:
-            target_language.append(convs[1]["lang"])
-        else:
-            target_language.append("EN")
+        target_language.append(language)
+
 
     print("Done extracting data from manifest")
     print(len(user_recordings))
@@ -87,7 +92,7 @@ def create_shar_from_manifest(
                 duration=cut.recording.duration,
                 text=instructions[i],
                 speaker="user",
-                language=source_language[i],
+                language=source_language[i].upper(),
             ),
         )
         cut.supervisions.append(
@@ -129,26 +134,33 @@ def main():
     parser.add_argument(
         '--manifest',
         type=str,
-        default="/lustre/fsw/portfolios/convai/users/subhankarg/manifests/s2s/squadv2/conversation_style_manifest_normalized_with_correctpath_with_evaluations.json",
+        default="/lustre/fsw/llmservice_nemo_speechlm/data/TTS/manifests/hifitts__phoneme__nemo_audio_21fps_8codebooks_2kcodes_v2bWithWavLM_simplet5.json",
+    )
+    parser.add_argument(
+        '--audio_root_path',
+        type=str,
+        default="/lustre/fsw/llmservice_nemo_speechlm/data/TTS/hi_fi_tts_v0/",
     )
     parser.add_argument(
         '--out_shar_dir',
         type=str,
-        default="/lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_lhotse_with_wavs/squadv2/",
+        default="/lustre/fsw/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/hifitts/",
     )
     parser.add_argument(
         '--num_shard',
         type=int,
         default=10,
     )
-    
+
     args = parser.parse_args()
     print(f"manifest {args.manifest}")
+    print(f"audio_root_path {args.audio_root_path}")
     print(f"out_shar_dir {args.out_shar_dir}")
     print(f"num_shard {args.num_shard}")
 
     create_shar_from_manifest(
         manifest=args.manifest,
+        audio_root_path=args.audio_root_path,
         out_shar_dir=args.out_shar_dir,
         num_shard=args.num_shard,
     )
