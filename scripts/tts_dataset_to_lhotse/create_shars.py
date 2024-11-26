@@ -26,15 +26,15 @@ def json_reader(filename):
 
 
 def create_shar_from_manifest(
-    manifest, audio_root_path, out_shar_dir, num_shard=10
+    manifest, audio_root_path, out_shar_dir, shard_size=1000
 ):
     in_manifest = list(json_reader(manifest))
     print(f"...loaded {manifest} # of datapoints {len(in_manifest)}")
-    shard_size = int(len(in_manifest) / num_shard)
+    num_shard = int(len(in_manifest) / shard_size)
     if len(in_manifest) % shard_size != 0:
         shard_size += 1
     print(f"shard_size {shard_size} num_shards {num_shard}")
-    
+
     user_recordings = []
     answer_list = []
     instructions = []
@@ -143,22 +143,22 @@ def main():
         default="/lustre/fsw/llmservice_nemo_speechlm/data/TTS/tts_lhotse_datasets/hifitts/",
     )
     parser.add_argument(
-        '--num_shard',
+        '--shard_size',
         type=int,
-        default=10,
+        default=1000,
     )
 
     args = parser.parse_args()
     print(f"manifest {args.manifest}")
     print(f"audio_root_path {args.audio_root_path}")
     print(f"out_shar_dir {args.out_shar_dir}")
-    print(f"num_shard {args.num_shard}")
+    print(f"num_shard {args.shard_size}")
 
     create_shar_from_manifest(
         manifest=args.manifest,
         audio_root_path=args.audio_root_path,
         out_shar_dir=args.out_shar_dir,
-        num_shard=args.num_shard,
+        shard_size=args.shard_size,
     )
 
 if __name__ == "__main__":
