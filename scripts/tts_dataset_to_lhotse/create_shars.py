@@ -46,11 +46,7 @@ def create_shar_from_manifest(
         # First element is user speech and second is agent speech
 
         # User_Speech
-        # if context audio path exists uses it, otherwise uses the target audio path
-        if "context_audio_path" in line:
-            context_audio_path = line["context_audio_path"]
-        else:
-            context_audio_path = line["audio_filepath"]
+        context_audio_path = line["context_audio_filepath"]
 
         user_recording = Recording.from_file(os.path.join(audio_root_path, context_audio_path))
         user_recordings.append(user_recording)
