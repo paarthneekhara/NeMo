@@ -56,7 +56,7 @@ def create_shar_from_manifest(
         user_recordings.append(user_recording)
 
         # This are the context text, this could be different things like a simple instruction or details about speaker voice
-        instructions.append("")
+        instructions.append(" ")
 
         # Language source
         if "lang" in line:
