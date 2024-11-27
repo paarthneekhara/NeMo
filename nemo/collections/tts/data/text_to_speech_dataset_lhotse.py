@@ -56,57 +56,12 @@ def normalize_volume_torch(audio, volume_level: float = 0.95):
 
 def build_lhotse_dataloader(dataset, data_cfg, is_eval=False):
     """Buld dataloader given an input dataset."""
-    if not is_eval:
-        return get_lhotse_dataloader_from_config(
-            data_cfg,
-            global_rank=parallel_state.get_data_parallel_rank(),
-            world_size=parallel_state.get_data_parallel_world_size(),
-            dataset=dataset,
-        )
-    else:
-        # for eval, we need to create separate dataset so as to report splitted numbers
-        dls = []
-        if hasattr(data_cfg, 'manifest_filepath'):
-            manifest_filepath = data_cfg.manifest_filepath
-            for cur_manifest_filepath in manifest_filepath:
-                conf = copy.deepcopy(data_cfg)
-                conf['manifest_filepath'] = cur_manifest_filepath
-                dls.append(
-                    get_lhotse_dataloader_from_config(
-                        conf,
-                        global_rank=parallel_state.get_data_parallel_rank(),
-                        world_size=parallel_state.get_data_parallel_world_size(),
-                        dataset=dataset,
-                    )
-                )
-        else:
-            input_cfg = data_cfg.input_cfg
-            if isinstance(input_cfg, (str, Path)):
-                # Resolve /path/to/input_cfg.yaml into config contents if needed.
-                input_cfg = OmegaConf.load(input_cfg)
-                assert len(input_cfg) == 1, "Only one dataset with multiple manifest paths is supported for eval"
-                data_cfg.input_cfg = input_cfg
-                # for getting names
-                manifest_filepath = [ic.manifest_filepath for ic in input_cfg[0].input_cfg]
-            for cur_input_cfg in input_cfg[0].input_cfg:
-                conf = copy.deepcopy(data_cfg)
-                conf.input_cfg[0].input_cfg = [cur_input_cfg]
-                dls.append(
-                    get_lhotse_dataloader_from_config(
-                        conf,
-                        global_rank=parallel_state.get_data_parallel_rank(),
-                        world_size=parallel_state.get_data_parallel_world_size(),
-                        dataset=dataset,
-                    )
-                )
-
-        if 'names' not in data_cfg:
-            names = []
-            for cur_manifest_filepath in manifest_filepath:
-                names.append(Path(cur_manifest_filepath).stem)
-            OmegaConf.update(data_cfg, 'names', names, force_add=True)
-            logging.info(f'Update dataset names as {names}')
-        return dls
+    return get_lhotse_dataloader_from_config(
+        data_cfg,
+        global_rank=parallel_state.get_data_parallel_rank(),
+        world_size=parallel_state.get_data_parallel_world_size(),
+        dataset=dataset,
+    )
 
 
 @experimental
@@ -221,8 +176,14 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
 
             # load context text
             if cut.supervisions[0].speaker == "user":
-                context_text = self.text_tokenizer(cut.supervisions[0].text)
-                context_text = context_text + [self.eos_id]
+                context_text = cut.supervisions[0].text
+                # check if the text is not empty
+                if context_text.replace(" ", ""):
+                    context_text = self.text_tokenizer(context_text)
+                    context_text = context_text + [self.eos_id]
+                else:
+                    context_text = [self.eos_id]
+                
                 context_text = torch.tensor(context_text, dtype=torch.int32)
                 context_text_len = context_text.shape[0]
                 context_text_tokens.append(context_text)
@@ -231,8 +192,14 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
                 raise Exception("First speaker should be user")
 
             if cut.supervisions[1].speaker == "agent":
-                target_text = self.text_tokenizer(cut.supervisions[1].text)
-                target_text = target_text + [self.eos_id]
+                target_text = cut.supervisions[1].text
+                # check if the text is not empty
+                if target_text.replace(" ", ""):
+                    target_text = self.text_tokenizer(target_text)
+                    target_text = target_text + [self.eos_id]
+                else:
+                    target_text = [self.eos_id]
+
                 target_text = torch.tensor(target_text, dtype=torch.int32)
                 target_text_len = target_text.shape[0]
                 target_text_tokens.append(target_text)
