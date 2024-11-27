@@ -38,7 +38,7 @@ model:
   max_steps: ${max_steps}
 
   sample_rate: ${sample_rate}
-  
+
   text_tokenizer:
     _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
     punct: true
@@ -57,14 +57,26 @@ model:
     use_lhotse: ${model.use_lhotse}
     dataset:
       input_cfg:
-      # - type: lhotse_shar
-      #   shar_path: /lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_shars_21fps_with_wavs/squadv2/
-      #   weight: 0.5
-      #   tags:
-      #     lang: en
-      #     s2s: True
       - type: lhotse_shar
-        shar_path: /media/ecasanova/data2/S2S/data/squadv2/squadv2/
+        shar_path: /cluster_data/TTS/tts_lhotse_datasets/hifitts_v0/
+        weight: 1.0
+        tags:
+          lang: en
+          s2s: True
+      - type: lhotse_shar
+        shar_path: /cluster_data/TTS/tts_lhotse_datasets/libri100/
+        weight: 1.0
+        tags:
+          lang: en
+          s2s: True
+      - type: lhotse_shar
+        shar_path: /cluster_data/TTS/tts_lhotse_datasets/rivaLindyRodney/
+        weight: 1.0
+        tags:
+          lang: en
+          s2s: True
+      - type: lhotse_shar
+        shar_path: /cluster_data/TTS/tts_lhotse_datasets/libri360/
         weight: 1.0
         tags:
           lang: en
@@ -111,32 +123,13 @@ model:
   validation_ds:
     use_lhotse: ${model.use_lhotse}
     dataset:
-      names: s2st
       input_cfg:
-        - type: group
-          weight: 1.0
-          tags:
-            lang: en
-          input_cfg:
-            # - type: lhotse_shar
-            #   shar_path: /lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_shars_21fps/squadv2/ # speech SQA
-            #   weight: 0.1
-            #   tags:
-            #     lang: en
-            #     s2s: True
-            - type: lhotse_shar
-              shar_path: /media/ecasanova/data2/S2S/data/squadv2-dummy-set/
-              weight: 0.1
-              tags:
-                lang: en
-                s2s_align: True
-            # s2s_shars_21fps_with_wavs
-            # - type: lhotse_shar
-            #   shar_path: /lustre/fs7/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/s2s_synthetic_data/s2s_shars_21fps/alpaca_val/ # speech SQA
-            #   weight: 0.1
-            #   tags:
-            #     lang: en
-            #     s2s: True
+      - type: lhotse_shar
+        shar_path: /cluster_data/TTS/tts_lhotse_datasets/LibriTTS_dev_clean/
+        weight: 1.0
+        tags:
+          lang: en
+          s2s: True
 
       global_batch_size: ${batch_size}
       micro_batch_size: ${micro_batch_size}

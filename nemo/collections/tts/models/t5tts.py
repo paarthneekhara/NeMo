@@ -421,7 +421,6 @@ class T5TTS_Model(ModelPT):
     def process_batch(self, batch):
         text = batch['text']
         text_lens = batch['text_lens']
-        print("batch size:", text.size(0))
         attn_prior = batch.get('align_prior_matrix', None)
         attn_prior = self.scale_prior(attn_prior, self.global_step)
 
