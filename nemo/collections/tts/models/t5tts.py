@@ -568,12 +568,12 @@ class T5TTS_Model(ModelPT):
             'context_audio_codes_lens': context_audio_codes_lens,
         }
 
-    def prepare_dummy_cond(self, cond, cond_mask, additional_decoder_input, addition_dec_mask):
+    def prepare_dummy_cond(self, cond, cond_mask, additional_decoder_input, additional_dec_mask):
         dummy_additional_decoder_input = None
-        addition_dec_mask = None
+        dummy_additional_dec_mask = None
         if additional_decoder_input is not None:
             dummy_additional_decoder_input = torch.zeros_like(additional_decoder_input)
-            addition_dec_mask = torch.zeros_like(addition_dec_mask)
+            dummy_additional_dec_mask = torch.zeros_like(additional_dec_mask)
 
         if isinstance(cond, list):
             # multi encoder conditioning
@@ -596,12 +596,12 @@ class T5TTS_Model(ModelPT):
         else:
             raise ValueError(f"Unsupported type for cond {type(cond)}")
         
-        return dummy_cond, dummy_mask, dummy_additional_decoder_input, addition_dec_mask, attn_prior
+        return dummy_cond, dummy_mask, dummy_additional_decoder_input, dummy_additional_dec_mask, attn_prior
         
 
-    def process_batch(self, batch):
+    def process_batch(self, batch, mode="train"):
         context_tensors = self.prepare_context_tensors(batch)
-
+        disable_alignment_loss = False
         if 'audio_codes' not in batch:
             audio_codes, audio_codes_lens = self.audio_to_codes(batch['audio'], batch['audio_lens'])
         else:
@@ -614,25 +614,26 @@ class T5TTS_Model(ModelPT):
 
         audio_codes_mask = ~get_mask_from_lengths(audio_codes_lens_input)
         audio_codes_embedded = self.embed_audio_tokens(audio_codes_input) # (B, T', E)
-
-        if self.cfg.get('cfg_unconditional_prob', 0.0) > 0.0:
-            if torch.rand(1).item() < self.cfg.cfg_unconditional_prob:
-                _cond, _cond_mask, _additional_decoder_input, _additional_decoder_mask, _attn_prior, = self.prepare_dummy_cond(
-                    context_tensors['cond'],
-                    context_tensors['cond_mask'],
-                    context_tensors['additional_decoder_input'],
-                    context_tensors['addtional_decoder_mask']
-                )
-            else:
-                _cond = context_tensors['cond']
-                _cond_mask = context_tensors['cond_mask']
-                _additional_decoder_input = context_tensors['additional_decoder_input']
-                _additional_decoder_mask = context_tensors['addtional_decoder_mask']
-                _attn_prior = context_tensors['attn_prior']
+        
+        use_cfg = (self.cfg.get('cfg_unconditional_prob', 0.0) > 0.0) and (mode == "train") and (context_tensors['cond'] is not None)
+        if use_cfg and torch.rand(1).item() < self.cfg.cfg_unconditional_prob:
+            cond, cond_mask, additional_decoder_input, additional_decoder_mask, attn_prior = self.prepare_dummy_cond(
+                context_tensors['cond'],
+                context_tensors['cond_mask'],
+                context_tensors['additional_decoder_input'],
+                context_tensors['addtional_decoder_mask']
+            )
+            disable_alignment_loss = True
+        else:
+            cond = context_tensors['cond']
+            cond_mask = context_tensors['cond_mask']
+            additional_decoder_input = context_tensors['additional_decoder_input']
+            additional_decoder_mask = context_tensors['addtional_decoder_mask']
+            attn_prior = context_tensors['attn_prior']
 
         if context_tensors['additional_decoder_input'] is not None:
-            dec_input_embedded = torch.cat([_additional_decoder_input, audio_codes_embedded], dim=1)
-            dec_input_mask = torch.cat([_additional_decoder_mask, audio_codes_mask], dim=1)
+            dec_input_embedded = torch.cat([additional_decoder_input, audio_codes_embedded], dim=1)
+            dec_input_mask = torch.cat([additional_decoder_mask, audio_codes_mask], dim=1)
         else:
             dec_input_embedded = audio_codes_embedded
             dec_input_mask = audio_codes_mask
@@ -640,9 +641,9 @@ class T5TTS_Model(ModelPT):
         logits, attn_info = self.forward(
             dec_input_embedded=dec_input_embedded,
             dec_input_mask=dec_input_mask,
-            cond=_cond,
-            cond_mask=_cond_mask,
-            attn_prior=_attn_prior,
+            cond=cond,
+            cond_mask=cond_mask,
+            attn_prior=attn_prior,
             multi_encoder_mapping=context_tensors['multi_encoder_mapping'],
         )
         # logits: (B, T', num_codebooks * num_tokens_per_codebook)
@@ -651,7 +652,7 @@ class T5TTS_Model(ModelPT):
 
         codebook_loss, loss_mask = self.compute_loss(logits, audio_codes_target, audio_codes_lens_target)
         alignment_loss = None
-        if self.cfg.alignment_loss_scale > 0.0:
+        if self.cfg.alignment_loss_scale > 0.0 and not disable_alignment_loss:
             text_lens = context_tensors['text_lens']
             cross_attention_scores = [attn['cross_attn_probabilities'][1] for layer_idx, attn in enumerate(attn_info) if layer_idx in self.transcript_decoder_layers]
             alignment_loss = self.compute_alignment_loss(cross_attention_scores, text_lens, audio_codes_lens_target, dec_context_size)
@@ -689,7 +690,7 @@ class T5TTS_Model(ModelPT):
     
     
     def validation_step(self, batch, batch_idx):
-        batch_output = self.process_batch(batch)
+        batch_output = self.process_batch(batch, mode="val")
         loss = batch_output['loss']
         codebook_loss = batch_output['codebook_loss']
         alignment_loss = batch_output['alignment_loss']
