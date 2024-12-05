@@ -884,7 +884,7 @@ class T5TTS_Model(ModelPT):
         if cfg.dataloader_params.num_workers == 0:
             persistent_workers = False
             # For num workers > 0 tokenizer will be assigned in worker_init_fn (since it is not picklable)
-            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(cfg)
+            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(self.cfg)
         data_loader = torch.utils.data.DataLoader(
             dataset, collate_fn=dataset.collate_fn, sampler=sampler, **cfg.dataloader_params, worker_init_fn=worker_init_fn, persistent_workers=persistent_workers
         )
@@ -896,7 +896,7 @@ class T5TTS_Model(ModelPT):
         if cfg.dataloader_params.num_workers == 0:
             persistent_workers = False
             # For num workers > 0 tokenizer will be assigned in worker_init_fn (since it is not picklable)
-            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(cfg, mode='test')
+            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(self.cfg, mode='test')
 
         data_loader = torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **cfg.dataloader_params, worker_init_fn=worker_init_fn, persistent_workers=persistent_workers)
         return data_loader
