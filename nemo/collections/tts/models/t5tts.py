@@ -722,11 +722,6 @@ class T5TTS_Model(ModelPT):
         return val_output
     
     def infer_batch(self, batch, max_decoder_steps=500, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0):
-        if use_cfg:
-            pass
-            # TODO: @pneekhara: Concatenate unconditional and conditional inputs into one batch to avoid this issue
-            # self.use_kv_cache_for_inference = False # KV cache is not supported with CFG yet.
-
         with torch.no_grad():
             if self.use_kv_cache_for_inference:
                 assert self.cfg.t5_decoder.use_flash_self_attention is False, "KV cache is not supported with flash self attention"
