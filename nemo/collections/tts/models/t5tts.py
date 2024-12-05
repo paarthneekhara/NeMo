@@ -568,30 +568,30 @@ class T5TTS_Model(ModelPT):
             'context_audio_codes_lens': context_audio_codes_lens,
         }
 
-    def prepare_dummy_cond(self, cond, cond_mask, additional_decoder_input, additional_dec_mask):
+    def prepare_dummy_cond_for_cfg(self, cond, cond_mask, additional_decoder_input, additional_dec_mask):
         dummy_additional_decoder_input = None
         dummy_additional_dec_mask = None
         if additional_decoder_input is not None:
             dummy_additional_decoder_input = torch.zeros_like(additional_decoder_input)
+            # all zero mask means dont ignore any timesteps (so that it is consistent with usual decoder mask)
             dummy_additional_dec_mask = torch.zeros_like(additional_dec_mask)
 
         if isinstance(cond, list):
             # multi encoder conditioning
-            bs, T, E = cond[0].size()
             dummy_cond = [torch.zeros_like(cond_item) for cond_item in cond]
             attn_prior = [None for _ in cond]
             dummy_mask = []
             for mask_item in cond_mask:
+                # ignore all timesteps except the first one
                 mask = torch.ones_like(mask_item)
                 mask[:,0] = 0 # Make first timestep all zeros
                 dummy_mask.append(mask)
             
         elif isinstance(cond, torch.Tensor):
             # single encoder conditioning
-            bs, T, E = cond.size()
             dummy_cond = torch.zeros_like(cond)
             dummy_mask = torch.ones_like(cond_mask)
-            dummy_mask[:,0] = 0 # Make first timestep all zeros
+            dummy_mask[:,0] = 0 # ignore all timesteps except the first one
             attn_prior = None
         else:
             raise ValueError(f"Unsupported type for cond {type(cond)}")
@@ -617,7 +617,7 @@ class T5TTS_Model(ModelPT):
         
         use_cfg = (self.cfg.get('cfg_unconditional_prob', 0.0) > 0.0) and (mode == "train") and (context_tensors['cond'] is not None)
         if use_cfg and torch.rand(1).item() < self.cfg.cfg_unconditional_prob:
-            cond, cond_mask, additional_decoder_input, additional_decoder_mask, attn_prior = self.prepare_dummy_cond(
+            cond, cond_mask, additional_decoder_input, additional_decoder_mask, attn_prior = self.prepare_dummy_cond_for_cfg(
                 context_tensors['cond'],
                 context_tensors['cond_mask'],
                 context_tensors['additional_decoder_input'],
@@ -741,7 +741,7 @@ class T5TTS_Model(ModelPT):
             end_indices = {}
 
             if use_cfg:
-                dummy_cond, dummy_cond_mask, dummy_additional_decoder_input, dummy_addition_dec_mask, _ = self.prepare_dummy_cond(
+                dummy_cond, dummy_cond_mask, dummy_additional_decoder_input, dummy_addition_dec_mask, _ = self.prepare_dummy_cond_for_cfg(
                     context_tensors['cond'],
                     context_tensors['cond_mask'],
                     context_tensors['additional_decoder_input'],
