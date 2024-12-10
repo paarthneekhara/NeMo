@@ -160,6 +160,8 @@ class T5TTS_Model(ModelPT):
         self.final_proj = nn.Linear(cfg.t5_decoder.d_model, cfg.num_audio_codebooks * cfg.num_audio_tokens_per_codebook)
 
         codec_model = AudioCodecModel.restore_from(cfg.get('codecmodel_path'), strict=False)
+        # del codec discriminator to free memory
+        del codec_model.discriminator
         codec_model.eval()
         self.freeze_model(codec_model)
         self._codec_model = codec_model
@@ -894,9 +896,14 @@ class T5TTS_Model(ModelPT):
                 prior_scaling_factor=self.cfg.prior_scaling_factor,
                 load_cached_codes_if_available=self.cfg.load_cached_codes_if_available,
                 dataset_type='train', # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
+                use_text_conditioning_tokenizer=self.cfg.use_text_conditioning_encoder,
+                pad_context_text_to_max_duration=self.pad_context_text_to_max_duration,
+                context_duration_min=self.cfg.context_duration_min,
+                context_duration_max=self.cfg.context_duration_max,
             )
             dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
-            dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
+            # dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
+            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(self.cfg)
             # ToDo: Add support for the dataset.text_conditioning_tokenizer on lhotse dataset
             data_loader = build_lhotse_dataloader(dataset, cfg.dataset)
         else:
@@ -924,9 +931,14 @@ class T5TTS_Model(ModelPT):
                 prior_scaling_factor=self.cfg.prior_scaling_factor,
                 load_cached_codes_if_available=self.cfg.load_cached_codes_if_available,
                 dataset_type='test', # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
+                use_text_conditioning_tokenizer=self.cfg.use_text_conditioning_encoder,
+                pad_context_text_to_max_duration=self.pad_context_text_to_max_duration,
+                context_duration_min=self.cfg.context_duration_min,
+                context_duration_max=self.cfg.context_duration_max,
             )
             dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
-            dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
+            # dataset.text_tokenizer = self.tokenizer # This will be used in worker_init_fn for instantiating tokenizer
+            dataset.text_tokenizer, dataset.text_conditioning_tokenizer = self._setup_tokenizers(self.cfg)
             data_loader = build_lhotse_dataloader(dataset, cfg.dataset, is_eval=True)
         else:
             dataset = self.get_dataset(cfg, dataset_type='test')

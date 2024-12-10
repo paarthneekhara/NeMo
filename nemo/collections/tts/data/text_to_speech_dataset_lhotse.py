@@ -104,6 +104,10 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
         dataset_type: str = 'train',
         tokenizer_config=None,
         load_16khz_audio: bool = True,
+        use_text_conditioning_tokenizer: bool = False,
+        pad_context_text_to_max_duration: bool = False,
+        context_duration_min: float = 3.0,
+        context_duration_max: float = 10.0
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -122,6 +126,11 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
         self.dataset_type = dataset_type
         self.tokenizer_config = tokenizer_config
         self.load_16khz_audio = load_16khz_audio
+        self.use_text_conditioning_tokenizer = use_text_conditioning_tokenizer
+        self.text_conditioning_tokenizer = None
+        self.pad_context_text_to_max_duration = pad_context_text_to_max_duration
+        self.context_duration_min = context_duration_min
+        self.context_duration_max = context_duration_max
 
     def __getitem__(self, cuts):
         cuts = cuts.sort_by_duration()
@@ -139,6 +148,7 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
         target_audios_16khz_lens = []
         context_text_tokens = []
         context_text_tokens_lens = []
+        has_text_context_list = []
         target_text_tokens = []
         target_text_tokens_lens = []
 
@@ -176,18 +186,29 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
 
             # load context text
             if cut.supervisions[0].speaker == "user":
-                context_text = cut.supervisions[0].text
-                # check if the text is not empty
-                if context_text.replace(" ", ""):
-                    context_text = self.text_tokenizer(context_text)
-                    context_text = context_text + [self.eos_id]
-                else:
-                    context_text = [self.eos_id]
-                
-                context_text = torch.tensor(context_text, dtype=torch.int32)
-                context_text_len = context_text.shape[0]
-                context_text_tokens.append(context_text)
-                context_text_tokens_lens.append(context_text_len)
+                if self.use_text_conditioning_tokenizer:
+                    context_text = cut.supervisions[0].text
+                    context_tokenizer = self.text_conditioning_tokenizer if self.text_conditioning_tokenizer else self.text_tokenizer
+                    # check if the text is not empty
+                    if context_text.replace(" ", ""):
+                        context_text = self.text_conditioning_tokenizer(context_text)['input_ids']
+                        has_text_context_list.append(True)
+                    else:
+                        context_text = self.text_conditioning_tokenizer("[NO TEXT CONTEXT]")['input_ids']
+                        has_text_context_list.append(False)
+                    
+                    if self.pad_context_text_to_max_duration:
+                        _required_len = int(self.context_duration_max * self.sample_rate / self.codec_model_downsample_factor) + 2 # +2 for BOS and EOS
+                        if len(context_text) < _required_len:
+                            _pad_id = self.text_conditioning_tokenizer.pad_token_id
+                            context_text += [_pad_id] * (_required_len - len(context_text))
+                        else:
+                            context_text = context_text[:_required_len]
+
+                    context_text = torch.tensor(context_text, dtype=torch.int32)
+                    context_text_len = context_text.shape[0]
+                    context_text_tokens.append(context_text)
+                    context_text_tokens_lens.append(context_text_len)
             else:
                 raise Exception("First speaker should be user")
 
@@ -254,74 +275,12 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
             ).float()
             target_audios_16khz_lens = torch.IntTensor(target_audios_16khz_lens)
 
-        """
-        # ToDo: implement audio codes load on lhotse dataset
-        if self.load_cached_codes_if_available and 'target_audio_codes_path' in data.manifest_entry:
-            audio_codes_path = data.manifest_entry['target_audio_codes_path']
-            audio_codes = torch.load(audio_codes_path).long() # (C, T)
-            spec_len = audio_codes.shape[1] + 1 # +1 for EOS
-            auidio_bos_tensor = torch.full((audio_codes.shape[0], 1), self.audio_bos_id, dtype=audio_codes.dtype)
-            audio_eos_tensor = torch.full((audio_codes.shape[0], 1), self.audio_eos_id, dtype=audio_codes.dtype)
-            audio_codes = torch.cat([auidio_bos_tensor, audio_codes, audio_eos_tensor], dim=1)
-            audio_codes_len = audio_codes.shape[1]
-            example['audio_codes'] = audio_codes
-            example['audio_codes_len'] = audio_codes_len
-            example['audio_filepath'] = audio_codes_path
-        else:
-            # Only load audio if codes are not available
-            audio_array, _, audio_filepath_rel = load_audio(
-                manifest_entry=data.manifest_entry,
-                audio_dir=data.audio_dir,
-                sample_rate=self.sample_rate,
-                volume_norm=self.volume_norm,
-            )
-            audio = torch.tensor(audio_array, dtype=torch.float32)
-            # Pad audio to be multiple of downsample factor
-            audio = torch.nn.functional.pad(
-                audio,
-                (0, self.codec_model_downsample_factor - (audio.shape[0] % self.codec_model_downsample_factor)),
-                value=0
-            )
-            audio_len = audio.shape[0]
-            example['audio_filepath'] = audio_filepath_rel
-            example['audio'] = audio
-            example['audio_len'] = audio_len
-            spec_len = int(audio_len / self.codec_model_downsample_factor) + 1 # +1 for EOS
-        
-        if self.load_cached_codes_if_available and 'context_audio_codes_path' in data.manifest_entry:
-            context_audio_codes_path = data.manifest_entry['context_audio_codes_path']
-            context_audio_codes = torch.load(context_audio_codes_path).long()
-            context_bos_tensor = torch.full((context_audio_codes.shape[0], 1), self.audio_bos_id, dtype=context_audio_codes.dtype)
-            context_eos_tensor = torch.full((context_audio_codes.shape[0], 1), self.audio_eos_id, dtype=context_audio_codes.dtype)
-            context_audio_codes = torch.cat([context_bos_tensor, context_audio_codes, context_eos_tensor], dim=1)
-            context_audio_codes_len = context_audio_codes.shape[1]
-            example['context_audio_codes'] = context_audio_codes
-            example['context_audio_codes_len'] = context_audio_codes_len
-        elif 'context_audio_filepath' in data.manifest_entry:
-            context_audio_filepath = os.path.join(data.audio_dir, data.manifest_entry['context_audio_filepath'])
-            context_duration = data.manifest_entry['context_audio_duration']
-            context_audio_array = _read_audio(audio_filepath=context_audio_filepath, sample_rate=self.sample_rate, offset=0, duration=context_duration)
-            context_audio_array = context_audio_array.samples
-            context_audio = torch.tensor(context_audio_array, dtype=torch.float32)
-            # Pad audio to be multiple of downsample factor
-            context_audio = torch.nn.functional.pad(
-                context_audio,
-                (0, self.codec_model_downsample_factor - (context_audio.shape[0] % self.codec_model_downsample_factor)),
-                value=0
-            )
-            context_audio_len = context_audio.shape[0]
-            example['context_audio'] = context_audio
-            example['context_audio_len'] = context_audio_len
-
-        """
         batch_dict = {
             # "dataset_names": dataset_names,
             # "audio_filepaths": audio_filepath_list,
             "sample_ids": list(cuts.ids),
             "text": target_text_tokens,
             "text_lens": target_text_tokens_lens,
-            "context_text": context_text_tokens,
-            "context_text_lens": context_text_tokens_lens,
             'audio': target_audios,
             'audio_lens': target_audios_lens,
             # 'audio_codes': batch_audio_codes
@@ -338,6 +297,11 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
         if self.load_16khz_audio:
             batch_dict['audio_16khz'] = target_audios_16khz
             batch_dict['audio_lens_16khz'] = target_audios_16khz_lens
+
+        if self.use_text_conditioning_tokenizer:
+            batch_dict['context_text_tokens'] = context_text
+            batch_dict['context_text_len'] = context_text_lens
+            batch_dict['has_text_context'] = torch.BoolTensor(has_text_context_list)
 
         return batch_dict
 
