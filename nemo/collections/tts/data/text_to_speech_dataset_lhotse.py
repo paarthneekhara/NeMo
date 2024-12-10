@@ -18,6 +18,7 @@ from typing import List, Optional
 
 import librosa
 import torch
+import random
 from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
 from megatron.core import parallel_state
 from omegaconf.omegaconf import OmegaConf
@@ -216,7 +217,12 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
                 target_text = cut.supervisions[1].text
                 # check if the text is not empty
                 if target_text.replace(" ", ""):
-                    target_text = self.text_tokenizer(target_text)
+                    tokenizer_name = "english_phoneme" # Default to english phoneme tokenizer
+                    if getattr(cut, "tokenizer_names", None):
+                        # Pick a random tokenizer from the list of tokenizers
+                        tokenizer_name = random.choice(cut.tokenizer_names)
+
+                    target_text = self.text_tokenizer.encode(text=target_text, tokenizer_name=tokenizer_name)
                     target_text = target_text + [self.eos_id]
                 else:
                     target_text = [self.eos_id]
@@ -255,8 +261,9 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
         context_audios_lens = torch.IntTensor(context_audios_lens)
 
         # collate context/user text
-        context_text_tokens = collate_vectors(context_text_tokens, max_length=max(context_text_tokens_lens), padding_value=self.text_tokenizer.pad)
-        context_text_tokens_lens = torch.IntTensor(context_text_tokens_lens)
+        if self.use_text_conditioning_tokenizer:
+            context_text_tokens = collate_vectors(context_text_tokens, max_length=max(context_text_tokens_lens), padding_value=self.text_tokenizer.pad)
+            context_text_tokens_lens = torch.IntTensor(context_text_tokens_lens)
 
         # collate target/agent text
         target_text_tokens = collate_vectors(target_text_tokens, max_length=max(target_text_tokens_lens), padding_value=self.text_tokenizer.pad)
@@ -299,8 +306,8 @@ class T5TTSLhotseDataset(torch.utils.data.Dataset):
             batch_dict['audio_lens_16khz'] = target_audios_16khz_lens
 
         if self.use_text_conditioning_tokenizer:
-            batch_dict['context_text_tokens'] = context_text
-            batch_dict['context_text_len'] = context_text_lens
+            batch_dict['context_text_tokens'] = context_text_tokens
+            batch_dict['context_text_len'] = context_text_tokens_lens
             batch_dict['has_text_context'] = torch.BoolTensor(has_text_context_list)
 
         return batch_dict

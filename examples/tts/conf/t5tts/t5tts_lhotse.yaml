@@ -67,24 +67,31 @@ model:
         tags:
           lang: en
           s2s: True
+          tokenizer_names: ["english_phoneme"]
+
       - type: lhotse_shar
         shar_path: /cluster_data/TTS/tts_lhotse_datasets/libri100/
         weight: 1.0
         tags:
           lang: en
           s2s: True
+          tokenizer_names: ["english_phoneme"]
+
       - type: lhotse_shar
         shar_path: /cluster_data/TTS/tts_lhotse_datasets/rivaLindyRodney/
         weight: 1.0
         tags:
           lang: en
           s2s: True
+          tokenizer_names: ["english_phoneme"]
+
       - type: lhotse_shar
         shar_path: /cluster_data/TTS/tts_lhotse_datasets/libri360/
         weight: 1.0
         tags:
           lang: en
           s2s: True
+          tokenizer_names: ["english_phoneme"]
 
       global_batch_size: ${batch_size}
       micro_batch_size: ${micro_batch_size}
@@ -134,6 +141,7 @@ model:
         tags:
           lang: en
           s2s: True
+          tokenizer_names: ["english_phoneme"]
 
       global_batch_size: ${batch_size}
       micro_batch_size: ${micro_batch_size}
@@ -145,7 +153,7 @@ model:
       is_tarred: false
       batch_size: ${eval_batch_size}
   
-t5_encoder:
+  t5_encoder:
     is_causal: false
     pos_emb:
       name: "learnable" # rope, learnable, alibi
@@ -164,7 +172,7 @@ t5_encoder:
     layer_scale_decay: 0.95
     max_length_causal_mask: 2048 # Determinse max size of positional embeddings
     context_xattn: null
-  
+
   context_encoder: # Only used for multi_encoder_context_tts, ignored otherwise
     is_causal: false
     pos_emb:
