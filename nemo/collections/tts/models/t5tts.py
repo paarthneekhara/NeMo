@@ -109,6 +109,8 @@ class T5TTS_Model(ModelPT):
         self.final_proj = nn.Linear(cfg.t5_decoder.d_model, cfg.num_audio_codebooks * cfg.num_audio_tokens_per_codebook)
 
         codec_model = AudioCodecModel.restore_from(cfg.get('codecmodel_path'), strict=False)
+        # del codec discriminator
+        del codec_model.discriminator
         codec_model.eval()
         self.freeze_model(codec_model)
         self._codec_model = codec_model
