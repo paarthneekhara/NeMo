@@ -151,11 +151,11 @@ class T5TTS_Model(ModelPT):
         if self.model_type != 'decoder_pretrain_synthesizer':
             # Decoder pretrain synthesizer doesn't have transcript encoder/text embeddings
             self.text_embedding = nn.Embedding(num_tokens, cfg.embedding_dim)
-            self.t5_encoder = t5tts_transformer.TransformerStack(dict(cfg.t5_encoder))
+            self.t5_encoder = t5tts_transformer.Transformer(**dict(cfg.t5_encoder))
         
         decoder_config = dict(cfg.t5_decoder)
         decoder_config['context_xattn'] = {'params': decoder_config['context_xattn']}
-        self.t5_decoder = t5tts_transformer.TransformerStack(decoder_config)
+        self.t5_decoder = t5tts_transformer.Transformer(**decoder_config)
 
         self.final_proj = nn.Linear(cfg.t5_decoder.d_model, cfg.num_audio_codebooks * cfg.num_audio_tokens_per_codebook)
 
@@ -182,8 +182,7 @@ class T5TTS_Model(ModelPT):
             for layer in self.context_decoder_layers:
                 multi_encoder_mapping[layer] = 1
             self.multi_encoder_mapping = multi_encoder_mapping
-
-            self.context_encoder = t5tts_transformer.TransformerStack(dict(cfg.context_encoder))
+            self.context_encoder = t5tts_transformer.Transformer(**dict(cfg.context_encoder))
             if cfg.use_perceiver:
                 self.perceiver_resampler = t5tts_perceiver.PerceiverResampler(
                     dim=cfg.context_encoder.d_model,

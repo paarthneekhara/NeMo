@@ -135,18 +135,17 @@ model:
     pos_emb:
       name: "learnable" # rope, learnable, alibi
       base: 10000 # Only used for rope
-    use_flash_self_attention: false
-    use_flash_x_attention: false
+    use_flash_self_attention: true
+    use_flash_x_attention: true
     deterministic: false
     d_model: 768
+    d_ffn: 3072
     n_layers: 6
     p_dropout: 0.1
     n_heads: 12
     has_xattn: false
     apply_norm_to_cond: true
     kernel_size: 3
-    layer_scale_init: 0.1
-    layer_scale_decay: 0.95
     max_length_causal_mask: 2048 # Determinse max size of positional embeddings
     context_xattn: null
   
@@ -155,18 +154,17 @@ model:
     pos_emb:
       name: "learnable" # rope, learnable, alibi
       base: 10000 # Only used for rope
-    use_flash_self_attention: false
-    use_flash_x_attention: false
+    use_flash_self_attention: true
+    use_flash_x_attention: true
     deterministic: false
     d_model: 768
+    d_ffn: 3072
     n_layers: 6
     p_dropout: 0.1
     n_heads: 12
     has_xattn: false
     apply_norm_to_cond: true
     kernel_size: 3
-    layer_scale_init: 0.1
-    layer_scale_decay: 0.95
     max_length_causal_mask: 2048 # Determinse max size of positional embeddings
     context_xattn: null
 
@@ -175,22 +173,21 @@ model:
     pos_emb:
       name: "learnable"
       base: 10000 # Only used for rope
-    use_flash_self_attention: false
-    use_flash_x_attention: false
+    use_flash_self_attention: true
+    use_flash_x_attention: true
     deterministic: false
     d_model: 768
+    d_ffn: 3072
     n_layers: 12
     p_dropout: 0.1
     n_heads: 12
     has_xattn: true
     apply_norm_to_cond: true
     kernel_size: 3
-    layer_scale_init: 0.1
-    layer_scale_decay: 0.95
     max_length_causal_mask: 2048 # Determinse max size of positional embeddings
     context_xattn:
         n_heads: 12
-        d_heads: 768
+        d_memory: 768
         pos_emb:
           name: ""
 

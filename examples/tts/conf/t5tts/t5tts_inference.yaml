@@ -78,6 +78,7 @@ model:
     use_flash_x_attention: false
     deterministic: false
     d_model: 768
+    d_ffn: 3072
     n_layers: 6
     p_dropout: 0.1
     n_heads: 12
@@ -98,6 +99,7 @@ model:
     use_flash_x_attention: false
     deterministic: false
     d_model: 768
+    d_ffn: 3072
     n_layers: 6
     p_dropout: 0.1
     n_heads: 12
@@ -118,6 +120,7 @@ model:
     use_flash_x_attention: false
     deterministic: false
     d_model: 768
+    d_ffn: 3072
     n_layers: 12
     p_dropout: 0.1
     n_heads: 12
