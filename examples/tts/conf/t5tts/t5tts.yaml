@@ -83,65 +83,53 @@ model:
       num_workers: 0
   
   t5_encoder:
-    is_causal: false
-    pos_emb:
-      name: "learnable" # rope, learnable, alibi
-      base: 10000 # Only used for rope
-    use_flash_self_attention: false
-    use_flash_x_attention: false
-    deterministic: false
+    n_layers: 6
     d_model: 768
     d_ffn: 3072
-    n_layers: 6
-    p_dropout: 0.1
-    n_heads: 12
-    has_xattn: false
-    apply_norm_to_cond: true
+    sa_n_heads: 12
     kernel_size: 3
-    max_length_causal_mask: 2048 # Determinse max size of positional embeddings
-    context_xattn: null
+    p_dropout: 0.1
+    is_causal: false
+    use_flash_self_attention: true
+    use_flash_x_attention: true
+    deterministic: false
+    pos_emb_name: "rope" # rope, learnable, None
+    pos_emb_base: 10000 # Only used for rope
+    max_length_causal_mask: 2048
+
   
   context_encoder: # Only used for multi_encoder_context_tts, ignored otherwise
+    n_layers: 6
+    d_model: 768
+    d_ffn: 3072
+    sa_n_heads: 12
+    kernel_size: 3
+    p_dropout: 0.1
     is_causal: false
-    pos_emb:
-      name: "learnable" # rope, learnable, alibi
-      base: 10000 # Only used for rope
     use_flash_self_attention: false
     use_flash_x_attention: false
     deterministic: false
-    d_model: 768
-    d_ffn: 3072
-    n_layers: 6
-    p_dropout: 0.1
-    n_heads: 12
-    has_xattn: false
-    apply_norm_to_cond: true
-    kernel_size: 3
-    max_length_causal_mask: 2048 # Determinse max size of positional embeddings
-    context_xattn: null
+    pos_emb_name: "rope" # rope, learnable, None
+    pos_emb_base: 10000 # Only used for rope
 
   t5_decoder:
-    is_causal: true
-    pos_emb:
-      name: "learnable"
-      base: 10000 # Only used for rope
-    use_flash_self_attention: false
-    use_flash_x_attention: false
-    deterministic: false
+    n_layers: 12
     d_model: 768
     d_ffn: 3072
-    n_layers: 12
-    p_dropout: 0.1
-    n_heads: 12
-    has_xattn: true
-    apply_norm_to_cond: true
+    sa_n_heads: 12
     kernel_size: 3
-    max_length_causal_mask: 2048 # Determinse max size of positional embeddings
-    context_xattn:
-        n_heads: 12
-        d_memory: 768
-        pos_emb:
-          name: ""
+    p_dropout: 0.1
+    xa_d_memory: 768
+    xa_n_heads: 12
+    has_xattn: true
+    is_causal: true
+    apply_norm_to_cond: true
+    use_flash_self_attention: true
+    use_flash_x_attention: true
+    deterministic: false
+    pos_emb_name: "rope" # rope, learnable, None
+    pos_emb_base: 10000 # Only used for rope
+    max_length_causal_mask: 2048
 
   optim:
     _target_: torch.optim.Adam

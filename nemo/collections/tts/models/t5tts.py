@@ -154,7 +154,6 @@ class T5TTS_Model(ModelPT):
             self.t5_encoder = t5tts_transformer.Transformer(**dict(cfg.t5_encoder))
         
         decoder_config = dict(cfg.t5_decoder)
-        decoder_config['context_xattn'] = {'params': decoder_config['context_xattn']}
         self.t5_decoder = t5tts_transformer.Transformer(**decoder_config)
 
         self.final_proj = nn.Linear(cfg.t5_decoder.d_model, cfg.num_audio_codebooks * cfg.num_audio_tokens_per_codebook)
