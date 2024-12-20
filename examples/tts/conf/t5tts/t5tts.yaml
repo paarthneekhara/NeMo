@@ -90,11 +90,8 @@ model:
     kernel_size: 3
     p_dropout: 0.1
     is_causal: false
-    use_flash_self_attention: true
-    use_flash_x_attention: true
     deterministic: false
-    pos_emb_name: "rope" # rope, learnable, None
-    pos_emb_base: 10000 # Only used for rope
+    use_learnable_pos_emb: true
     max_length_causal_mask: 2048
 
   
@@ -106,11 +103,8 @@ model:
     kernel_size: 3
     p_dropout: 0.1
     is_causal: false
-    use_flash_self_attention: false
-    use_flash_x_attention: false
     deterministic: false
-    pos_emb_name: "rope" # rope, learnable, None
-    pos_emb_base: 10000 # Only used for rope
+    use_learnable_pos_emb: true
 
   t5_decoder:
     n_layers: 12
@@ -124,11 +118,8 @@ model:
     has_xattn: true
     is_causal: true
     apply_norm_to_cond: true
-    use_flash_self_attention: true
-    use_flash_x_attention: true
     deterministic: false
-    pos_emb_name: "rope" # rope, learnable, None
-    pos_emb_base: 10000 # Only used for rope
+    use_learnable_pos_emb: true
     max_length_causal_mask: 2048
 
   optim:
