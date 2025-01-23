@@ -721,6 +721,22 @@ class T5TTS_Model(ModelPT):
 
         return val_output
     
+    def get_cross_attention_scores(self, attn_probs, text_lens):
+        mean_cross_attn_scores = []
+        for layerwise_attn_prob in attn_probs:
+            cross_attn_prob = layerwise_attn_prob['cross_attn_probabilities'][0] # B, H, audio_timesteps, text_timesteps
+            mean_cross_attn_scores.append(cross_attn_prob.mean(dim=1)) # B, audio_timesteps, text_timesteps
+        mean_cross_attn_scores = torch.stack(mean_cross_attn_scores, dim=1) # B, L, audio_timesteps, text_timesteps
+        mean_cross_attn_scores = mean_cross_attn_scores.mean(dim=1) # B, audio_timesteps, text_timesteps
+        last_audio_timestep_scores = mean_cross_attn_scores[:, -1, :] # B, text_timesteps
+        for item_idx in range(text_lens.size(0)):
+            # Zero out attention scores over the last and first timesteps..
+            # Since model always attends to the last timestep.
+            last_audio_timestep_scores[item_idx, text_lens[item_idx]-2:] = 0.0
+            last_audio_timestep_scores[item_idx,0] = 0.0
+        print("Attending to timestep", last_audio_timestep_scores.argmax(dim=-1))
+            
+
     def infer_batch(self, batch, max_decoder_steps=500, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0):
         with torch.no_grad():
             self.t5_decoder.reset_cache(use_cache=self.use_kv_cache_for_inference)
@@ -769,7 +785,7 @@ class T5TTS_Model(ModelPT):
                         cfg_audio_codes_embedded[batch_size:, :dummy_additional_decoder_input.size(1)] = dummy_additional_decoder_input
                         cfg_audio_codes_mask[batch_size:, :dummy_additional_decoder_input.size(1)] = dummy_addition_dec_mask
 
-                    combined_logits, _ = self.forward(
+                    combined_logits, attn_probs = self.forward(
                         dec_input_embedded=cfg_audio_codes_embedded,
                         dec_input_mask=cfg_audio_codes_mask,
                         cond=cfg_cond,
@@ -782,7 +798,7 @@ class T5TTS_Model(ModelPT):
                     uncond_logits = combined_logits[batch_size:]
                     all_code_logits = (1 - cfg_scale) * uncond_logits + cfg_scale * cond_logits
                 else:
-                    all_code_logits, _ = self.forward(
+                    all_code_logits, attn_probs = self.forward(
                         dec_input_embedded=_audio_codes_embedded,
                         dec_input_mask=_audio_codes_mask,
                         cond=context_tensors['cond'],
@@ -790,6 +806,9 @@ class T5TTS_Model(ModelPT):
                         attn_prior=None,
                         multi_encoder_mapping=context_tensors['multi_encoder_mapping']
                     )
+                
+                self.get_cross_attention_scores(attn_probs, context_tensors['text_lens'])
+                    
                 all_code_logits_t = all_code_logits[:, -1, :] # (B, num_codebooks * num_tokens_per_codebook)
                 audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk) # (B, num_codebooks)
                 all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01) # (B, num_codebooks)
