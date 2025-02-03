@@ -396,6 +396,8 @@ class T5TTSDataset(TextToSpeechDataset):
             "dataset_name": data.dataset_name,
             "tokens": tokens,
             "text_len": text_len,
+            "audio_dir": data.audio_dir,
+            "dialogue_id_turn_id": "{}_{}".format(data.manifest_entry['dialogue_id'], data.manifest_entry['turn_id']),
         }
 
         if self.load_cached_codes_if_available and 'target_audio_codes_path' in data.manifest_entry:
@@ -455,18 +457,18 @@ class T5TTSDataset(TextToSpeechDataset):
         elif 'context_audio_filepath' in data.manifest_entry:
             context_audio_filepath = os.path.join(data.audio_dir, data.manifest_entry['context_audio_filepath'])
             context_duration = data.manifest_entry['context_audio_duration']
-            context_audio_array = _read_audio(audio_filepath=context_audio_filepath, sample_rate=self.sample_rate, offset=0, duration=context_duration)
+            context_audio_array = _read_audio(audio_filepath=context_audio_filepath, sample_rate=self.sample_rate, offset=0, duration=None)
             context_audio_array = context_audio_array.samples
             _context_duration_to_slice = random.uniform(self.context_duration_min, self.context_duration_max)
             _num_samples_to_slice = self.get_num_audio_samples_to_slice(_context_duration_to_slice, self.sample_rate)
             if _num_samples_to_slice < len(context_audio_array):
-                start_idx = random.randint(0, len(context_audio_array) - _num_samples_to_slice)
-                context_audio_array = context_audio_array[start_idx:start_idx+_num_samples_to_slice]
+                # Last _num_samples_to_slice
+                context_audio_array = context_audio_array[-_num_samples_to_slice:]
             else:
                 # Repeaet the audio if it is shorter than the desired duration
                 _num_repeats = int(np.ceil(_num_samples_to_slice / len(context_audio_array)))
                 context_audio_array = np.tile(context_audio_array, _num_repeats)
-                context_audio_array = context_audio_array[:_num_samples_to_slice]
+                context_audio_array = context_audio_array[-_num_samples_to_slice:]
             context_audio = torch.tensor(context_audio_array, dtype=torch.float32)
             context_audio_len = context_audio.shape[0]
             example['context_audio'] = context_audio
@@ -484,7 +486,7 @@ class T5TTSDataset(TextToSpeechDataset):
                 example['context_audio_codes_len'] = context_audio_codes_len
             else:
                 # @shehzeenh: Added this condition so that a batch does not have a mix of context_audio and context_audio_codes
-                context_audio = torch.zeros(self.codec_model_downsample_factor, dtype=torch.float32)
+                context_audio = torch.zeros(self.codec_model_downsample_factor*5, dtype=torch.float32)
                 context_audio_len = context_audio.shape[0]
                 example['context_audio'] = context_audio
                 example['context_audio_len'] = context_audio_len
@@ -568,10 +570,12 @@ class T5TTSDataset(TextToSpeechDataset):
         context_has_text_context_list = []
         reward_list = []
         raw_text_list = []
+        dialog_turn_id_list = []
         for example in batch:
             dataset_name_list.append(example["dataset_name"])
-            audio_filepath_list.append(example["audio_filepath"])
+            audio_filepath_list.append(os.path.join(example["audio_dir"], example["audio_filepath"]))
             raw_text_list.append(example["raw_text"])
+            dialog_turn_id_list.append(example["dialogue_id_turn_id"])
 
             token_list.append(example["tokens"])
             token_len_list.append(example["text_len"])
@@ -617,6 +621,7 @@ class T5TTSDataset(TextToSpeechDataset):
             "audio_filepaths": audio_filepath_list,
             "text": batch_tokens,
             "text_lens": batch_token_len,
+            "dialog_turn_ids": dialog_turn_id_list
         }
 
         if len(audio_list) > 0:

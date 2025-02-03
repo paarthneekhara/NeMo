@@ -847,7 +847,11 @@ class T5TTS_Model(ModelPT):
     def test_step(self, batch, batch_idx):
         with torch.no_grad():
             test_dl_batch_size = self._test_dl.batch_size
-            predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(batch, max_decoder_steps=self.cfg.get('max_decoder_steps', 500))
+            cfg_scale = self.cfg.get('inference_cfg_scale', 1.0)
+            use_cfg = False
+            if cfg_scale > 1.0:
+                use_cfg = True
+            predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(batch, max_decoder_steps=self.cfg.get('max_decoder_steps', 500), use_cfg=use_cfg, cfg_scale=cfg_scale)
             for idx in range(predicted_audio.size(0)):
                 predicted_audio_np = predicted_audio[idx].float().detach().cpu().numpy()
                 predicted_audio_np = predicted_audio_np[:predicted_audio_lens[idx]]
@@ -1043,25 +1047,66 @@ class T5TTS_ModelInference(T5TTS_Model):
     def test_step(self, batch, batch_idx):
         with torch.no_grad():
             test_dl_batch_size = self._test_dl.batch_size
-            predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(batch, max_decoder_steps=self.cfg.get('max_decoder_steps', 500))
+            cfg_scale = self.cfg.get('inference_cfg_scale', 1.0)
+            temperature = self.cfg.get('inference_temperature', 0.7)
+            use_cfg = False
+            if cfg_scale > 1.0:
+                use_cfg = True
+            predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(batch, max_decoder_steps=self.cfg.get('max_decoder_steps', 430), use_cfg=use_cfg, cfg_scale=cfg_scale, temperature=temperature)
             predicted_audio_paths = []
             audio_durations = []
             for idx in range(predicted_audio.size(0)):
+                dialog_turn_id = batch['dialog_turn_ids'][idx]
                 predicted_audio_np = predicted_audio[idx].float().detach().cpu().numpy()
                 predicted_audio_np = predicted_audio_np[:predicted_audio_lens[idx]]
                 item_idx = batch_idx * test_dl_batch_size + idx
                 # Save the predicted audio
-                log_dir = self.logger.log_dir
+                log_dir = self.logger.root_dir
                 audio_dir = os.path.join(log_dir, 'audios')
                 if not os.path.exists(audio_dir):
                     os.makedirs(audio_dir)
-                audio_path = os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}.wav')
-                audio_durations.append(len(predicted_audio_np) / self.cfg.sample_rate)
-                sf.write(audio_path, predicted_audio_np, self.cfg.sample_rate)
+                
+                turn_id = int(dialog_turn_id.split('_')[-1])
+                if turn_id > 0:
+                    prev_dialog_turn_id = dialog_turn_id.split('_')[0] + '_' + str(turn_id - 1)
+                    existing_multi_channel_filepath = os.path.join(audio_dir, f'dialogueturn_{prev_dialog_turn_id}.wav')
+                    # Load the previous multi-channel audio and append the current audio to it in channel 2
+                    existing_audio, _ = sf.read(existing_multi_channel_filepath)
+                    if existing_audio.ndim == 1:
+                        if "[SPK-BWL-B-M]" in batch['raw_texts'][idx]:
+                            # Means previous speaker was female, goes to channel 1
+                            existing_audio = np.stack([existing_audio, np.zeros_like(existing_audio)], axis=0)
+                        else:
+                            # Means previous speaker was male, goes to channel 2
+                            existing_audio = np.stack([np.zeros_like(existing_audio), existing_audio], axis=0)
 
+                    silent_channel = np.zeros_like(predicted_audio_np)
+                    if "[SPK-BWL-B-M]" in batch['raw_texts'][idx]:
+                        # Male speaker goes in channel 2
+                        channel_1_extended = np.concatenate([existing_audio[0], silent_channel])
+                        channel_2_extended = np.concatenate([existing_audio[1], predicted_audio_np])
+                    else:
+                        channel_1_extended = np.concatenate([existing_audio[0], predicted_audio_np])
+                        channel_2_extended = np.concatenate([existing_audio[1], silent_channel])
+                    
+                    extended_audio = np.stack([channel_1_extended, channel_2_extended], axis=0)
+                    audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}_multichannel.wav')
+                    # Save the multi-channel audio
+                    sf.write(audio_path, extended_audio.T, self.cfg.sample_rate)
+
+                    # Save the single channel audio as well
+                    audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}.wav')
+                    extended_audio_mono = np.mean(extended_audio, axis=0)  # Average both channels
+                    sf.write(audio_path, extended_audio_mono, self.cfg.sample_rate)
+                    
+                else:
+                    audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}.wav')
+                    sf.write(audio_path, predicted_audio_np, self.cfg.sample_rate)
+                
+                audio_durations.append(len(predicted_audio_np) / self.cfg.sample_rate)
                 predicted_codes_torch = predicted_codes[idx].cpu().type(torch.int16)
                 predicted_codes_torch = predicted_codes_torch[:, :predicted_codes_lens[idx]]
-                torch.save(predicted_codes_torch, os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}_codes.pt'))
+                torch.save(predicted_codes_torch, os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}_codes.pt'))
                 predicted_audio_paths.append(audio_path)
             
             with torch.no_grad():
@@ -1074,6 +1119,7 @@ class T5TTS_ModelInference(T5TTS_Model):
                 item_idx = batch_idx * test_dl_batch_size + idx
                 pred_transcript = pred_transcripts[idx]
                 gt_transcript = self.process_text(batch['raw_texts'][idx])
+                dialog_turn_id = batch['dialog_turn_ids'][idx]
 
                 cer_gt = word_error_rate([pred_transcript], [gt_transcript], use_cer=True)
                 wer_gt = word_error_rate([pred_transcript], [gt_transcript], use_cer=False)
@@ -1094,7 +1140,7 @@ class T5TTS_ModelInference(T5TTS_Model):
                     'gt_transcript': gt_transcript,
                 }
 
-                with open(os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}_metrics.json'), 'w') as f:
+                with open(os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}_metrics.json'), 'w') as f:
                     json.dump(item_metrics, f)
 
 class T5TTS_ModelDPO(T5TTS_Model):
