@@ -1081,24 +1081,26 @@ class T5TTS_ModelInference(T5TTS_Model):
                             existing_audio = np.stack([np.zeros_like(existing_audio), existing_audio], axis=0)
 
                     silent_channel = np.zeros_like(predicted_audio_np)
+                    # 200 to 400 ms padding
+                    padding_length = np.random.randint(200, 400)
+                    padding_single_channel = np.zeros(padding_length)
                     if "[SPK-BWL-B-M]" in batch['raw_texts'][idx]:
                         # Male speaker goes in channel 2
-                        channel_1_extended = np.concatenate([existing_audio[0], silent_channel])
-                        channel_2_extended = np.concatenate([existing_audio[1], predicted_audio_np])
+                        channel_1_extended = np.concatenate([existing_audio[0], padding_single_channel, silent_channel])
+                        channel_2_extended = np.concatenate([existing_audio[1], padding_single_channel, predicted_audio_np])
                     else:
-                        channel_1_extended = np.concatenate([existing_audio[0], predicted_audio_np])
-                        channel_2_extended = np.concatenate([existing_audio[1], silent_channel])
+                        channel_1_extended = np.concatenate([existing_audio[0], padding_single_channel, predicted_audio_np])
+                        channel_2_extended = np.concatenate([existing_audio[1], padding_single_channel, silent_channel])
                     
                     extended_audio = np.stack([channel_1_extended, channel_2_extended], axis=0)
                     audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}_multichannel.wav')
                     # Save the multi-channel audio
                     sf.write(audio_path, extended_audio.T, self.cfg.sample_rate)
-
+                    
                     # Save the single channel audio as well
                     audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}.wav')
                     extended_audio_mono = np.mean(extended_audio, axis=0)  # Average both channels
                     sf.write(audio_path, extended_audio_mono, self.cfg.sample_rate)
-                    
                 else:
                     audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}.wav')
                     sf.write(audio_path, predicted_audio_np, self.cfg.sample_rate)
