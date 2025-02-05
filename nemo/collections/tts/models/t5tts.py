@@ -1001,6 +1001,10 @@ class T5TTS_ModelInference(T5TTS_Model):
         Taken from hallucination_eval.py
         """
         # Convert text to lowercase
+        input_text.replace("[SPK-BWL-B-M] ", "")
+        input_text.replace("[SPK-BWL-B-F] ", "")
+        input_text.replace("  ", " ")
+
         lower_case_text = input_text.lower()
         
         # Remove commas from text
@@ -1069,9 +1073,13 @@ class T5TTS_ModelInference(T5TTS_Model):
                 turn_id = int(dialog_turn_id.split('_')[-1])
                 if turn_id > 0:
                     prev_dialog_turn_id = dialog_turn_id.split('_')[0] + '_' + str(turn_id - 1)
-                    existing_multi_channel_filepath = os.path.join(audio_dir, f'dialogueturn_{prev_dialog_turn_id}.wav')
+                    existing_multi_channel_filepath = os.path.join(audio_dir, f'dialogueturn_{prev_dialog_turn_id}_multichannel.wav')
+                    if not os.path.exists(existing_multi_channel_filepath):
+                        existing_multi_channel_filepath = os.path.join(audio_dir, f'dialogueturn_{prev_dialog_turn_id}.wav')
                     # Load the previous multi-channel audio and append the current audio to it in channel 2
                     existing_audio, _ = sf.read(existing_multi_channel_filepath)
+                    existing_audio = existing_audio.T
+                    
                     if existing_audio.ndim == 1:
                         if "[SPK-BWL-B-M]" in batch['raw_texts'][idx]:
                             # Means previous speaker was female, goes to channel 1
@@ -1082,7 +1090,7 @@ class T5TTS_ModelInference(T5TTS_Model):
 
                     silent_channel = np.zeros_like(predicted_audio_np)
                     # 200 to 400 ms padding
-                    padding_length = np.random.randint(200, 400)
+                    padding_length = int((np.random.randint(200, 400)/1000.0) * 22050)
                     padding_single_channel = np.zeros(padding_length)
                     if "[SPK-BWL-B-M]" in batch['raw_texts'][idx]:
                         # Male speaker goes in channel 2
@@ -1095,8 +1103,8 @@ class T5TTS_ModelInference(T5TTS_Model):
                     extended_audio = np.stack([channel_1_extended, channel_2_extended], axis=0)
                     audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}_multichannel.wav')
                     # Save the multi-channel audio
-                    sf.write(audio_path, extended_audio.T, self.cfg.sample_rate)
                     
+                    sf.write(audio_path, extended_audio.T, self.cfg.sample_rate)
                     # Save the single channel audio as well
                     audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}.wav')
                     extended_audio_mono = np.mean(extended_audio, axis=0)  # Average both channels
