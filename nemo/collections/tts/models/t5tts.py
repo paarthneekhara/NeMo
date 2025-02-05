@@ -1059,6 +1059,7 @@ class T5TTS_ModelInference(T5TTS_Model):
             predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(batch, max_decoder_steps=self.cfg.get('max_decoder_steps', 430), use_cfg=use_cfg, cfg_scale=cfg_scale, temperature=temperature)
             predicted_audio_paths = []
             audio_durations = []
+            padding_durations = []
             for idx in range(predicted_audio.size(0)):
                 dialog_turn_id = batch['dialog_turn_ids'][idx]
                 predicted_audio_np = predicted_audio[idx].float().detach().cpu().numpy()
@@ -1091,6 +1092,7 @@ class T5TTS_ModelInference(T5TTS_Model):
                     silent_channel = np.zeros_like(predicted_audio_np)
                     # 200 to 400 ms padding
                     padding_length = int((np.random.randint(200, 400)/1000.0) * 22050)
+                    padding_duration = padding_length / 22050.0
                     padding_single_channel = np.zeros(padding_length)
                     if "[SPK-BWL-B-M]" in batch['raw_texts'][idx]:
                         # Male speaker goes in channel 2
@@ -1112,8 +1114,10 @@ class T5TTS_ModelInference(T5TTS_Model):
                 else:
                     audio_path = os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}.wav')
                     sf.write(audio_path, predicted_audio_np, self.cfg.sample_rate)
+                    padding_duration = 0
                 
                 audio_durations.append(len(predicted_audio_np) / self.cfg.sample_rate)
+                padding_durations.append(padding_duration)
                 predicted_codes_torch = predicted_codes[idx].cpu().type(torch.int16)
                 predicted_codes_torch = predicted_codes_torch[:, :predicted_codes_lens[idx]]
                 torch.save(predicted_codes_torch, os.path.join(audio_dir, f'dialogueturn_{dialog_turn_id}_codes.pt'))
@@ -1145,6 +1149,7 @@ class T5TTS_ModelInference(T5TTS_Model):
                     'cer_gt': float(cer_gt),
                     'wer_gt': float(wer_gt),
                     'duration' : audio_durations[idx],
+                    'padding_duration' : padding_durations[idx],
                     'spk_similarity': float(spk_similarity),
                     'pred_transcript': pred_transcript,
                     'gt_transcript': gt_transcript,
