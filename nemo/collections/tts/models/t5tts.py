@@ -355,13 +355,19 @@ class T5TTS_Model(ModelPT):
 
         return all_preds
 
-    def sample_codes_from_logits(self, all_code_logits_t, temperature=0.7, topk=80):
+    def sample_codes_from_logits(self, all_code_logits_t, temperature=0.7, topk=80, unfinished_items={}, finished_items={}):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
         all_preds = []
         for idx in range(self.cfg.num_audio_codebooks):
             si = idx * self.cfg.num_audio_tokens_per_codebook
             ei = si + self.cfg.num_audio_tokens_per_codebook
             codebook_logits = all_code_logits_t[:, si:ei] # (B, num_tokens_per_codebook)
+            for item_idx in unfinished_items:
+                codebook_logits[item_idx, self.audio_eos_id] = float('-inf')
+            for item_idx in finished_items:
+                codebook_logits[item_idx, :] = float('-inf')
+                codebook_logits[item_idx, self.audio_eos_id] = 0.0
+
             codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0] # (B, topk)
             indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(-1) # (B, num_tokens_per_codebook)
             codebook_logits_rescored = codebook_logits.clone()
@@ -721,7 +727,17 @@ class T5TTS_Model(ModelPT):
 
         return val_output
     
-    def infer_batch(self, batch, max_decoder_steps=500, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0):
+    def get_cross_attention_scores(self, attn_probs, text_lens):
+        mean_cross_attn_scores = []
+        for layerwise_attn_prob in attn_probs:
+            cross_attn_prob = layerwise_attn_prob['cross_attn_probabilities'][0] # B, H, audio_timesteps, text_timesteps
+            mean_cross_attn_scores.append(cross_attn_prob.mean(dim=1)) # B, audio_timesteps, text_timesteps
+        mean_cross_attn_scores = torch.stack(mean_cross_attn_scores, dim=1) # B, L, audio_timesteps, text_timesteps
+        mean_cross_attn_scores = mean_cross_attn_scores.mean(dim=1) # B, audio_timesteps, text_timesteps
+        last_audio_timestep_scores = mean_cross_attn_scores[:, -1, :] # B, text_timesteps
+        return last_audio_timestep_scores
+
+    def infer_batch(self, batch, max_decoder_steps=500, temperature=0.7, topk=80, use_cfg=False, cfg_scale=1.0, return_cross_attn_map=False):
         with torch.no_grad():
             self.t5_decoder.reset_cache(use_cache=self.use_kv_cache_for_inference)
             
@@ -743,6 +759,10 @@ class T5TTS_Model(ModelPT):
                     context_tensors['addtional_decoder_mask']
                 )
             
+            cross_attention_scores_all_timesteps = []
+            _attn_prior = None
+            unfinished_texts = {}
+            finished_texts = {}
             for idx in range(max_decoder_steps):
                 if idx % 20 == 0:
                     print(f"Decoding timestep {idx}")
@@ -769,12 +789,12 @@ class T5TTS_Model(ModelPT):
                         cfg_audio_codes_embedded[batch_size:, :dummy_additional_decoder_input.size(1)] = dummy_additional_decoder_input
                         cfg_audio_codes_mask[batch_size:, :dummy_additional_decoder_input.size(1)] = dummy_addition_dec_mask
 
-                    combined_logits, _ = self.forward(
+                    combined_logits, attn_probs = self.forward(
                         dec_input_embedded=cfg_audio_codes_embedded,
                         dec_input_mask=cfg_audio_codes_mask,
                         cond=cfg_cond,
                         cond_mask=cfg_cond_mask,
-                        attn_prior=None,
+                        attn_prior=_attn_prior,
                         multi_encoder_mapping=context_tensors['multi_encoder_mapping']
                     )
                     
@@ -782,17 +802,54 @@ class T5TTS_Model(ModelPT):
                     uncond_logits = combined_logits[batch_size:]
                     all_code_logits = (1 - cfg_scale) * uncond_logits + cfg_scale * cond_logits
                 else:
-                    all_code_logits, _ = self.forward(
+                    batch_size = audio_codes_embedded.size(0)
+                    all_code_logits, attn_probs = self.forward(
                         dec_input_embedded=_audio_codes_embedded,
                         dec_input_mask=_audio_codes_mask,
                         cond=context_tensors['cond'],
                         cond_mask=context_tensors['cond_mask'],
-                        attn_prior=None,
+                        attn_prior=_attn_prior,
                         multi_encoder_mapping=context_tensors['multi_encoder_mapping']
                     )
+                
+                if return_cross_attn_map:
+                    cross_attention_scores = self.get_cross_attention_scores(attn_probs, context_tensors['text_lens']) # B, text_timesteps
+                    # Find attended timestep
+                    text_time_step_attended = []
+                    for bidx in range(batch_size):
+                        item_attention_scores = cross_attention_scores[bidx,:context_tensors['text_lens'][bidx]-3]
+                        attended_timestep = item_attention_scores.argmax().item()
+                        text_time_step_attended.append(attended_timestep)
+                    # print(f"Attended text timestep: {text_time_step_attended}", cross_attention_scores.shape)
+                    # print("Text lens", context_tensors['text_lens'])
+                    cross_attention_scores_all_timesteps.append(cross_attention_scores)
+                
+                
+                if return_cross_attn_map and idx > 2:
+                    _attn_prior = torch.zeros(cross_attention_scores.shape[0], 1, cross_attention_scores.shape[1]) + 0.3
+                    _attn_prior = _attn_prior.to(cross_attention_scores.device)
+                    for bidx in range(cross_attention_scores.shape[0]):
+                        if bidx < len(text_time_step_attended):
+                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+3: min(context_tensors['text_lens'][bidx]-3, text_time_step_attended[bidx]+100)] = 1e-2
+                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+2] = 1.0
+                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+1] = 2.0
+                            _attn_prior[bidx, 0, text_time_step_attended[bidx]] = 1.0
+                            _attn_prior[bidx, 0, max(2,text_time_step_attended[bidx]-100):text_time_step_attended[bidx]-2] = 1e-2
+                            if text_time_step_attended[bidx] < context_tensors['text_lens'][bidx] - 10:
+                                if bidx not in finished_texts and bidx not in end_indices:
+                                    unfinished_texts[bidx] = True
+                            else:
+                                if bidx in unfinished_texts:
+                                    del unfinished_texts[bidx]
+
+                            if text_time_step_attended[bidx] >= context_tensors['text_lens'][bidx] - 3 or bidx in end_indices:
+                                finished_texts[bidx] = True
+                                if bidx in unfinished_texts:
+                                    del unfinished_texts[bidx]
+                
                 all_code_logits_t = all_code_logits[:, -1, :] # (B, num_codebooks * num_tokens_per_codebook)
-                audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk) # (B, num_codebooks)
-                all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01) # (B, num_codebooks)
+                audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk, unfinished_items=unfinished_texts, finished_items=finished_texts) # (B, num_codebooks)
+                all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01, unfinished_items=unfinished_texts, finished_items=finished_texts) # (B, num_codebooks)
                 
                 for item_idx in range(all_codes_next_argmax.size(0)):
                     if item_idx not in end_indices:
@@ -801,6 +858,8 @@ class T5TTS_Model(ModelPT):
                         if (pred_token == self.audio_eos_id) or (pred_token_multinomial == self.audio_eos_id):
                             print("End detected for item {} at timestep {}".format(item_idx, idx))
                             end_indices[item_idx] = idx
+
+                
 
                 all_predictions.append(audio_codes_next)
                 audio_codes_input = torch.cat([audio_codes_input, audio_codes_next.unsqueeze(-1)], dim=-1) # (B, C, T')
@@ -817,7 +876,13 @@ class T5TTS_Model(ModelPT):
             predicted_audio, predicted_audio_lens = self.codes_to_audio(predicted_codes, predicted_codes_lens)
             
             torch.cuda.empty_cache()
-            return predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens
+            if return_cross_attn_map:
+                cross_attention_scores_all_timesteps = torch.stack(cross_attention_scores_all_timesteps, dim=2) # B, text_timesteps, T'
+                cross_attn_np = plot_alignment_to_numpy(cross_attention_scores_all_timesteps[0].cpu().numpy())
+                return predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens, cross_attn_np
+            else:
+                # For backward compatibility
+                return predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens
 
     def test_step(self, batch, batch_idx):
         with torch.no_grad():
