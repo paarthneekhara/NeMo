@@ -825,16 +825,16 @@ class T5TTS_Model(ModelPT):
                     cross_attention_scores_all_timesteps.append(cross_attention_scores)
                 
                 
-                if return_cross_attn_map and idx > 2:
-                    _attn_prior = torch.zeros(cross_attention_scores.shape[0], 1, cross_attention_scores.shape[1]) + 0.3
+                if return_cross_attn_map and idx >= 5:
+                    _attn_prior = torch.zeros(cross_attention_scores.shape[0], 1, cross_attention_scores.shape[1]) + 1e-3
                     _attn_prior = _attn_prior.to(cross_attention_scores.device)
                     for bidx in range(cross_attention_scores.shape[0]):
                         if bidx < len(text_time_step_attended):
-                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+3: min(context_tensors['text_lens'][bidx]-3, text_time_step_attended[bidx]+100)] = 1e-2
+                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+3: context_tensors['text_lens'][bidx]-3] = 1e-3
                             _attn_prior[bidx, 0, text_time_step_attended[bidx]+2] = 1.0
-                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+1] = 2.0
+                            _attn_prior[bidx, 0, text_time_step_attended[bidx]+1] = 1.0
                             _attn_prior[bidx, 0, text_time_step_attended[bidx]] = 1.0
-                            _attn_prior[bidx, 0, max(2,text_time_step_attended[bidx]-100):text_time_step_attended[bidx]-2] = 1e-2
+                            _attn_prior[bidx, 0, max(2,text_time_step_attended[bidx]-100):text_time_step_attended[bidx]-2] = 1e-3
                             if text_time_step_attended[bidx] < context_tensors['text_lens'][bidx] - 10:
                                 if bidx not in finished_texts and bidx not in end_indices:
                                     unfinished_texts[bidx] = True
@@ -842,14 +842,22 @@ class T5TTS_Model(ModelPT):
                                 if bidx in unfinished_texts:
                                     del unfinished_texts[bidx]
 
-                            if text_time_step_attended[bidx] >= context_tensors['text_lens'][bidx] - 3 or bidx in end_indices:
-                                finished_texts[bidx] = True
+                            if text_time_step_attended[bidx] >= context_tensors['text_lens'][bidx] - 5 or bidx in end_indices:
+                                if bidx not in finished_texts:
+                                    finished_texts[bidx] = 0
+                                finished_texts[bidx] += 1
                                 if bidx in unfinished_texts:
                                     del unfinished_texts[bidx]
+                if idx > 5 and idx % 20 == 0 and return_cross_attn_map:
+                    print("text_time_step_attended[bidx]", text_time_step_attended[0], context_tensors['text_lens'][0])
+                    print("Finished texts", finished_texts)
+                    print("Unfinished texts", unfinished_texts)
                 
+                finished_items = {k: v for k, v in finished_texts.items() if v >= 5}
+                # finished_items = {}
                 all_code_logits_t = all_code_logits[:, -1, :] # (B, num_codebooks * num_tokens_per_codebook)
-                audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk, unfinished_items=unfinished_texts, finished_items=finished_texts) # (B, num_codebooks)
-                all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01, unfinished_items=unfinished_texts, finished_items=finished_texts) # (B, num_codebooks)
+                audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk, unfinished_items=unfinished_texts, finished_items=finished_items) # (B, num_codebooks)
+                all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01, unfinished_items=unfinished_texts, finished_items=finished_items) # (B, num_codebooks)
                 
                 for item_idx in range(all_codes_next_argmax.size(0)):
                     if item_idx not in end_indices:
