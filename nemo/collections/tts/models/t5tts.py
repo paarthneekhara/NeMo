@@ -130,6 +130,7 @@ class T5TTS_Model(ModelPT):
         self.audio_eos_id = cfg.num_audio_tokens_per_codebook - 1
         self.context_audio_bos_id = cfg.num_audio_tokens_per_codebook - 2 # For backward compatibility
         self.context_audio_eos_id = cfg.num_audio_tokens_per_codebook - 1 # For backward compatibility
+        self.codes_roll_out_factor = cfg.get('codes_roll_out_factor', 1)
         self.model_type = cfg.get('model_type', 'single_encoder_sv_tts')
         
         if self.model_type == 'decoder_context_tts':
@@ -145,7 +146,7 @@ class T5TTS_Model(ModelPT):
         
         audio_embeddings = []
         for _ in range(cfg.num_audio_codebooks):
-            audio_embeddings.append(nn.Embedding(cfg.num_audio_tokens_per_codebook, cfg.embedding_dim))
+            audio_embeddings.append(nn.Embedding(cfg.num_audio_tokens_per_codebook * self.codes_roll_out_factor, cfg.embedding_dim))
         self.audio_embeddings = nn.ModuleList(audio_embeddings)
 
         if self.model_type != 'decoder_pretrain_synthesizer':
@@ -155,7 +156,7 @@ class T5TTS_Model(ModelPT):
         
         self.t5_decoder = t5tts_transformer.Transformer(**dict(cfg.t5_decoder))
 
-        self.final_proj = nn.Linear(cfg.t5_decoder.d_model, cfg.num_audio_codebooks * cfg.num_audio_tokens_per_codebook)
+        self.final_proj = nn.Linear(cfg.t5_decoder.d_model, cfg.num_audio_codebooks * self.codes_roll_out_factor * cfg.num_audio_tokens_per_codebook)
 
         codec_model = AudioCodecModel.restore_from(cfg.get('codecmodel_path'), strict=False)
         # del codec discriminator to free memory
@@ -237,6 +238,53 @@ class T5TTS_Model(ModelPT):
             self._tb_logger = tb_logger
         return self._tb_logger
     
+    def roll_out_channels(self, tensor: torch.Tensor, factor: int) -> torch.Tensor:
+        """
+        Rolls out or stacks the channels of a tensor of shape (B, C, T).
+        
+        Args:
+            tensor (torch.Tensor): Input tensor of shape (B, C, T).
+            factor (float): Roll out factor. If >1, expands channels and increases T.
+        
+        Returns:
+            torch.Tensor: Transformed tensor with new shape (B, new_C, new_T).
+        """
+        if factor == 1:
+            return tensor
+
+        assert factor > 1
+        B, C, T = tensor.shape
+
+        for c in range(C):
+            partition_size = C // factor
+            offset = (c // partition_size) * self.cfg.num_audio_tokens_per_codebook
+            tensor[:,c] = tensor[:,c] + offset
+
+        if factor > 1:
+            new_C = int(C / factor)
+            if C % factor != 0:
+                raise ValueError(f"Factor {factor} must divide the number of channels {C} exactly.")
+            new_T = int(T * factor)
+            return tensor.view(B, new_C, factor, T).permute(0, 1, 3, 2).reshape(B, new_C, new_T)
+
+    def stack_channels(self, tensor: torch.Tensor, factor: int) -> torch.Tensor:
+        if factor == 1:
+            return tensor
+        
+        assert factor > 1
+        B, C, T = tensor.shape
+        if factor > 1:
+            new_C = C * factor
+            new_T = int(T / factor)
+            stacked_tensor =  tensor.view(B, C, new_T, factor).permute(0, 1, 3, 2).reshape(B, new_C, new_T)
+            for c in range(new_C):
+                partition_size = new_C // factor
+                offset = (c // self.cfg.num_audio_tokens_per_codebook) * partition_size
+                stacked_tensor[:,c] = stacked_tensor[:,c] - offset
+            stacked_tensor = torch.clamp(stacked_tensor, 0, self.cfg.num_audio_tokens_per_codebook - 1)
+            return stacked_tensor
+        
+
     def audio_to_codes(self, audio, audio_len, audio_type='target'):
         # audio: (B, T)
         # audio_len: (B,)
@@ -250,6 +298,8 @@ class T5TTS_Model(ModelPT):
         self._codec_model.eval()
         with torch.no_grad():
             codes, codes_len = self._codec_model.encode(audio=audio, audio_len=audio_len)
+            codes = self.roll_out_channels(codes, self.codes_roll_out_factor)
+            codes_len = codes_len * self.codes_roll_out_factor
             # Add a timestep to begining and end of codes tensor
             bos_tensor = torch.full((codes.size(0), codes.size(1), 1), audio_bos_id, dtype=codes.dtype, device=codes.device)
             pad_tensor = torch.full((codes.size(0), codes.size(1), 1), 0, dtype=codes.dtype, device=codes.device) # 0 is the padding token in the audio codebook
@@ -267,9 +317,18 @@ class T5TTS_Model(ModelPT):
         # codes_len: (B,)
         self._codec_model.eval()
         with torch.no_grad():
+            if codes[:,:,0].eq(self.audio_bos_id).all():
+                codes = codes[:,:,1:]
+                codes_len = codes_len - 1
+            if codes[:,:,codes.size(2)-1].eq(self.audio_eos_id).any():
+                codes = codes[:,:,:codes.size(2)-1]
+                codes_len = codes_len - 1
+            
+            codes = self.stack_channels(codes, self.codes_roll_out_factor)
             # Replace eos and bos tokens with padding in codes tensor
             codes[codes == self.audio_bos_id] = 0 # zero is the padding token in the audio codebook
             codes[codes == self.audio_eos_id] = 0
+
             # self.additional_models['codec'] = self.additional_models['codec'].to(codes.device)
             audio, audio_len = self._codec_model.decode(tokens=codes, tokens_len=codes_len)
             # audio: (B, T)
@@ -342,8 +401,8 @@ class T5TTS_Model(ModelPT):
         # audio_codes_lens: (B,)
         all_preds = []
         for idx in range(self.cfg.num_audio_codebooks):
-            si = idx * self.cfg.num_audio_tokens_per_codebook
-            ei = si + self.cfg.num_audio_tokens_per_codebook
+            si = idx * (self.cfg.num_audio_tokens_per_codebook * self.codes_roll_out_factor)
+            ei = si + (self.cfg.num_audio_tokens_per_codebook * self.codes_roll_out_factor)
             codebook_logits = all_code_logits[:, :, si:ei]
             codebook_probs = torch.softmax(codebook_logits, dim=-1) # (B, T', num_tokens_per_codebook)
             # argmax to get the tokens
@@ -351,6 +410,7 @@ class T5TTS_Model(ModelPT):
             all_preds.append(codebook_preds)
         
         all_preds = torch.stack(all_preds, dim=1) # (B, C, T')
+        all_preds = all_preds % self.cfg.num_audio_tokens_per_codebook
         audio_mask = get_mask_from_lengths(audio_codes_lens)
         all_preds = all_preds * audio_mask.unsqueeze(1)
 
@@ -648,6 +708,7 @@ class T5TTS_Model(ModelPT):
                 # timestep_mask is True for timesteps to be kept
                 audio_codes_input = audio_codes_input * dec_dropout_mask + random_audio_tokens * (~dec_dropout_mask)
 
+        import ipdb; ipdb.set_trace()
         
         audio_codes_embedded = self.embed_audio_tokens(audio_codes_input) # (B, T', E)
         if context_tensors['additional_decoder_input'] is not None:
@@ -1059,6 +1120,8 @@ class T5TTS_Model(ModelPT):
             pad_context_text_to_max_duration=self.pad_context_text_to_max_duration,
             context_duration_min=self.cfg.context_duration_min,
             context_duration_max=self.cfg.context_duration_max,
+            codes_roll_out_factor=self.codes_roll_out_factor,
+            num_audio_tokens_per_codebook=self.cfg.num_audio_tokens_per_codebook,
         )
         dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
         dataset.tokenizer_config = self.cfg.text_tokenizers # This will be used in worker_init_fn for instantiating tokenizer

@@ -340,7 +340,9 @@ class T5TTSDataset(TextToSpeechDataset):
         use_text_conditioning_tokenizer: bool = False,
         pad_context_text_to_max_duration: bool = False,
         context_duration_min: float = 3.0,
-        context_duration_max: float = 10.0
+        context_duration_max: float = 10.0,
+        codes_roll_out_factor: int = 1,
+        num_audio_tokens_per_codebook: int = 2048,
     ):
         super().__init__(
             dataset_meta=dataset_meta,
@@ -375,11 +377,40 @@ class T5TTSDataset(TextToSpeechDataset):
         self.pad_context_text_to_max_duration = pad_context_text_to_max_duration
         self.context_duration_min = context_duration_min
         self.context_duration_max = context_duration_max
+        self.codes_roll_out_factor = codes_roll_out_factor
+        self.num_audio_tokens_per_codebook = num_audio_tokens_per_codebook
     
     def get_num_audio_samples_to_slice(self, duration, sample_rate):
         num_codec_frames = int(duration * sample_rate / self.codec_model_downsample_factor)
         num_audio_samples = num_codec_frames * self.codec_model_downsample_factor
         return num_audio_samples
+
+    
+    def roll_out_channels(self, tensor: torch.Tensor, factor: int) -> torch.Tensor:
+        """
+        Rolls out or stacks the channels of a tensor of shape (C, T).
+        
+        Args:
+            tensor (torch.Tensor): Input tensor of shape (C, T).
+            factor (float): Roll out factor. If >1, expands channels and increases T.
+        
+        Returns:
+            torch.Tensor: Transformed tensor with new shape.
+        """
+        if factor == 1:
+            return tensor
+        
+        for c in range(tensor.shape[0]):
+            partition_size = tensor.shape[0] // factor
+            offset = (c // partition_size) * self.num_audio_tokens_per_codebook
+            tensor[c] = tensor[c] + offset
+        C, T = tensor.shape
+        assert factor >= 1
+        new_C = int(C / factor)
+        if C % factor != 0:
+            raise ValueError(f"Factor {factor} must divide the number of channels {C} exactly.")
+        new_T = int(T * factor)
+        return tensor.view(new_C, factor, T).permute(0, 2, 1).reshape(new_C, new_T)
     
     def __getitem__(self, index):
         data = self.data_samples[index]
@@ -401,6 +432,7 @@ class T5TTSDataset(TextToSpeechDataset):
         if self.load_cached_codes_if_available and 'target_audio_codes_path' in data.manifest_entry:
             audio_codes_path = data.manifest_entry['target_audio_codes_path']
             audio_codes = torch.load(audio_codes_path).long() # (C, T)
+            audio_codes = self.roll_out_channels(audio_codes, self.codes_roll_out_factor) # (C//factor, T*factor)
             spec_len = audio_codes.shape[1] + 1 # +1 for EOS
             auidio_bos_tensor = torch.full((audio_codes.shape[0], 1), self.audio_bos_id, dtype=audio_codes.dtype)
             audio_eos_tensor = torch.full((audio_codes.shape[0], 1), self.audio_eos_id, dtype=audio_codes.dtype)
@@ -428,11 +460,12 @@ class T5TTSDataset(TextToSpeechDataset):
             example['audio_filepath'] = data.manifest_entry['audio_filepath']
             example['audio'] = audio
             example['audio_len'] = audio_len
-            spec_len = int(audio_len / self.codec_model_downsample_factor) + 1 # +1 for EOS
+            spec_len = int(audio_len / self.codec_model_downsample_factor) * self.codes_roll_out_factor  + 1 # +1 for EOS
         
         if self.load_cached_codes_if_available and 'context_audio_codes_path' in data.manifest_entry:
             context_audio_codes_path = data.manifest_entry['context_audio_codes_path']
             context_audio_codes = torch.load(context_audio_codes_path).long() # (8, T)
+            context_audio_codes = self.roll_out_channels(context_audio_codes, self.codes_roll_out_factor) # (8//factor, T*factor)
             # Sample random duration between self.context_duration_min and self.context_duration_max
             _context_duration_to_slice = random.uniform(self.context_duration_min, self.context_duration_max)
             _num_frames_to_slice = int(_context_duration_to_slice * self.sample_rate / self.codec_model_downsample_factor)
