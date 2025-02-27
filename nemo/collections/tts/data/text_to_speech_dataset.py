@@ -12,22 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import io
 import json
-import random
 import os
+import random
 from dataclasses import dataclass
+from hydra.utils import instantiate
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import librosa
+import torch
 import torch.utils.data
+import webdataset as wds
 
+from nemo.collections.asr.data.audio_to_text import expand_sharded_filepaths
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import BaseTokenizer
 from nemo.collections.tts.parts.preprocessing.feature_processors import FeatureProcessor
-from nemo.collections.tts.parts.preprocessing.features import Featurizer
+from nemo.collections.tts.parts.preprocessing.features import FeatureReader
+from nemo.collections.tts.parts.utils.tarred_dataset_utils import (
+    create_tarred_dataset,
+    process_tarred_manifest,
+    FileFilterIterator,
+    TarredMetadata
+)
 from nemo.collections.tts.parts.utils.tts_dataset_utils import (
-    BetaBinomialInterpolator,
     _read_audio,
     beta_binomial_prior_distribution,
     filter_dataset_by_duration,
@@ -38,6 +49,7 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
 from nemo.core.classes import Dataset
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
+from torch.utils.data import IterableDataset, Sampler
 import numpy as np
 
 
@@ -60,6 +72,87 @@ class DatasetSample:
     speaker: str
     speaker_index: int = None
     tokenizer_names: List[str] = None
+
+
+def create_text_to_speech_dataset(
+    dataset_type: str,
+    text_tokenizer: BaseTokenizer,
+    dataset_args: Optional[Dict] = None,
+    global_rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+    is_train: bool = False,
+):
+    if dataset_args:
+        dataset_args = instantiate(dataset_args)
+    else:
+        dataset_args = {}
+
+    if not hasattr(text_tokenizer, "set_phone_prob"):
+        phoneme_mode = contextlib.nullcontext()
+    elif is_train:
+        phoneme_mode = text_tokenizer.set_phone_prob(text_tokenizer.phoneme_probability)
+    else:
+        phoneme_mode = text_tokenizer.set_phone_prob(1.0)
+
+    with phoneme_mode:
+        if dataset_type == "default":
+            return TextToSpeechDataset(text_tokenizer=text_tokenizer, **dataset_args)
+        elif dataset_type == "tarred":
+            if not is_train:
+                raise ValueError("Tarred dataset should only be used for training set.")
+            return TarredTextToSpeechDataset(
+                text_tokenizer=text_tokenizer, global_rank=global_rank, world_size=world_size, **dataset_args
+            )
+        else:
+            raise ValueError(f"Unknown dataset type {dataset_type}")
+
+
+def text_to_speech_collate_fn(
+    batch: List[dict],
+    feature_readers: List[FeatureReader],
+    feature_processors: List[FeatureProcessor],
+    text_pad_value: int,
+    include_speaker: bool
+):
+    dataset_name_list = []
+    audio_filepath_list = []
+    token_list = []
+    token_len_list = []
+    speaker_list = []
+
+    for example in batch:
+        dataset_name_list.append(example["dataset_name"])
+        audio_filepath_list.append(example["audio_filepath"])
+
+        token_list.append(example["tokens"])
+        token_len_list.append(example["text_len"])
+
+        if include_speaker:
+            speaker_list.append(example["speaker_index"])
+
+    batch_token_len = torch.IntTensor(token_len_list)
+    token_max_len = int(batch_token_len.max().item())
+    batch_tokens = stack_tensors(token_list, max_lens=[token_max_len], pad_value=text_pad_value)
+
+    batch_dict = {
+        "dataset_names": dataset_name_list,
+        "audio_filepaths": audio_filepath_list,
+        "text": batch_tokens,
+        "text_lens": batch_token_len,
+    }
+
+    if include_speaker:
+        batch_dict["speaker_id"] = torch.IntTensor(speaker_list)
+
+    for feature_reader in feature_readers:
+        feature_dict = feature_reader.collate_fn(batch)
+        batch_dict.update(feature_dict)
+
+    for feature_processor in feature_processors:
+        processor_dict = feature_processor.collate_fn(batch)
+        batch_dict.update(processor_dict)
+
+    return batch_dict
 
 
 @experimental
@@ -96,7 +189,7 @@ class TextToSpeechDataset(Dataset):
         text_tokenizer: BaseTokenizer,
         weighted_sampling_steps_per_epoch: Optional[int] = None,
         speaker_path: Optional[Path] = None,
-        featurizers: Optional[Dict[str, Featurizer]] = None,
+        feature_readers: Optional[Dict[str, FeatureReader]] = None,
         feature_processors: Optional[Dict[str, FeatureProcessor]] = None,
         align_prior_hop_length: Optional[int] = None,
         min_duration: Optional[float] = None,
@@ -120,11 +213,11 @@ class TextToSpeechDataset(Dataset):
             self.include_speaker = False
             speaker_index_map = None
 
-        if featurizers:
-            logging.info(f"Found featurizers {featurizers.keys()}")
-            self.featurizers = list(featurizers.values())
+        if feature_readers:
+            logging.info(f"Found feature readers {feature_readers.keys()}")
+            self.feature_readers = list(feature_readers.values())
         else:
-            self.featurizers = []
+            self.feature_readers = []
 
         if feature_processors:
             logging.info(f"Found featurize processors {feature_processors.keys()}")
@@ -246,8 +339,8 @@ class TextToSpeechDataset(Dataset):
             align_prior = torch.tensor(align_prior, dtype=torch.float32)
             example["align_prior"] = align_prior
 
-        for featurizer in self.featurizers:
-            feature_dict = featurizer.load(
+        for feature_reader in self.feature_readers:
+            feature_dict = feature_reader.load(
                 manifest_entry=data.manifest_entry, audio_dir=data.audio_dir, feature_dir=data.feature_dir
             )
             example.update(feature_dict)
@@ -258,62 +351,200 @@ class TextToSpeechDataset(Dataset):
         return example
 
     def collate_fn(self, batch: List[dict]):
-        dataset_name_list = []
-        audio_filepath_list = []
-        audio_list = []
-        audio_len_list = []
-        token_list = []
-        token_len_list = []
-        speaker_list = []
-        prior_list = []
+        return text_to_speech_collate_fn(
+            batch,
+            feature_readers=self.feature_readers,
+            feature_processors=self.feature_processors,
+            text_pad_value=self.text_tokenizer.pad,
+            include_speaker=self.include_speaker
+        )
 
-        for example in batch:
-            dataset_name_list.append(example["dataset_name"])
-            audio_filepath_list.append(example["audio_filepath"])
 
-            audio_list.append(example["audio"])
-            audio_len_list.append(example["audio_len"])
+class TarredTextToSpeechDataset(IterableDataset):
+    """
+    """
+    def __init__(
+        self,
+        dataset_meta: Dict,
+        text_tokenizer: BaseTokenizer = None,
+        sample_type: str = "concat",
+        sample_args: Optional[Dict] = None,
+        speaker_path: Optional[Path] = None,
+        feature_readers: Optional[Dict[str, FeatureReader]] = None,
+        feature_processors: Optional[Dict[str, FeatureProcessor]] = None,
+        min_duration: Optional[float] = None,
+        max_duration: Optional[float] = None,
+        volume_norm: bool = True,
+        shuffle_n: int = 0,
+        shard_strategy: str = "scatter",
+        global_rank: int = 0,
+        world_size: int = 0,
+        min_words = 1
+    ):
+        super().__init__()
+        self.text_tokenizer = text_tokenizer
+        self.volume_norm = volume_norm
 
-            token_list.append(example["tokens"])
-            token_len_list.append(example["text_len"])
+        if speaker_path:
+            self.include_speaker = True
+            with open(speaker_path, 'r', encoding="utf-8") as speaker_f:
+                self.speaker_index_map = json.load(speaker_f)
+        else:
+            self.include_speaker = False
+            self.speaker_index_map = None
 
-            if self.include_speaker:
-                speaker_list.append(example["speaker_index"])
+        if feature_readers:
+            logging.info(f"Found feature readers for {feature_readers.keys()}")
+            self.feature_readers = list(feature_readers.values())
+        else:
+            self.feature_readers = []
 
-            if self.include_align_prior:
-                prior_list.append(example["align_prior"])
+        if feature_processors:
+            logging.info(f"Found feature processors {feature_processors.keys()}")
+            self.feature_processors = list(feature_processors.values())
+        else:
+            self.feature_processors = []
 
-        batch_audio_len = torch.IntTensor(audio_len_list)
-        audio_max_len = int(batch_audio_len.max().item())
+        web_datasets = []
+        dataset_lengths = []
+        self.file_to_sample_map = {}
+        for dataset_name, dataset_info in dataset_meta.items():
+            dataset_meta = TarredMetadata(**dataset_info)
 
-        batch_token_len = torch.IntTensor(token_len_list)
-        token_max_len = int(batch_token_len.max().item())
+            dataset_entries = read_manifest(dataset_meta.manifest_path)
+            sample_map, unfiltered_file_count, unfiltered_hours, filtered_hours = process_tarred_manifest(
+                dataset_name=dataset_name,
+                entries=dataset_entries,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                min_words=min_words
+            )
+            self.file_to_sample_map.update(sample_map)
 
-        batch_audio = stack_tensors(audio_list, max_lens=[audio_max_len])
-        batch_tokens = stack_tensors(token_list, max_lens=[token_max_len], pad_value=self.text_tokenizer.pad)
+            dataset_length = len(sample_map)
+            if dataset_length == 0:
+                raise ValueError(f"Found empty dataset {dataset_name} after filtering.")
 
-        batch_dict = {
-            "dataset_names": dataset_name_list,
-            "audio_filepaths": audio_filepath_list,
-            "audio": batch_audio,
-            "audio_lens": batch_audio_len,
-            "text": batch_tokens,
-            "text_lens": batch_token_len,
+            logging.info(dataset_name)
+            logging.info(f"Original # of files: {len(dataset_entries)}")
+            logging.info(f"Filtered # of files: {dataset_length}")
+            logging.info(f"Original duration: {unfiltered_hours:.2f} hours")
+            logging.info(f"Filtered duration: {filtered_hours:.2f} hours")
+
+            web_dataset = self._create_web_dataset(
+                tar_filepath=dataset_meta.tar_filepath,
+                shuffle_n=shuffle_n,
+                shard_strategy=shard_strategy,
+                global_rank=global_rank,
+                world_size=world_size
+            )
+            if web_dataset is not None:
+                web_datasets.append(web_dataset)
+                dataset_lengths.append(dataset_length)
+
+        self.dataset = create_tarred_dataset(
+            datasets=web_datasets,
+            dataset_lengths=dataset_lengths,
+            sample_type=sample_type,
+            sample_args=sample_args
+        )
+
+        if len(self.dataset) == 0:
+            raise ValueError(f"Final dataset is empty.")
+
+    def _create_web_dataset(
+        self, tar_filepath: str, shuffle_n: int, shard_strategy: str, global_rank: int, world_size: int
+    ):
+        tar_filepaths = expand_sharded_filepaths(
+            sharded_filepaths=tar_filepath,
+            global_rank=global_rank,
+            world_size=world_size,
+            shard_strategy=shard_strategy,
+        )
+        logging.info(f"Expanded {tar_filepath} to {len(tar_filepaths)} files")
+
+        if len(tar_filepaths) == 0:
+            # When using scatter shard_strategy, some workers might have no shards for a dataset
+            return None
+
+        key_names = ["key"]
+        rename_args = {
+            "key": "__key__"
+        }
+        for feature_reader in self.feature_readers:
+            key_names.append(feature_reader.feature_name)
+            rename_args[feature_reader.feature_name] = feature_reader.get_tarred_suffixes()
+
+        file_ids = set(self.file_to_sample_map.keys())
+
+        dataset = wds.DataPipeline(
+            wds.SimpleShardList(urls=tar_filepaths),
+            wds.shuffle(100),
+            wds.tarfile_to_samples(),
+            wds.shuffle(shuffle_n),
+            wds.rename(**rename_args),
+            lambda iterator: FileFilterIterator(iterator=iterator, file_ids=file_ids),
+            wds.map(self._build_sample),
+        )
+
+        return dataset
+
+    def _build_sample(self, inputs):
+        file_id = inputs["key"]
+        data = self.file_to_sample_map[file_id]
+        entry = data.manifest_entry
+
+        if "normalized_text" in entry:
+            text = entry["normalized_text"]
+        else:
+            text = entry["text"]
+
+        tokens = self.text_tokenizer(text)
+        tokens = torch.tensor(tokens, dtype=torch.int32)
+        text_len = tokens.shape[0]
+
+        audio_filepath = Path(data.manifest_entry["audio_filepath"])
+        example = {
+            "dataset_name": data.dataset_name,
+            "audio_filepath": audio_filepath,
+            "tokens": tokens,
+            "text_len": text_len,
         }
 
         if self.include_speaker:
-            batch_dict["speaker_id"] = torch.IntTensor(speaker_list)
+            speaker = entry["speaker"]
+            example["speaker"] = speaker
+            example["speaker_index"] = self.speaker_index_map[speaker]
 
-        if self.include_align_prior:
-            spec_max_len = max([prior.shape[0] for prior in prior_list])
-            text_max_len = max([prior.shape[1] for prior in prior_list])
-            batch_dict["align_prior_matrix"] = stack_tensors(prior_list, max_lens=[text_max_len, spec_max_len],)
+        for feature_reader in self.feature_readers:
+            feature_bytes = inputs[feature_reader.feature_name]
+            feature_bytes_io = io.BytesIO(feature_bytes)
+            feature_dict = feature_reader.deserialize(feature_bytes_io)
+            example.update(feature_dict)
 
-        for featurizer in self.featurizers:
-            feature_dict = featurizer.collate_fn(batch)
-            batch_dict.update(feature_dict)
+        for processor in self.feature_processors:
+            processor.process(example)
 
-        return batch_dict
+        return example
+
+    def get_sampler(self, batch_size: int, world_size: int) -> Optional[Sampler]:
+        return None
+
+    def collate_fn(self, batch):
+        return text_to_speech_collate_fn(
+            batch,
+            feature_readers=self.feature_readers,
+            feature_processors=self.feature_processors,
+            text_pad_value=self.text_tokenizer.pad,
+            include_speaker=self.include_speaker,
+        )
+
+    def __iter__(self):
+        return self.dataset.__iter__()
+
+    def __len__(self):
+        return len(self.dataset)
+
 
 class T5TTSDataset(TextToSpeechDataset):
     def __init__(
@@ -348,7 +579,7 @@ class T5TTSDataset(TextToSpeechDataset):
             text_tokenizer=None,
             weighted_sampling_steps_per_epoch=weighted_sampling_steps_per_epoch,
             speaker_path=None,
-            featurizers=None,
+            feature_readers=None,
             feature_processors=None,
             align_prior_hop_length=None,
             min_duration=min_duration,

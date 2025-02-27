@@ -218,6 +218,51 @@ def filter_dataset_by_duration(entries: List[Dict[str, Any]], min_duration: floa
     return filtered_entries, total_hours, filtered_hours
 
 
+def filter_dataset(entries: List[Dict[str, Any]], min_duration: float, max_duration: float, min_words: int):
+    """
+    Filter out manifest entries based on duration.
+
+    Args:
+        entries: List of manifest entry dictionaries.
+        min_duration: Minimum duration below which entries are removed.
+        max_duration: Maximum duration above which entries are removed.
+
+    Returns:
+        filtered_entries: List of manifest entries after filtering.
+        total_hours: Total duration of original dataset, in hours
+        filtered_hours: Total duration of dataset after filtering, in hours
+    """
+    filtered_entries = []
+    total_duration = 0.0
+    filtered_duration = 0.0
+    for entry in entries:
+        duration = entry["duration"]
+        total_duration += duration
+        if (min_duration and duration < min_duration) or (max_duration and duration > max_duration):
+            continue
+
+        if min_words:
+            if "normalized_text" in entry:
+                text = entry["normalized_text"]
+            elif "text" in entry:
+                text = entry["text"]
+            else:
+                raise ValueError(f"Received min_words but entry has no text field: {entry}")
+
+            num_words = len(text.split(" "))
+            if num_words < min_words:
+                continue
+
+
+        filtered_duration += duration
+        filtered_entries.append(entry)
+
+    total_hours = total_duration / 3600.0
+    filtered_hours = filtered_duration / 3600.0
+
+    return filtered_entries, total_hours, filtered_hours
+
+
 def get_weighted_sampler(
     sample_weights: List[float], batch_size: int, world_size: int, num_steps: int
 ) -> torch.utils.data.WeightedRandomSampler:

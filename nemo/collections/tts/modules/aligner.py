@@ -38,15 +38,19 @@ class AlignmentEncoder(torch.nn.Module):
     def __init__(
         self,
         n_mel_channels=80,
+        n_mel_filters=None,
         n_text_channels=512,
         n_att_channels=80,
         temperature=0.0005,
-        condition_types=[],
+        condition_dim=None,
+        condition_types=None,
         dist_type="l2",
     ):
         super().__init__()
         self.temperature = temperature
-        self.cond_input = ConditionalInput(n_text_channels, n_text_channels, condition_types)
+        self.cond_input = ConditionalInput(
+            hidden_dim=n_text_channels, condition_dim=condition_dim, condition_types=condition_types
+        )
         self.softmax = torch.nn.Softmax(dim=3)
         self.log_softmax = torch.nn.LogSoftmax(dim=3)
 
@@ -56,12 +60,19 @@ class AlignmentEncoder(torch.nn.Module):
             ConvNorm(n_text_channels * 2, n_att_channels, kernel_size=1, bias=True),
         )
 
+        if n_mel_filters:
+            query_filters_1 = n_mel_filters
+            query_filters_2 = n_mel_filters
+        else:
+            query_filters_1 = n_mel_channels * 2
+            query_filters_2 = n_mel_channels
+
         self.query_proj = nn.Sequential(
-            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu'),
+            ConvNorm(n_mel_channels, query_filters_1, kernel_size=3, bias=True, w_init_gain='relu'),
             torch.nn.ReLU(),
-            ConvNorm(n_mel_channels * 2, n_mel_channels, kernel_size=1, bias=True),
+            ConvNorm(query_filters_1, query_filters_2, kernel_size=1, bias=True),
             torch.nn.ReLU(),
-            ConvNorm(n_mel_channels, n_att_channels, kernel_size=1, bias=True),
+            ConvNorm(query_filters_2, n_att_channels, kernel_size=1, bias=True),
         )
         if dist_type == "l2":
             self.dist_fn = self.get_euclidean_dist

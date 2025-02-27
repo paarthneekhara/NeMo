@@ -1056,3 +1056,20 @@ class GaussianDropout(torch.nn.Module):
         noise = torch.normal(mean=1.0, std=self.stdev, size=inputs.shape, device=inputs.device)
         out = noise * inputs
         return out
+
+
+class DropoutWithoutScaling(torch.nn.Module):
+    """
+    """
+
+    def __init__(self, dropout_rate):
+        super(DropoutWithoutScaling, self).__init__()
+        self.dropout_rate = dropout_rate
+
+    def forward(self, inputs):
+        if not self.training:
+            return inputs
+
+        mask = torch.rand(size=inputs.shape, device=inputs.device) >= self.dropout_rate
+        out = torch.where(mask, inputs, torch.zeros_like(inputs))
+        return out

@@ -437,7 +437,9 @@ class ConditionalLayerNorm(torch.nn.LayerNorm):
     If we don't have any conditions, this will be a normal LayerNorm.
     """
 
-    def __init__(self, hidden_dim, condition_dim=None, condition_types=[]):
+    def __init__(self, hidden_dim, condition_dim=None, condition_types=None):
+        if not condition_types:
+            condition_types = []
         check_support_condition_types(condition_types)
         self.condition = "layernorm" in condition_types
         super().__init__(hidden_dim, elementwise_affine=not self.condition)
@@ -476,7 +478,9 @@ class ConditionalInput(torch.nn.Module):
     If we don't have any conditions, this will be a normal pass.
     """
 
-    def __init__(self, hidden_dim, condition_dim, condition_types=[]):
+    def __init__(self, hidden_dim, condition_dim=None, condition_types=None):
+        if not condition_types:
+            condition_types = []
         check_support_condition_types(condition_types)
         super().__init__()
         self.support_types = ["add", "concat"]

@@ -677,6 +677,7 @@ class Conv1dNorm(NeuralModule):
         dilation: int = 1,
         padding: Optional[int] = None,
         pad_mode: str = "reflect",
+        activation: Optional[str] = None,
     ):
         super().__init__()
         if not padding:
@@ -691,6 +692,11 @@ class Conv1dNorm(NeuralModule):
             padding_mode=pad_mode,
         )
         self.conv = nn.utils.parametrizations.weight_norm(conv)
+        if activation is not None:
+            self.activation = CodecActivation(activation=activation, channels=out_channels)
+        else:
+            self.activation = None
+
 
     @property
     def input_types(self):
@@ -711,6 +717,10 @@ class Conv1dNorm(NeuralModule):
     @typecheck()
     def forward(self, inputs, input_len):
         out = self.conv(inputs)
+
+        if self.activation is not None:
+            out = self.activation(out)
+
         out = mask_sequence_tensor(out, input_len)
         return out
 
@@ -2413,3 +2423,340 @@ class MultiBandMelEncoder(NeuralModule):
         # [B, C, T]
         encoded = torch.cat(outputs, dim=1)
         return encoded, spec_len
+
+
+class STFTProcessor(NeuralModule):
+    def __init__(self, n_fft, win_length, hop_length, log_guard=1.0):
+        super(STFTProcessor, self).__init__()
+
+        self.n_fft = n_fft
+        self.win_length = win_length
+        self.hop_length = hop_length
+        self.register_buffer("window", torch.hann_window(self.win_length, periodic=False))
+        self.log_guard = log_guard
+        self.stft_pad_amount = (self.n_fft - self.hop_length) // 2
+
+    @property
+    def input_types(self):
+        return {
+            "audio": NeuralType(('B', 'T_audio'), AudioSignal()),
+            "audio_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "spec": NeuralType(('B', 'D', 'T_spec'), MelSpectrogramType()),
+            "spec_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @typecheck()
+    def forward(self, audio, audio_len):
+        spec_len = audio_len // self.hop_length
+        audio_padded = torch.nn.functional.pad(audio, (self.stft_pad_amount, self.stft_pad_amount), "reflect")
+        # [B, n_fft, T_spec]
+        fft = torch.stft(
+            audio_padded,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            return_complex=True,
+            center=False
+        )
+        fft_mag = torch.abs(fft)
+        fft_mag_log = torch.log(fft_mag + self.log_guard)
+        fft_mag_log = mask_sequence_tensor(fft_mag_log, spec_len)
+        return fft_mag_log, spec_len
+
+
+class ResidualBlockV2(NeuralModule):
+    """
+    Residual block which applies activation to output instead of input.
+
+    Args:
+        channels: Input dimension.
+        filters: Number of channels in the residual convolutions.
+        kernel_size: Kernel size of the residual convolutions.
+        dilation: Dilation of the residual convolutions.
+        activation: Activation to apply in between residual convolutions.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        filters: int,
+        kernel_size: int = 3,
+        activation: str = "lrelu",
+    ):
+        super(ResidualBlockV2, self).__init__()
+
+        self.input_conv = Conv1dNorm(
+            in_channels=channels, out_channels=filters, kernel_size=kernel_size, activation=activation
+        )
+        self.skip_conv = Conv1dNorm(in_channels=filters, out_channels=channels, kernel_size=kernel_size)
+        self.output_activation = CodecActivation(activation=activation, channels=channels)
+
+    def remove_weight_norm(self):
+        self.input_conv.remove_weight_norm()
+        self.skip_conv.remove_weight_norm()
+
+    @property
+    def input_types(self):
+        return {"inputs": NeuralType(('B', 'C', 'T'), VoidType()), "input_len": NeuralType(tuple('B'), LengthsType())}
+
+    @property
+    def output_types(self):
+        return {"out": NeuralType(('B', 'C', 'T'), EncodedRepresentation())}
+
+    @typecheck()
+    def forward(self, inputs, input_len):
+        res = self.input_conv(inputs=inputs, input_len=input_len)
+        res = self.skip_conv(inputs=res, input_len=input_len)
+        out = inputs + res
+        out = self.output_activation(out)
+        return out
+
+
+
+class STFTResidualBlock(NeuralModule):
+    """
+    Block in multi-resolution STFT encoder which adds an STFT resolution to the encoder latent space, after down
+    sampling the input to match the time resoluton of the STFT features.
+
+    Args:
+        channels: Input dimension.
+        filters: Number of channels in the residual convolutions.
+        kernel_size: Kernel size of the residual convolutions.
+        dilation: Dilation of the residual convolutions.
+        dropout_rate: Dropout to apply to residuals.
+        activation: Activation to apply in between residual convolutions.
+    """
+
+    def __init__(
+        self,
+        resolution,
+        input_dim,
+        filters,
+        kernel_size,
+        activation,
+        down_sample_rate,
+    ):
+        super(STFTResidualBlock, self).__init__()
+        down_sample_kernel_size = down_sample_rate * 2 + 1
+
+        self.down_sample_rate = down_sample_rate
+        self.down_sample_conv = Conv1dNorm(
+            in_channels=input_dim,
+            out_channels=filters,
+            kernel_size=down_sample_kernel_size,
+            stride=self.down_sample_rate,
+            activation=activation
+        )
+
+        n_fft, hop_length, win_length = resolution
+        stft_dim = n_fft // 2 + 1
+        self.spec_processor = STFTProcessor(n_fft=n_fft, win_length=win_length, hop_length=hop_length)
+        self.spec_conv = Conv1dNorm(in_channels=stft_dim, out_channels=filters, kernel_size=kernel_size)
+        self.spec_act = CodecActivation(activation=activation, channels=filters)
+
+        self.res_block = ResidualBlockV2(
+            channels=filters, filters=filters, kernel_size=kernel_size, activation=activation
+        )
+
+    def remove_weight_norm(self):
+        self.input_conv.remove_weight_norm()
+        self.skip_conv.remove_weight_norm()
+
+    @property
+    def input_types(self):
+        return {
+            "inputs": NeuralType(('B', 'C', 'T'), VoidType()),
+            "input_len": NeuralType(tuple('B'), LengthsType()),
+            "audio": NeuralType(('B', 'T_audio'), AudioSignal()),
+            "audio_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "out": NeuralType(('B', 'C', 'T'), EncodedRepresentation()),
+            "out_len": NeuralType(tuple('B'), LengthsType())
+        }
+
+    @typecheck()
+    def forward(self, inputs, input_len, audio, audio_len):
+        out_len = input_len // self.down_sample_rate
+        out = self.down_sample_conv(inputs=inputs, input_len=out_len)
+
+        spec, _ = self.spec_processor(audio=audio, audio_len=audio_len)
+        spec_res = self.spec_conv(inputs=spec, input_len=out_len)
+        out = out + spec_res
+        out = self.spec_act(out)
+
+        out = self.res_block(inputs=out, input_len=out_len)
+        return out, out_len
+
+
+class DownSampleResidualBlock(NeuralModule):
+    """
+    Layer which combines a down sampling layer with a residual block.
+
+    Args:
+        channels: Input dimension.
+        filters: Number of channels in the residual convolutions.
+        kernel_size: Kernel size of the residual convolutions.
+        dilation: Dilation of the residual convolutions.
+        dropout_rate: Dropout to apply to residuals.
+        activation: Activation to apply in between residual convolutions.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        filters: int,
+        kernel_size: int,
+        activation: str,
+        down_sample_rate: int,
+    ):
+        super(DownSampleResidualBlock, self).__init__()
+        down_sample_kernel_size = down_sample_rate * 2 + 1
+
+        self.down_sample_rate = down_sample_rate
+        self.down_sample_conv = Conv1dNorm(
+            in_channels=channels,
+            out_channels=filters,
+            kernel_size=down_sample_kernel_size,
+            stride=self.down_sample_rate,
+            activation=activation
+        )
+        self.res_block = ResidualBlockV2(
+            channels=filters, filters=filters, kernel_size=kernel_size, activation=activation
+        )
+
+    def remove_weight_norm(self):
+        self.input_conv.remove_weight_norm()
+        self.skip_conv.remove_weight_norm()
+
+    @property
+    def input_types(self):
+        return {
+            "inputs": NeuralType(('B', 'C', 'T'), VoidType()),
+            "input_len": NeuralType(tuple('B'), LengthsType())
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "out": NeuralType(('B', 'C', 'T'), EncodedRepresentation()),
+            "out_len": NeuralType(tuple('B'), LengthsType())
+        }
+
+    @typecheck()
+    def forward(self, inputs, input_len):
+        output_len = input_len // self.down_sample_rate
+        out = self.down_sample_conv(inputs=inputs, input_len=output_len)
+        out = self.res_block(inputs=out, input_len=output_len)
+        return out, output_len
+
+
+class MultiResolutionSTFTEncoder(NeuralModule):
+    def __init__(
+        self,
+        out_dim,
+        resolutions,
+        resolution_filter_list,
+        down_sample_filter_list=(),
+        down_sample_rate_list=(),
+        kernel_size=3,
+        activation="lrelu",
+    ):
+        super(MultiResolutionSTFTEncoder, self).__init__()
+        assert len(resolutions) >= 1
+        assert len(resolutions) == len(resolution_filter_list)
+
+        n_fft, hop_length, win_length = resolutions[0]
+        input_filters = resolution_filter_list[0]
+        input_dim = n_fft // 2 + 1
+        self.pre_spec_processor = STFTProcessor(n_fft=n_fft, win_length=win_length, hop_length=hop_length)
+        self.pre_conv = Conv1dNorm(
+            in_channels=input_dim,
+            out_channels=input_filters,
+            kernel_size=kernel_size,
+            activation=activation
+        )
+        self.pre_res_block = ResidualBlockV2(
+            channels=input_filters,
+            filters=input_filters,
+            kernel_size=kernel_size,
+            activation=activation
+        )
+        input_dim = input_filters
+        self.stft_blocks = nn.ModuleList([])
+        for resolution, filters in zip(resolutions[1:], resolution_filter_list[1:]):
+            stft_block = STFTResidualBlock(
+                resolution=resolution,
+                input_dim=input_dim,
+                down_sample_rate=2,
+                filters=filters,
+                kernel_size=kernel_size,
+                activation=activation,
+            )
+            self.stft_blocks.append(stft_block)
+            input_dim = filters
+
+        if down_sample_filter_list and not down_sample_rate_list:
+            down_sample_rate_list = len(down_sample_filter_list) * [2]
+
+        self.down_sample_blocks = nn.ModuleList([])
+        for (filters, down_sample_rate) in zip(down_sample_filter_list, down_sample_rate_list):
+            down_sample_block = DownSampleResidualBlock(
+                channels=input_dim,
+                filters=filters,
+                down_sample_rate=down_sample_rate,
+                kernel_size=kernel_size,
+                activation=activation
+            )
+            self.down_sample_blocks.append(down_sample_block)
+            input_dim = filters
+
+        self.post_conv = Conv1dNorm(
+            in_channels=input_dim,
+            out_channels=out_dim,
+            kernel_size=kernel_size
+        )
+
+    def remove_weight_norm(self):
+        self.encoder.remove_weight_norm()
+
+    @property
+    def input_types(self):
+        return {
+            "audio": NeuralType(('B', 'T_audio'), AudioSignal()),
+            "audio_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "encoded": NeuralType(('B', 'D', 'T_encoded'), EncodedRepresentation()),
+            "encoded_len": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @typecheck()
+    def forward(self, audio, audio_len):
+        encoded, encoded_len = self.pre_spec_processor(audio=audio, audio_len=audio_len)
+        encoded = self.pre_conv(inputs=encoded, input_len=encoded_len)
+        encoded = self.pre_res_block(inputs=encoded, input_len=encoded_len)
+
+        for stft_block in self.stft_blocks:
+            encoded, encoded_len = stft_block(
+                inputs=encoded, input_len=encoded_len, audio=audio, audio_len=audio_len
+            )
+
+        for down_sample_block in self.down_sample_blocks:
+            encoded, encoded_len = down_sample_block(inputs=encoded, input_len=encoded_len)
+
+        encoded = self.post_conv(inputs=encoded, input_len=encoded_len)
+
+        return encoded, encoded_len
