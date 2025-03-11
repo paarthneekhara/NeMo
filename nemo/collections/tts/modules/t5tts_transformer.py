@@ -229,8 +229,8 @@ class Attention(torch.nn.Module):
         if attn_prior is not None:
             eps = self.prior_eps
             attn_prior = attn_prior[:, :T]  # trim for inference
+            attn_prior = attn_prior[:, None].repeat(1, self.n_heads, 1, 1)
             attn_prior_log = torch.log(attn_prior + eps)
-            attn_prior_log = attn_prior_log[:, None].repeat(1, self.n_heads, 1, 1)
             attn_score_log = F.log_softmax(attn_score, dim=-1) + attn_prior_log
             attn_score_log = attn_score_log.masked_fill(attn_prior == 0, float('-inf'))
             attn_prob = F.softmax(attn_score_log, dim=-1)
