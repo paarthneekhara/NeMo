@@ -652,8 +652,8 @@ class T5TTS_Model(ModelPT):
                 attn_prior = _attn_prior
                 if attn_prior is not None:
                     # B, audio_timesteps, text_timesteps
-                    padding_zeros = torch.zeros(attn_prior.size(0), dec_context_size, attn_prior.size(2), device=attn_prior.device)
-                    attn_prior = torch.cat([padding_zeros, attn_prior], dim=1)
+                    prior_padding = torch.ones(attn_prior.size(0), dec_context_size, attn_prior.size(2), device=attn_prior.device)
+                    attn_prior = torch.cat([prior_padding, attn_prior], dim=1)
                 cond = text_encoder_out
                 cond_mask = text_mask
                 multi_encoder_mapping = None
