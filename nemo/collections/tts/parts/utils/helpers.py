@@ -565,8 +565,12 @@ def plot_gate_outputs_to_numpy(gate_targets, gate_outputs):
 
 def save_figure_to_numpy(fig):
     # save it to a numpy array.
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    # note: canvas.draw() must be called before this to populate the buffer
+    buffer = fig.canvas.buffer_rgba()
+    width, height = fig.canvas.get_width_height()
+    data = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 4)
+    # drop the alpha channel
+    data = data[:,:,:-1]
     return data
 
 
