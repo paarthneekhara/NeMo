@@ -28,7 +28,7 @@ from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 
 from nemo.collections.tts.modules.magpietts_modules import CharAwareSubwordEncoder, SpecialAudioToken, LocalTransformerType, cosine_schedule
-from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths, binarize_attention_parallel
 
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
@@ -39,6 +39,7 @@ from transformers import (
     AutoModelForCausalLM
 )
 import time
+from nemo.collections.tts.modules.aligner import AlignmentEncoder
 
 def worker_init_fn(worker_id):
     # For mp.set_start_method("spawn", force=True)
@@ -83,6 +84,11 @@ class MagpieTTSDecoderModel(ModelPT):
         self.mask_token_id = cfg.get('forced_mask_token_id', num_audio_tokens + SpecialAudioToken.MASK_TOKEN.value)
         self.use_bpe_char_tokenizer = cfg.get('use_bpe_char_tokenizer', False)
         self.cfg_unconditional_prob = cfg.get('cfg_unconditional_prob', 0.0)
+        self.use_alignment_encoder = cfg.get('use_alignment_encoder', False)
+        self.binarize_repeat_audio_factor = cfg.get('binarize_repeat_audio_factor', 2)
+        self.binarize_attn_method = cfg.get('binarize_attn_method', 'nemo_binarize')
+        self.use_prior_for_aligner = cfg.get('use_prior_for_aligner', True)
+        self.aligner_encoder_train_steps = cfg.get('aligner_encoder_train_steps',30000)
         
         
         self.tokenizer, _ = setup_tokenizers(
@@ -122,6 +128,19 @@ class MagpieTTSDecoderModel(ModelPT):
         hf_transformer = AutoModelForCausalLM.from_config(self.transformer_backend_config)
         self.decoder = hf_transformer.model
         self.lm_text_head = hf_transformer.lm_head
+
+        if self.use_alignment_encoder:
+            max_text_len = cfg.get('max_text_len', 512)
+            self.text_index_embedding = nn.Embedding(
+                max_text_len, cfg.embedding_dim
+            )
+            self.text_index_predictor = nn.Linear(cfg.embedding_dim, max_text_len)
+            self.alignment_encoder = AlignmentEncoder(
+                n_mel_channels=cfg.embedding_dim,
+                n_text_channels=cfg.embedding_dim,
+                dist_type="cosine",
+                temperature=15.0,
+            )
 
         if self.use_bpe_char_tokenizer:
             # BPE char tokenizer
@@ -724,8 +743,8 @@ class MagpieTTSDecoderModel(ModelPT):
         text = batch['text']
         text_lens = batch['text_lens']
         text_embedded = self.decoder.get_input_embeddings()(text)
+        text_mask = get_mask_from_lengths(text_lens)
         if self.use_bpe_char_tokenizer:
-            text_mask = get_mask_from_lengths(text_lens)
             cas_embedding = self.cas_encoder(text, subword_mask=text_mask)  # (B, L, E)
             text_embedded = text_embedded + cas_embedding
 
@@ -750,10 +769,14 @@ class MagpieTTSDecoderModel(ModelPT):
         )
 
         return {
+            'beta_binomial_attn_prior': batch.get('align_prior_matrix', None),
             'full_context_embedding': full_context_embedding,  # (B, T_total, E)
             'full_context_lens': full_context_lens,  # (B,)
             'context_audio_codes': context_audio_codes,  # (B, C, T')
             'context_audio_codes_lens': context_audio_codes_lens,  # (B,)
+            'text_embedded': text_embedded,  # (B, T_total, E)
+            'text_mask': text_mask,  # (B, T_total)
+            'text_lens': text_lens,  # (B,)
         }
 
     def slice_pred_embeddings(self, transformer_out, context_lens, target_lens):
@@ -783,6 +806,22 @@ class MagpieTTSDecoderModel(ModelPT):
         sliced = torch.gather(transformer_out, dim=1, index=gather_indices_exp)
         return sliced
 
+    def get_binarized_prior_matrix(self, aligner_attn_soft, audio_lens, text_lens):
+        # aligner_attn_soft B, 1, audio_timesteps, text_timesteps
+        if self.binarize_attn_method == 'nemo_binarize':
+            logging.info("Binarizing attention using nemo_binarize")
+            binarize_repeat_audio_factor = self.binarize_repeat_audio_factor
+            aligner_attn_soft_repeated = aligner_attn_soft.repeat_interleave(binarize_repeat_audio_factor, dim=2) # B, 1, 2*audio_timesteps, text_timesteps
+            aligner_attn_hard = binarize_attention_parallel(aligner_attn_soft_repeated, text_lens, audio_lens*binarize_repeat_audio_factor).squeeze(1) # B, 2*audio_timesteps, text_timesteps
+            aligner_attn_hard = aligner_attn_hard[:, ::2, :] # B, audio_timesteps, text_timesteps
+        elif self.binarize_attn_method == 'argmax':
+            logging.info("Binarizing attention using argmax")
+            aligner_attn_hard = torch.argmax(aligner_attn_soft.squeeze(1), dim=-1)
+            aligner_attn_hard = torch.nn.functional.one_hot(aligner_attn_hard, num_classes=aligner_attn_soft.size(-1)).float()
+        else:
+            raise ValueError(f"self.binarize_attn_method '{self.binarize_attn_method}' must be one of 'nemo_binarize' or 'argmax'.")
+
+        return aligner_attn_hard  # B, audio_timesteps, text_timesteps
 
     def process_batch(self, batch, mode="train"):
         context_tensors = self.prepare_context_tensors(batch)
@@ -807,7 +846,41 @@ class MagpieTTSDecoderModel(ModelPT):
         audio_codes_lens_input = audio_codes_lens_target = audio_codes_lens - 1
         audio_codes_target = audio_codes[:, :, 1:]  # (B, C, T') Target for the decoder
         audio_codes_input = audio_codes[:, :, :-1]  # (B, C, T') Input to the decoder
-        audio_codes_input_embedded = self.embed_audio_tokens(audio_codes_input) # (B, T, E) # Computing this to be use in the alignment encoder
+        audio_codes_embedded_all = self.embed_audio_tokens(audio_codes)  # (B, T, E) # Computing this to be use in the alignment encoder
+        audio_codes_input_embedded = audio_codes_embedded_all[:, :-1, :] # (B, T', E) Input to the decoder
+
+        if self.use_alignment_encoder:
+            aligner_prior = None
+            if self.use_prior_for_aligner:
+                aligner_prior = context_tensors['beta_binomial_attn_prior']
+            if self.global_step < self.aligner_encoder_train_steps:
+                aligner_attn_soft, aligner_attn_logprobs = self.alignment_encoder(
+                    queries=audio_codes_embedded_all[:, 1:, :].permute(0, 2, 1), # B, E, T'
+                    keys=context_tensors['text_embedded'].permute(0, 2, 1), # B, E, T
+                    mask=~context_tensors['text_mask'].unsqueeze(-1),
+                    attn_prior=aligner_prior
+                )
+                # aligner_encoder_loss = self.alignment_encoder_loss(
+                #     attn_logprob=aligner_attn_logprobs, in_lens=context_tensors['text_lens'], out_lens=audio_codes_lens_input
+                # )
+            else:
+                with torch.no_grad():
+                    aligner_attn_soft, aligner_attn_logprobs = self.alignment_encoder(
+                        queries=audio_codes_embedded_all[:, 1:, :].permute(0, 2, 1), # B, E, T'
+                        keys=context_tensors['text_embedded'].permute(0, 2, 1), # B, E, T
+                        mask=~context_tensors['text_mask'].unsqueeze(-1),
+                        attn_prior=aligner_prior
+                    )
+            
+            with torch.no_grad():
+                aligner_attn_hard = self.get_binarized_prior_matrix(
+                    aligner_attn_soft, audio_codes_lens_input, context_tensors['text_lens']
+                ) # B, audioT, textT
+                text_indices = torch.argmax(aligner_attn_hard, dim=-1)  # B, audioT
+            
+            import ipdb; ipdb.set_trace()
+            text_index_embedding = self.text_index_embedding(text_indices)  # (B, audioT, E)
+            audio_codes_input_embedded = audio_codes_input_embedded + text_index_embedding  # (B, T', E)
 
         context_plus_audio_embedded, context_plus_audio_lens = self.join_embeddings_temporally(
             embeddings=[context_embedding, audio_codes_input_embedded],
@@ -826,6 +899,8 @@ class MagpieTTSDecoderModel(ModelPT):
             target_lens=audio_codes_lens_target,
         )
         
+        
+
         logits = self.final_proj(pred_embeddings)  # (B, T', num_codebooks * num_tokens_per_codebook)
         # import ipdb; ipdb.set_trace()
         codebook_loss, loss_mask = self.compute_loss(logits, audio_codes_target, audio_codes_lens_target)
@@ -847,6 +922,7 @@ class MagpieTTSDecoderModel(ModelPT):
                 local_transformer_loss, _ = self.compute_loss(local_transformer_logits, audio_codes_target, audio_codes_lens_target, None)
             local_transformer_loss_scale = self.cfg.get('local_transformer_loss_scale', 1.0)
             loss = loss + local_transformer_loss_scale * local_transformer_loss
+
 
         return {
             'loss': loss,
@@ -968,7 +1044,7 @@ class MagpieTTSDecoderModel(ModelPT):
             context_audio_eos_id=self.context_audio_eos_id,
             num_audio_codebooks=self.num_audio_codebooks,
             codec_model_samples_per_frame=self.codec_model_samples_per_frame,
-            prior_scaling_factor=0.0,
+            prior_scaling_factor=0.05,
             load_cached_codes_if_available=self.cfg.load_cached_codes_if_available,
             dataset_type=dataset_type,  # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
             use_text_conditioning_tokenizer=True,
@@ -995,7 +1071,7 @@ class MagpieTTSDecoderModel(ModelPT):
             context_audio_bos_id=self.context_audio_bos_id,
             context_audio_eos_id=self.context_audio_eos_id,
             num_audio_codebooks=self.num_audio_codebooks,
-            prior_scaling_factor=0.0,
+            prior_scaling_factor=0.05,
             load_cached_codes_if_available=self.cfg.load_cached_codes_if_available,
             dataset_type=mode,  # train or test used for setting phone prob to 1.0 in test dataset (worker_init_fn)
             load_16khz_audio=False,
