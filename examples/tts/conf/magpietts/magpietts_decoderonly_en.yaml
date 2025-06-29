@@ -38,6 +38,11 @@ model:
   # To get special_tokens of the tokenzer, you can do:
   # model.tokenizer.first_tokenizer.additional_special_tokens
   
+  use_alignment_encoder: false
+  alignment_encoder_loss_scale: 1.0
+  aligner_encoder_train_steps: 50000
+  add_auxiliary_text_loss_after_step: 10000
+
   text_tokenizers: # Add more languages for multi-lingual TTS
     english_phoneme:
       _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer

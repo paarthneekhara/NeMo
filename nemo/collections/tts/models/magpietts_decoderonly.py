@@ -28,7 +28,11 @@ from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 
 from nemo.collections.tts.modules.magpietts_modules import CharAwareSubwordEncoder, SpecialAudioToken, LocalTransformerType, cosine_schedule
-from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths, binarize_attention_parallel
+from nemo.collections.tts.parts.utils.helpers import (
+    binarize_attention_parallel,
+    get_mask_from_lengths,
+    plot_alignment_to_numpy,
+)
 
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
@@ -40,6 +44,7 @@ from transformers import (
 )
 import time
 from nemo.collections.tts.modules.aligner import AlignmentEncoder
+from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
 
 def worker_init_fn(worker_id):
     # For mp.set_start_method("spawn", force=True)
@@ -85,10 +90,12 @@ class MagpieTTSDecoderModel(ModelPT):
         self.use_bpe_char_tokenizer = cfg.get('use_bpe_char_tokenizer', False)
         self.cfg_unconditional_prob = cfg.get('cfg_unconditional_prob', 0.0)
         self.use_alignment_encoder = cfg.get('use_alignment_encoder', False)
+        self.max_text_len = cfg.get('max_text_len', 512)
         self.binarize_repeat_audio_factor = cfg.get('binarize_repeat_audio_factor', 2)
         self.binarize_attn_method = cfg.get('binarize_attn_method', 'nemo_binarize')
         self.use_prior_for_aligner = cfg.get('use_prior_for_aligner', True)
-        self.aligner_encoder_train_steps = cfg.get('aligner_encoder_train_steps',30000)
+        self.aligner_encoder_train_steps = cfg.get('aligner_encoder_train_steps', 50000)
+        self.add_auxiliary_text_loss_after_step = cfg.get('add_auxiliary_text_loss_after_step', 10000)
         
         
         self.tokenizer, _ = setup_tokenizers(
@@ -130,7 +137,7 @@ class MagpieTTSDecoderModel(ModelPT):
         self.lm_text_head = hf_transformer.lm_head
 
         if self.use_alignment_encoder:
-            max_text_len = cfg.get('max_text_len', 512)
+            max_text_len = self.max_text_len
             self.text_index_embedding = nn.Embedding(
                 max_text_len, cfg.embedding_dim
             )
@@ -160,6 +167,9 @@ class MagpieTTSDecoderModel(ModelPT):
 
         self.final_proj = nn.Linear(cfg.hidden_dim, self.num_audio_codebooks * self.num_all_tokens_per_codebook)
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
+        self.alignment_encoder_loss_scale = cfg.get('alignment_encoder_loss_scale', 0.0)
+        if self.alignment_encoder_loss_scale > 0.0:
+            self.alignment_encoder_loss = ForwardSumLoss(loss_scale=self.alignment_encoder_loss_scale)
 
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
@@ -414,6 +424,7 @@ class MagpieTTSDecoderModel(ModelPT):
             codebook_loss = self.cross_entropy_loss(
                 codebook_logits.permute(0, 2, 1), codebook_targets  # (B, num_tokens_per_codebook, T')
             )  # (B, T')
+            # import ipdb; ipdb.set_trace()
             codebook_loss = codebook_loss * loss_mask[:, codebook, :]
             codebook_loss = codebook_loss.sum() / loss_mask[:, codebook, :].sum()
             if total_codebook_loss is None:
@@ -614,6 +625,41 @@ class MagpieTTSDecoderModel(ModelPT):
         all_preds = torch.cat(all_preds, dim=1).long()  # (B, num_codebooks)
         return all_preds
 
+    def log_attention_probs(self, attention_prob_matrix, audio_codes_lens, text_lens, prefix="", dec_context_size=0):
+        # attention_prob_matrix List of (B, C, audio_timesteps, text_timesteps)
+        wandb_images_log = {}
+
+        with torch.no_grad():
+            attention_prob_matrix = torch.cat(attention_prob_matrix, dim=1)  # (B, C, audio_timesteps, text_timesteps)
+            attention_prob_matrix_mean = attention_prob_matrix.mean(dim=1)  # (B, audio_timesteps, text_timesteps)
+
+            for logger in self.loggers:
+                is_wandb = isinstance(logger, WandbLogger)
+                is_tb = isinstance(logger, TensorBoardLogger)
+                if not is_wandb and not is_tb:
+                    raise ValueError(f"Invalid logger type for image logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported.")
+
+                wandb_images_log[f"Image/{prefix}/attention_matrix"] = list()
+                for idx in range(min(3, attention_prob_matrix_mean.size(0))):
+                    item_attn_matrix = attention_prob_matrix_mean[idx][
+                        dec_context_size : dec_context_size + audio_codes_lens[idx], : text_lens[idx]
+                    ]
+                    item_attn_matrix = item_attn_matrix.detach().cpu().numpy()
+                    img_np = plot_alignment_to_numpy(item_attn_matrix.T)
+
+                    if is_wandb:
+                        wandb_images_log[f"Image/{prefix}/attention_matrix"].append(wandb.Image(img_np, caption=f"Example_{idx}"))
+
+                    if is_tb:
+                        logger.experiment.add_image(
+                            f'{prefix}/attention_matrix/Example_{idx}',
+                            img_np,
+                            global_step=self.global_step,
+                            dataformats="HWC",
+                        )
+
+        return wandb_images_log
+    
     def log_val_audio_example(
         self,
         logits,
@@ -849,6 +895,10 @@ class MagpieTTSDecoderModel(ModelPT):
         audio_codes_embedded_all = self.embed_audio_tokens(audio_codes)  # (B, T, E) # Computing this to be use in the alignment encoder
         audio_codes_input_embedded = audio_codes_embedded_all[:, :-1, :] # (B, T', E) Input to the decoder
 
+        aligner_encoder_loss = None
+        aligner_attn_hard = None
+        aligner_attn_soft = None
+        loss = 0
         if self.use_alignment_encoder:
             aligner_prior = None
             if self.use_prior_for_aligner:
@@ -860,9 +910,10 @@ class MagpieTTSDecoderModel(ModelPT):
                     mask=~context_tensors['text_mask'].unsqueeze(-1),
                     attn_prior=aligner_prior
                 )
-                # aligner_encoder_loss = self.alignment_encoder_loss(
-                #     attn_logprob=aligner_attn_logprobs, in_lens=context_tensors['text_lens'], out_lens=audio_codes_lens_input
-                # )
+                aligner_encoder_loss = self.alignment_encoder_loss(
+                    attn_logprob=aligner_attn_logprobs, in_lens=context_tensors['text_lens'], out_lens=audio_codes_lens_input
+                )
+                loss += aligner_encoder_loss
             else:
                 with torch.no_grad():
                     aligner_attn_soft, aligner_attn_logprobs = self.alignment_encoder(
@@ -877,8 +928,8 @@ class MagpieTTSDecoderModel(ModelPT):
                     aligner_attn_soft, audio_codes_lens_input, context_tensors['text_lens']
                 ) # B, audioT, textT
                 text_indices = torch.argmax(aligner_attn_hard, dim=-1)  # B, audioT
+                text_indices_target = text_indices[:,1:]  # B, audioT-1
             
-            import ipdb; ipdb.set_trace()
             text_index_embedding = self.text_index_embedding(text_indices)  # (B, audioT, E)
             audio_codes_input_embedded = audio_codes_input_embedded + text_index_embedding  # (B, T', E)
 
@@ -899,12 +950,21 @@ class MagpieTTSDecoderModel(ModelPT):
             target_lens=audio_codes_lens_target,
         )
         
-        
-
         logits = self.final_proj(pred_embeddings)  # (B, T', num_codebooks * num_tokens_per_codebook)
-        # import ipdb; ipdb.set_trace()
         codebook_loss, loss_mask = self.compute_loss(logits, audio_codes_target, audio_codes_lens_target)
-        loss = codebook_loss
+        loss += codebook_loss
+        
+        text_index_loss = None
+        if self.use_alignment_encoder and self.global_step > self.add_auxiliary_text_loss_after_step:
+            text_index_logits = self.text_index_predictor(pred_embeddings)  # (B, T', num_text_tokens)
+            text_index_loss = self.cross_entropy_loss(
+                text_index_logits.permute(0, 2, 1)[:,:,:-1],  # (B, num_text_tokens, T'-1)
+                text_indices_target,  # (B, T'-1)
+            )  # (B, T')
+            text_index_loss_mask = get_mask_from_lengths(audio_codes_lens_target - 1)  # (B, T'-1)
+            text_index_loss = text_index_loss * text_index_loss_mask  # (B, C, T')
+            text_index_loss = text_index_loss.sum() / loss_mask.sum()
+            loss += text_index_loss
 
         local_transformer_loss = None
         local_transformer_logits = None
@@ -927,6 +987,8 @@ class MagpieTTSDecoderModel(ModelPT):
         return {
             'loss': loss,
             'codebook_loss': codebook_loss,
+            'text_index_loss': text_index_loss,
+            'aligner_encoder_loss': aligner_encoder_loss,
             'local_transformer_loss': local_transformer_loss,
             'local_transformer_logits': local_transformer_logits,  # (B, T', num_codebooks * num_tokens_per_codebook)
             'logits': logits,
@@ -934,6 +996,9 @@ class MagpieTTSDecoderModel(ModelPT):
             'audio_codes_lens_target': audio_codes_lens_target,  # (B,)
             'context_audio_codes': context_tensors['context_audio_codes'],  # (B, C, T')
             'context_audio_codes_lens': context_tensors['context_audio_codes_lens'],  # (B,)
+            'aligner_attn_soft': aligner_attn_soft,
+            'aligner_attn_hard': aligner_attn_hard,
+            'text_lens': context_tensors['text_lens'],  # (B,)
         }
 
         
@@ -991,6 +1056,7 @@ class MagpieTTSDecoderModel(ModelPT):
         audio_codes_lens_target = batch_output['audio_codes_lens_target']
         context_audio_codes = batch_output['context_audio_codes']
         context_audio_codes_lens = batch_output['context_audio_codes_lens']
+        text_lens = batch_output['text_lens']
         
         if batch_idx == 0 and self.global_rank == 0:
             # Prepare dictionary for aggregated wandb logging
@@ -1002,6 +1068,25 @@ class MagpieTTSDecoderModel(ModelPT):
                     logits, audio_codes_target, audio_codes_lens_target, context_audio_codes, context_audio_codes_lens
                 )
             )
+            if batch_output['aligner_attn_soft'] is not None:
+                wandb_log_dict.update(
+                    self.log_attention_probs(
+                        [batch_output['aligner_attn_soft']],
+                        audio_codes_lens_target,
+                        text_lens,
+                        prefix=f"val/aligner_encoder_attn",
+                    )
+                )
+
+            if batch_output['aligner_attn_hard'] is not None:
+                wandb_log_dict.update(
+                    self.log_attention_probs(
+                        [batch_output['aligner_attn_hard'].unsqueeze(1)],
+                        audio_codes_lens_target,
+                        text_lens,
+                        prefix=f"val/aligner_encoder_attn_hard",
+                    )
+                )
 
             # Perform single wandb log call if wandb is active and there is data
             for logger in self.loggers:
@@ -1013,6 +1098,8 @@ class MagpieTTSDecoderModel(ModelPT):
             'val_loss': loss,
             'val_codebook_loss': codebook_loss,
             'val_local_transformer_loss': local_transformer_loss,
+            'val_aligner_encoder_loss': batch_output['aligner_encoder_loss'],
+            'val_text_index_loss': batch_output['text_index_loss']
         }
         self.validation_step_outputs.append(val_output)
 
@@ -1029,6 +1116,13 @@ class MagpieTTSDecoderModel(ModelPT):
         if self.local_transformer_type != LocalTransformerType.NO_LT:
             val_local_transformer_loss = collect("val_local_transformer_loss")
             self.log("val/local_transformer_loss", val_local_transformer_loss, prog_bar=True, sync_dist=True)
+        if self.use_alignment_encoder:
+            val_aligner_encoder_loss = collect("val_aligner_encoder_loss")
+            self.log("val/aligner_encoder_loss", val_aligner_encoder_loss, prog_bar=True, sync_dist=True)
+            if self.validation_step_outputs[0]['val_text_index_loss'] is not None:
+                # If text index loss is computed, log it
+                val_text_index_loss = collect("val_text_index_loss")
+                self.log("val/text_index_loss", val_text_index_loss, prog_bar=True, sync_dist=True)
         
         self.validation_step_outputs.clear()  # free memory
 
