@@ -1256,6 +1256,12 @@ class MagpieTTSDecoderModel(ModelPT):
             audio_codes_input = audio_codes_bos
 
             audio_codes_input_embedded = self.embed_audio_tokens(audio_codes_input)  # (B, T, E)
+            if self.use_alignment_encoder:
+                text_indices = torch.zeros(
+                    context_embedding.size(0), 1, device=context_embedding.device, dtype=torch.long
+                )
+                text_index_embedding = self.text_index_embedding(text_indices)  # (B, 1, E)
+                audio_codes_input_embedded = audio_codes_input_embedded + text_index_embedding  # (B, T, E)
             
             context_plus_audio_embedded, context_plus_audio_lens = self.join_embeddings_temporally(
                 embeddings=[context_embedding, audio_codes_input_embedded],
@@ -1300,6 +1306,7 @@ class MagpieTTSDecoderModel(ModelPT):
                     print(f"Decoding timestep {idx}")
 
                 all_code_logits_t = self.final_proj(last_hidden[:, -1, :])  # (B, num_codebooks * num_tokens_per_codebook)
+
                 if use_cfg:
                     conditional_logits = all_code_logits_t[:actual_batch_size]
                     unconditional_logits = all_code_logits_t[actual_batch_size:]
@@ -1344,7 +1351,13 @@ class MagpieTTSDecoderModel(ModelPT):
                 all_predictions.append(audio_codes_next)
                 
                 new_emb = self.embed_audio_tokens(audio_codes_next.unsqueeze(2))  # (B, 1, E)
-                
+                if self.use_alignment_encoder:
+                    text_index_logits_t = self.text_index_predictor(last_hidden[:actual_batch_size, -1, :])  # (B, num_text_tokens)
+                    text_index_predicted = torch.argmax(text_index_logits_t, dim=-1)  # (B,)
+                    text_index_embedding = self.text_index_embedding(text_index_predicted.unsqueeze(1))  # (B, 1, E)
+                    new_emb = new_emb + text_index_embedding  # (B, 1, E)
+                    print("Text index predicted", text_index_predicted)
+
                 context_incomplete_mask = context_plus_audio_lens > idx + min_context_len # (B,)
                 # True if we have not yet reached the end of the context for this item
                 # import ipdb; ipdb.set_trace()
