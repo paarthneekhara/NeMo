@@ -135,6 +135,14 @@ class MagpieTTSModel(ModelPT):
         self.pad_context_text_to_max_duration = self.model_type in ['decoder_context_tts', 'decoder_ce']
         self.use_kv_cache_for_inference = cfg.get('use_kv_cache_for_inference', False)
 
+        self.text_context_remapping = None
+        text_context_remapping_json = cfg.get('text_context_remapping_json', None)
+        if text_context_remapping_json is not None:
+            import json
+            with open(text_context_remapping_json, 'r') as f:
+                self.text_context_remapping = json.load(f)
+
+
         super().__init__(cfg=cfg, trainer=trainer)
 
         if self.use_text_conditioning_encoder:
@@ -1877,6 +1885,7 @@ class MagpieTTSModel(ModelPT):
             pad_context_text_to_max_duration=self.pad_context_text_to_max_duration,
             context_duration_min=self.cfg.context_duration_min,
             context_duration_max=self.cfg.context_duration_max,
+            text_context_remapping=self.text_context_remapping,
         )
         dataset.load_16khz_audio = self.model_type == 'single_encoder_sv_tts'
         dataset.tokenizer_config = (
@@ -1906,6 +1915,7 @@ class MagpieTTSModel(ModelPT):
             use_text_conditioning_tokenizer=self.cfg.use_text_conditioning_encoder,
             text_conditioning_tokenizer_name=self.text_conditioning_tokenizer_name,
             tokenizer_config=self.cfg.text_tokenizers,
+            text_context_remapping=self.text_context_remapping,
         )
         data_loader = get_lhotse_dataloader_from_config(
             config=dataset_cfg.dataset,

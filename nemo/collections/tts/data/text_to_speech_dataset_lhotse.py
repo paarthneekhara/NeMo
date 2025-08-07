@@ -155,6 +155,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         use_text_conditioning_tokenizer: bool = False,
         text_conditioning_tokenizer_name: str = 'google-t5/t5-small',
         tokenizer_config: DictConfig = None,
+        text_context_remapping: Dict[str, str] = None,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -180,6 +181,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.tokenizer_config = tokenizer_config
         self.text_tokenizer = None
         self.text_conditioning_tokenizer = None
+        self.text_context_remapping = text_context_remapping
 
     def get_num_audio_samples_to_slice(self, duration, sample_rate):
         num_codec_frames = int(duration * sample_rate / self.codec_model_samples_per_frame)
@@ -375,7 +377,11 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
 
             if self.use_text_conditioning_tokenizer:
                 if cut.supervisions[0].has_custom("context_text"):
-                    context_text_tokens = self.text_conditioning_tokenizer(cut.supervisions[0].context_text)['input_ids']
+                    context_text = cut.supervisions[0].context_text
+                    if self.text_context_remapping is not None and context_text in self.text_context_remapping:
+                        context_text = self.text_context_remapping[context_text]
+                        print(f"Remapped from {cut.supervisions[0].context_text} to {context_text}")
+                    context_text_tokens = self.text_conditioning_tokenizer(context_text)['input_ids']
                     has_text_context = True
                 else:
                     context_text_tokens = self.text_conditioning_tokenizer("[NO TEXT CONTEXT]")['input_ids']
