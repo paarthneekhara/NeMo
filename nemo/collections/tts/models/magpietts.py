@@ -727,6 +727,8 @@ class MagpieTTSModel(ModelPT):
         if use_cfg:
             all_preds = all_preds[:actual_batch_size]
 
+        # reset the cache
+        self.local_transformer.reset_cache(use_cache=False)
         return all_preds
 
 
