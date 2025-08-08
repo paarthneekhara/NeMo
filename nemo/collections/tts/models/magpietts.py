@@ -689,7 +689,7 @@ class MagpieTTSModel(ModelPT):
 
     def local_transformer_sample_autoregressive(self, dec_output, temperature=0.7, topk=80, unfinished_items={}, finished_items={}, use_cfg=False, cfg_scale=1.0):
         # dec_output: (B, E)
-        self.local_transformer.reset_cache(use_cache=True)
+        # self.local_transformer.reset_cache(use_cache=True)
         dec_output = dec_output.unsqueeze(1) # (B, 1, E)
         local_transformer_input = self.local_transformer_in_projection(dec_output) # (B, 1, 128)
         all_preds = []
@@ -728,7 +728,7 @@ class MagpieTTSModel(ModelPT):
             all_preds = all_preds[:actual_batch_size]
 
         # reset the cache
-        self.local_transformer.reset_cache(use_cache=False)
+        # self.local_transformer.reset_cache(use_cache=False)
         return all_preds
 
 
