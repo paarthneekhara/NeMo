@@ -66,8 +66,10 @@ class MagpieTTSDecoderModel(ModelPT):
         # load codec
         codec_model = AudioCodecModel.restore_from(cfg.get('codecmodel_path'), strict=False)
         self.sample_rate = codec_model.sample_rate
-        # del codec discriminator to free memory
-        del codec_model.discriminator
+        
+        if hasattr(codec_model, "discriminator"):
+            # del codec discriminator to free memory
+            del codec_model.discriminator
 
         # Set up codebook configuration
         self.num_audio_codebooks = codec_model.num_codebooks
@@ -83,7 +85,8 @@ class MagpieTTSDecoderModel(ModelPT):
         self.mask_token_id = cfg.get('forced_mask_token_id', num_audio_tokens + SpecialAudioToken.MASK_TOKEN.value)
         self.use_bpe_char_tokenizer = cfg.get('use_bpe_char_tokenizer', False)
         self.cfg_unconditional_prob = cfg.get('cfg_unconditional_prob', 0.0)
-        
+        self.text_input_mode = cfg.get('text_input_mode', 'full')
+        self.streaming_speech_delay = cfg.get('streaming_speech_delay', 3)
         
         self.tokenizer, _ = setup_tokenizers(
             all_tokenizers_config=cfg.text_tokenizers,
@@ -113,15 +116,23 @@ class MagpieTTSDecoderModel(ModelPT):
         for _ in range(self.num_audio_codebooks):
             audio_embeddings.append(nn.Embedding(self.num_all_tokens_per_codebook, cfg.embedding_dim))
         self.audio_embeddings = nn.ModuleList(audio_embeddings)
+        
+        if cfg.transformer_hf_backend == "custom_qwen3_moe":
+            # from transformers.models import qwen3_moe
+            # config = qwen3_moe.configuration_qwen3_moe.Qwen3MoeConfig(intermediate_size=3072, num_hidden_layers=5, num_experts=64)
+            # self.decoder = qwen3_moe.modeling_qwen3_moe.Qwen3MoeModel(config)
+            from transformers.models import qwen2_moe
+            config_qwen2 = qwen2_moe.configuration_qwen2_moe.Qwen2MoeConfig(hidden_size=1536, intermediate_size=3072, num_hidden_layers=5, num_experts=32)
+            self.decoder = qwen2_moe.modeling_qwen2_moe.Qwen2MoeModel(config_qwen2)
+        else:
+            self.transformer_backend_config = AutoConfig.from_pretrained(
+                cfg.transformer_hf_backend,
+                trust_remote_code=True,
+            )
 
-        self.transformer_backend_config = AutoConfig.from_pretrained(
-            cfg.transformer_hf_backend,
-            trust_remote_code=True,
-        )
-
-        hf_transformer = AutoModelForCausalLM.from_config(self.transformer_backend_config)
-        self.decoder = hf_transformer.model
-        self.lm_text_head = hf_transformer.lm_head
+            hf_transformer = AutoModelForCausalLM.from_config(self.transformer_backend_config)
+            self.decoder = hf_transformer.model
+            self.lm_text_head = hf_transformer.lm_head
 
         if self.use_bpe_char_tokenizer:
             # BPE char tokenizer
@@ -744,16 +755,39 @@ class MagpieTTSDecoderModel(ModelPT):
         context_text_lens = batch['context_text_tokens_lens']
         context_text_embedded = self.decoder.get_input_embeddings()(context_text_tokens)  # (B, L, E)
     
-        full_context_embedding, full_context_lens = self.join_embeddings_temporally(
-            embeddings=[context_audio_embedded, context_text_embedded, text_embedded],
-            lengths=[context_audio_codes_lens, context_text_lens, text_lens],
-        )
+        remaining_text_embedded = None
+        remaining_text_lens = None
+        if self.text_input_mode == 'full':
+            context_embedding, context_lens = self.join_embeddings_temporally(
+                embeddings=[context_audio_embedded, context_text_embedded, text_embedded],
+                lengths=[context_audio_codes_lens, context_text_lens, text_lens],
+            )
+        elif self.text_input_mode == 'streaming':
+            prompt_text_embedded = text_embedded[:,:self.streaming_speech_delay,:]
+            prompt_text_lens = torch.ones_like(text_lens) * self.streaming_speech_delay
+            context_embedding, context_lens = self.join_embeddings_temporally(
+                embeddings=[context_audio_embedded, context_text_embedded, prompt_text_embedded],
+                lengths=[context_audio_codes_lens, context_text_lens, prompt_text_lens],
+            )
+            remaining_text_embedded = text_embedded[:,self.streaming_speech_delay:,:]
+            remaining_text_lens = text_lens - self.streaming_speech_delay
+            remaining_text_mask = get_mask_from_lengths(remaining_text_lens)
+            remaining_text_embedded = remaining_text_embedded * remaining_text_mask.unsqueeze(2) # (B, T, E)
+        else:
+            raise ValueError(f"Invalid text input mode: {self.text_input_mode}")
 
         return {
-            'full_context_embedding': full_context_embedding,  # (B, T_total, E)
-            'full_context_lens': full_context_lens,  # (B,)
+            'context_embedding': context_embedding,  # (B, T_total, E)
+            'context_lens': context_lens,  # (B,)
             'context_audio_codes': context_audio_codes,  # (B, C, T')
+            'context_audio_embedded': context_audio_embedded,  # (B, T', E)
             'context_audio_codes_lens': context_audio_codes_lens,  # (B,)
+            'text_embedded': text_embedded,  # (B, L, E)
+            'text_lens': text_lens,  # (B,)
+            'context_text_tokens': context_text_tokens,  # (B, L)
+            'context_text_lens': context_text_lens,  # (B,)
+            'remaining_text_embedded': remaining_text_embedded,  # (B, T, E)
+            'remaining_text_lens': remaining_text_lens,  # (B,)
         }
 
     def slice_pred_embeddings(self, transformer_out, context_lens, target_lens):
@@ -786,8 +820,9 @@ class MagpieTTSDecoderModel(ModelPT):
 
     def process_batch(self, batch, mode="train"):
         context_tensors = self.prepare_context_tensors(batch)
-        context_embedding = context_tensors['full_context_embedding']  # (B, T_total, E)
-        context_lens = context_tensors['full_context_lens']  # (B,)
+        remaining_text_embedded = context_tensors['remaining_text_embedded']
+        context_embedding = context_tensors['context_embedding']
+        context_lens = context_tensors['context_lens']
 
         if mode == 'train' and self.cfg_unconditional_prob > 0.0:
             if torch.rand(1).item() < self.cfg_unconditional_prob:
@@ -797,6 +832,9 @@ class MagpieTTSDecoderModel(ModelPT):
                 # Keeping the dummy context same size as the context embedding makes 
                 # inference easier especially with KV caching and using a duplicated batch.
                 context_embedding = cfg_token_embedding.expand(-1, context_embedding.size(1), -1)  # (B, T_total, E)
+                # Make unconditional remaining text embedding all zeros. Simplifies the inference implementation.
+                if self.text_input_mode == 'streaming':
+                    remaining_text_embedded = torch.zeros_like(remaining_text_embedded)
 
         if 'audio_codes' not in batch:
             audio_codes, audio_codes_lens = self.audio_to_codes(batch['audio'], batch['audio_lens'])
@@ -808,6 +846,13 @@ class MagpieTTSDecoderModel(ModelPT):
         audio_codes_target = audio_codes[:, :, 1:]  # (B, C, T') Target for the decoder
         audio_codes_input = audio_codes[:, :, :-1]  # (B, C, T') Input to the decoder
         audio_codes_input_embedded = self.embed_audio_tokens(audio_codes_input) # (B, T, E) # Computing this to be use in the alignment encoder
+        if remaining_text_embedded is not None:
+            # Make remaining text embedded the same size as audio_codes_input_embedded by padding with zeros on the right
+            padding_len = audio_codes_input_embedded.size(1) - remaining_text_embedded.size(1)
+            padding_tensor = torch.zeros(remaining_text_embedded.size(0), padding_len, remaining_text_embedded.size(2), device=remaining_text_embedded.device)
+            remaining_text_embedded = torch.cat([remaining_text_embedded, padding_tensor], dim=1)
+            audio_codes_input_embedded = audio_codes_input_embedded + remaining_text_embedded
+            
 
         context_plus_audio_embedded, context_plus_audio_lens = self.join_embeddings_temporally(
             embeddings=[context_embedding, audio_codes_input_embedded],
@@ -1076,9 +1121,11 @@ class MagpieTTSDecoderModel(ModelPT):
         with torch.inference_mode():
             start_time = time.time()
             context_tensors = self.prepare_context_tensors(batch)
-            context_embedding = context_tensors['full_context_embedding']  # (B, T_total, E)
-            context_lens = context_tensors['full_context_lens']  # (B,)
-
+            context_embedding = context_tensors['context_embedding']  # (B, T_total, E)
+            context_lens = context_tensors['context_lens']  # (B,)
+            remaining_text_embedded = context_tensors['remaining_text_embedded']
+            remaining_text_lens = context_tensors['remaining_text_lens']
+            
             audio_codes_bos = torch.full(
                     (context_embedding.size(0), self.num_audio_codebooks, 1), self.audio_bos_id, device=context_embedding.device
                 ).long()
@@ -1086,7 +1133,12 @@ class MagpieTTSDecoderModel(ModelPT):
             audio_codes_input = audio_codes_bos
 
             audio_codes_input_embedded = self.embed_audio_tokens(audio_codes_input)  # (B, T, E)
-            
+            if self.text_input_mode == 'streaming':
+                remaining_text_pad_length = max_decoder_steps - remaining_text_lens.max().item() + 1
+                remaining_text_pad_tensor = torch.zeros(remaining_text_embedded.size(0), remaining_text_pad_length, remaining_text_embedded.size(2), device=remaining_text_embedded.device)
+                remaining_text_embedded = torch.cat([remaining_text_embedded, remaining_text_pad_tensor], dim=1)
+                audio_codes_input_embedded = audio_codes_input_embedded + remaining_text_embedded[:, :1, :]
+
             context_plus_audio_embedded, context_plus_audio_lens = self.join_embeddings_temporally(
                 embeddings=[context_embedding, audio_codes_input_embedded],
                 lengths=[context_lens, audio_codes_lens],
@@ -1095,13 +1147,13 @@ class MagpieTTSDecoderModel(ModelPT):
 
             actual_batch_size = context_embedding.size(0)
             if use_cfg:
-                dummy_context_embedding = self.decoder.get_input_embeddings()(
+                dummy_context_embedding_unconditional = self.decoder.get_input_embeddings()(
                     torch.full((actual_batch_size, 1), self.cfg_unk_token_id, device=context_embedding.device)
                 ) # (B, 1, E)
-                dummy_context_embedding = dummy_context_embedding.expand(-1, context_embedding.size(1), -1)  # (B, T_total, E)
+                dummy_context_embedding_unconditional_expanded = dummy_context_embedding_unconditional.expand(-1, context_embedding.size(1), -1)  # (B, T_total, E)
                 
                 dummy_context_plus_audio_embedded, _ = self.join_embeddings_temporally(
-                    embeddings=[dummy_context_embedding, audio_codes_input_embedded],
+                    embeddings=[dummy_context_embedding_unconditional_expanded, audio_codes_input_embedded],
                     lengths=[context_lens, audio_codes_lens],
                 )
                 first_inference_input = torch.cat(
@@ -1125,7 +1177,14 @@ class MagpieTTSDecoderModel(ModelPT):
             all_predictions = []
             end_indices = {}
             
+            current_text_positions = []
+            for item_idx in range(context_embedding.size(0)):
+                # 0 if we have started reading the remaining text otherwise negative (indicating how far we are before we start reading the remaining text)
+                current_text_positions.append(min_context_len - context_plus_audio_lens[item_idx])
+            current_text_positions = torch.tensor(current_text_positions, device=context_embedding.device).long()
+                
             for idx in range(max_decoder_steps):
+                current_text_positions += 1
                 if idx % 20 == 0:
                     print(f"Decoding timestep {idx}")
 
@@ -1174,24 +1233,29 @@ class MagpieTTSDecoderModel(ModelPT):
                 all_predictions.append(audio_codes_next)
                 
                 new_emb = self.embed_audio_tokens(audio_codes_next.unsqueeze(2))  # (B, 1, E)
+                new_emb_unconditional = new_emb * 1
+                if self.text_input_mode == 'streaming':
+                    _bs = context_embedding.size(0)
+                    remaining_text_embedded = remaining_text_embedded[torch.arange(_bs), current_text_positions.clamp(min=0) , :].unsqueeze(1) # (B, 1, E)
+                    new_emb = new_emb + remaining_text_embedded
+                    
                 
                 context_incomplete_mask = context_plus_audio_lens > idx + min_context_len # (B,)
                 # True if we have not yet reached the end of the context for this item
-                # import ipdb; ipdb.set_trace()
+                
                 if context_incomplete_mask.any():
+                    # If some contexts are not yet complete.
                     context_incomplete_mask = context_incomplete_mask.unsqueeze(1).unsqueeze(2).float()  # (B, 1, 1)
                     context_embedding = context_plus_audio_embedded[:,min_context_len+idx:min_context_len+idx+1,:] # (B, 1, E)
-                    next_input = context_incomplete_mask * context_embedding + (1 - context_incomplete_mask) * new_emb
+                    next_input = context_incomplete_mask * context_embedding + (1 - context_incomplete_mask) * new_emb                    
                     if use_cfg:
-                        dummy_context_embedding = torch.zeros_like(context_embedding)  # (B, 1, E) to be used in case of no context
-                        next_input_unconditional = context_incomplete_mask * dummy_context_embedding + (1 - context_incomplete_mask) * new_emb
+                        next_input_unconditional = context_incomplete_mask * dummy_context_embedding_unconditional + (1 - context_incomplete_mask) * new_emb_unconditional
                         next_input = torch.cat([next_input, next_input_unconditional], dim=0)  # (2B, 1, E)
                 else:
                     next_input = new_emb
                     if use_cfg:
-                        # Duplicate the input for CFG
-                        next_input = torch.cat([next_input, next_input], dim=0)  # (2B, 1, E)
-
+                        next_input = torch.cat([next_input, new_emb_unconditional], dim=0)  # (2B, 1, E)
+                        
                 transformer_out = self.forward(
                     inputs_embeds=next_input,
                     attention_mask=None,
