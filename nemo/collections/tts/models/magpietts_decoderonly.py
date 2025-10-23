@@ -255,6 +255,11 @@ class MagpieTTSDecoderModel(ModelPT):
             # Unstack the audio codes if they are stacked
             codes, codes_len = self.unstack_audio_codes(codes, codes_len)
         
+        if codes.size(2) < 5:
+            # If the codes are too short, we need to pad them
+            codes = torch.cat([codes, torch.zeros(codes.size(0), codes.size(1), 5 - codes.size(2), device=codes.device)], dim=2).long()
+            codes_len = codes_len + 5 - codes.size(2)
+        
         self._codec_model.eval()
         with torch.no_grad(), torch.autocast(device_type=codes.device.type, dtype=torch.float32):
             # Make a copy to avoid modifying the original tensor if it's used elsewhere
@@ -547,7 +552,7 @@ class MagpieTTSDecoderModel(ModelPT):
 
     def local_transformer_sample_autoregressive(self, dec_output, temperature=0.7, topk=80, unfinished_items={}, finished_items={}, use_cfg=False, cfg_scale=1.0):
         # dec_output: (B, E)
-        self.local_transformer.reset_cache(use_cache=True)
+        self.local_transformer.reset_cache(use_cache=False)
         dec_output = dec_output.unsqueeze(1) # (B, 1, E)
         local_transformer_input = self.local_transformer_in_projection(dec_output) # (B, 1, 128)
         all_preds = []
@@ -1039,6 +1044,50 @@ class MagpieTTSDecoderModel(ModelPT):
             for logger in self.loggers:
                 if isinstance(logger, WandbLogger) and wandb_log_dict:
                     logger.experiment.log(wandb_log_dict)
+            
+            # infer_output_no_cfg_noLT = self.infer_batch(
+            #     batch, 
+            #     max_decoder_steps=500, 
+            #     temperature=0.7, 
+            #     topk=80, 
+            #     use_local_transformer_for_inference=False, 
+            #     maskgit_n_steps=3, 
+            #     use_cfg=False, 
+            #     cfg_scale=1.0
+            # )
+            # infer_output_cfg_withLT = self.infer_batch(
+            #     batch, 
+            #     max_decoder_steps=500, 
+            #     temperature=0.7, 
+            #     topk=80, 
+            #     use_local_transformer_for_inference=self.local_transformer_type != LocalTransformerType.NO_LT,
+            #     maskgit_n_steps=3,
+            #     use_cfg=True, 
+            #     cfg_scale=2.5
+            # )
+            # pred_audio_no_cfg_noLT, pred_audio_no_cfg_noLT_lens = infer_output_no_cfg_noLT[0], infer_output_no_cfg_noLT[1]
+            # pred_audio_cfg_withLT, pred_audio_cfg_withLT_lens = infer_output_cfg_withLT[0], infer_output_cfg_withLT[1]
+
+            # for logger in self.loggers:
+            #     is_wandb = isinstance(logger, WandbLogger)
+            #     is_tb = isinstance(logger, TensorBoardLogger)
+            #     if not is_wandb and not is_tb:
+            #         raise ValueError(f"Invalid logger type for audio logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported.")
+            #     for idx in range(pred_audio_no_cfg_noLT.size(0)):
+            #         pred_audio_no_cfg_noLT_idx = pred_audio_no_cfg_noLT[idx][:pred_audio_no_cfg_noLT_lens[idx]].float().cpu().numpy()
+            #         pred_audio_cfg_withLT_idx = pred_audio_cfg_withLT[idx][:pred_audio_cfg_withLT_lens[idx]].float().cpu().numpy()
+            #         if is_wandb:
+            #             logger.experiment.log({
+            #                 "val/pred_audio_no_cfg_noLT": wandb.Audio(pred_audio_no_cfg_noLT_idx, sample_rate=self.sample_rate, caption="Inference No CFG, No LT"),
+            #                 "val/pred_audio_cfg_withLT": wandb.Audio(pred_audio_cfg_withLT_idx, sample_rate=self.sample_rate, caption="Inference CFG, With LT"),
+            #             })
+            #         if is_tb:
+            #             logger.experiment.add_audio(
+            #                 "val/pred_audio_no_cfg_noLT", pred_audio_no_cfg_noLT_idx, sample_rate=self.sample_rate, global_step=batch_idx
+            #             )
+            #             logger.experiment.add_audio(
+            #                 "val/pred_audio_cfg_withLT", pred_audio_cfg_withLT_idx, sample_rate=self.sample_rate, global_step=batch_idx
+            #             )   
 
         local_transformer_loss = batch_output['local_transformer_loss']
         val_output = {
@@ -1299,8 +1348,8 @@ class MagpieTTSDecoderModel(ModelPT):
                 new_emb_unconditional = new_emb * 1
                 if self.text_input_mode == 'streaming':
                     _bs = context_embedding.size(0)
-                    remaining_text_embedded = remaining_text_embedded[torch.arange(_bs), current_text_positions.clamp(min=0) , :].unsqueeze(1) # (B, 1, E)
-                    new_emb = new_emb + remaining_text_embedded
+                    remaining_text_embedded_current = remaining_text_embedded[torch.arange(_bs), current_text_positions.clamp(min=0) , :].unsqueeze(1) # (B, 1, E)
+                    new_emb = new_emb + remaining_text_embedded_current
                     
                 
                 context_incomplete_mask = context_plus_audio_lens > idx + min_context_len # (B,)
