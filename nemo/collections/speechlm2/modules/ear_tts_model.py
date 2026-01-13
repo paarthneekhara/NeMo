@@ -1188,8 +1188,7 @@ class RVQEARTTSModel(nn.Module):
         context_hidden_state: Tensor | None,
         subword_ids: Tensor | None,
         subword_mask: Tensor | None,
-        uncond_dec_flag: Tensor,
-        asr_speech_tokens_emb: Tensor | None,
+        uncond_dec_flag: Tensor
     ) -> Tensor:
         """Computes the final conditioning tensor by combining all sources."""
         cond = torch.zeros((1, 1, self.hidden_size), device=uncond_dec_flag.device)
@@ -1204,9 +1203,6 @@ class RVQEARTTSModel(nn.Module):
             # at least one value should be true, otherwise we can completly skip it to avoid errors
             if subword_mask is not None and subword_mask.any():
                 cond = cond + self.embed_subword(subword_ids, subword_mask)
-
-        if asr_speech_tokens_emb is not None:
-            cond = cond + asr_speech_tokens_emb
 
         # Replace with null embedding for unconditional generation
         cond = torch.where(uncond_dec_flag, self.null_emb, cond)
@@ -1364,9 +1360,11 @@ class RVQEARTTSModel(nn.Module):
             context_hidden_state,
             subword_ids,
             subword_mask,
-            uncond_dec_flag,
-            asr_speech_tokens_emb=asr_speech_tokens_emb,
+            uncond_dec_flag
         )
+
+        if asr_speech_tokens_emb is not None:
+            cond = cond + asr_speech_tokens_emb
 
         if self.config.use_gated_fusion_for_text_audio:
             inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)

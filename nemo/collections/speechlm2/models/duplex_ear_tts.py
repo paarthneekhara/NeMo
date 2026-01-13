@@ -55,6 +55,27 @@ from nemo.collections.speechlm2.parts.pretrained import (
 from nemo.utils import logging
 
 
+from nemo.collections.speechlm2.modules.asr_speech_tokenizer.modeling_whisper import WhisperVQEncoder
+from transformers import WhisperFeatureExtractor
+from nemo.collections.speechlm2.modules.asr_speech_tokenizer.utils import extract_speech_token
+def setup_asr_speech_tokenizer(model):
+    """
+    Includes a workaround for PTL auto-downcasting the codec model to bf16 with bf16-true precision.
+    """
+    if hasattr(model, "asr_speech_tokenizer") and next(model.asr_speech_tokenizer.parameters()).dtype == torch.float:
+        return  # skip if already set up and has the right dtype
+
+    with fp32_precision():
+            model.asr_speech_tokenizer = WhisperVQEncoder.from_pretrained(
+                "THUDM/glm-4-voice-tokenizer",
+            ).float().eval()
+            model.asr_tokenizer_feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                "THUDM/glm-4-voice-tokenizer",
+            )
+    for p in model.asr_speech_tokenizer.parameters():
+        p.requires_grad = False
+
+
 class DuplexEARTTS(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
         assert isinstance(cfg, dict), (
@@ -116,6 +137,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "_control_codes",
             torch.tensor([self.speech_bos_id, self.speech_eos_id, self.speech_pad_id], device=self.device),
         )
+
+        if self.cfg.get("use_asr_speech_tokens", False):
+            setup_asr_speech_tokenizer(self)
+            num_tokens = 16384
+            self.asr_speech_tokens_pad_id = num_tokens
+            self.asr_speech_tokens_emb = torch.nn.Embedding(num_tokens + 1, self.tts_model.hidden_size)
+            nn.init.zeros_(self.asr_speech_tokens_emb.weight) # init with zeros
+            self.asr_speech_tokens_head = nn.Linear(self.tts_model.hidden_size, num_tokens + 1)
 
         self._use_fsdp = False
         self._use_tp = False
@@ -324,6 +353,17 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         with ensures_target_precision(self.audio_codec_run_dtype), torch.no_grad():
             target_codes, target_codes_lens = self.audio_codec.encode(target_audio.unsqueeze(1), target_audio_lens)
 
+        with fp32_precision(), torch.no_grad():
+            if self.cfg.get("use_asr_speech_tokens", False):
+                target_audio_16khz = resample(target_audio, self.target_sample_rate, 16000)
+                # ToDo: find a more efficient way to do it (batched?)
+                asr_speech_tokens_ = extract_speech_token(
+                    self.asr_speech_tokenizer,
+                    self.asr_tokenizer_feature_extractor,
+                    [(target_audio_16khz[i].unsqueeze(0), 16000) for i in range(target_audio_16khz.shape[0])],
+                )
+                target_asr_speech_tokens = torch.tensor(asr_speech_tokens_, dtype=torch.long, device=self.device).unsqueeze(dim=-1)
+
         with fp32_precision():
             target_len = target_codes.shape[1]
 
@@ -340,6 +380,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             target_text_tokens = pad_or_truncate(target_text_tokens, pad_value=self.text_pad_id)
             non_prompt_mask = pad_or_truncate(non_prompt_mask, pad_value=0)
             aligned_position_ids = pad_or_truncate(aligned_position_ids, pad_value=0)
+
+            if self.cfg.get("use_asr_speech_tokens", False):
+                target_asr_speech_tokens = pad_or_truncate(target_asr_speech_tokens, pad_value=self.asr_speech_tokens_pad_id)
 
             # Correct attention mask padding/truncation
             B, H, L1, L2 = aligned_attention_mask.shape
@@ -441,6 +484,43 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         else:
             context_hidden_state = None
 
+        if self.cfg.get("use_asr_speech_tokens", False):
+            # add the padding token in the prompt positions as done in RVQ speech tokens
+            target_asr_speech_tokens = torch.where(
+                ~non_prompt_mask.unsqueeze(-1),                    # (B, T, 1) for broadcasting
+                torch.full_like(target_asr_speech_tokens, self.asr_speech_tokens_pad_id),  # fill with pad id
+                target_asr_speech_tokens
+            ).squeeze(-1)
+
+            # shift inputs adding pad token
+            input_asr_speech_tokens = torch.cat(
+                [
+                    torch.full(
+                        [target_asr_speech_tokens.shape[0], 1],
+                        fill_value=self.asr_speech_tokens_pad_id, # we can use pad here, because the RVQ embedding has a BOS token, so the model can reuse that one
+                        device=self.device,
+                        dtype=torch.long,
+                    ),
+                    target_asr_speech_tokens[:, :-1],
+                ],
+                dim=1,
+            )
+            asr_speech_tokens_emb = self.asr_speech_tokens_emb(input_asr_speech_tokens)
+
+            if self.cfg.get("predict_first_asr_speech_tokens", False):
+                delay = self.cfg.get("semantic_to_acoustic_delay", 2)
+                padded_codes = torch.full(
+                    (target_codes_aligned.size(0), delay, target_codes_aligned.size(-1)),
+                    self.speech_pad_id,
+                    dtype=target_codes_aligned.dtype,
+                    device=target_codes_aligned.device
+                )
+                # Prepend pad tokens and remove the last `delay` tokens to keep the same length
+                target_codes_aligned = torch.cat([padded_codes, target_codes_aligned[:, :-delay]], dim=1)
+        else:
+            asr_speech_tokens_emb = None
+            target_asr_speech_tokens = None
+
         if self._use_tp:
             tp_world_size = self.device_mesh["tensor_parallel"].size()
             if (remainder := (target_text_tokens.shape[1] - 1) % tp_world_size) != 0:
@@ -461,6 +541,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "output_lens": target_codes_lens,
             "non_prompt_mask": non_prompt_mask,
             "target_text_tokens": target_text_tokens,
+            "asr_speech_tokens_emb": asr_speech_tokens_emb,
+            "target_asr_speech_tokens": target_asr_speech_tokens,
         }
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -482,6 +564,19 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         )
         loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
         loss = sum(loss_dict.values())
+
+        if self.cfg.get("use_asr_speech_tokens", False):
+            asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states)
+            asr_tok_loss = (
+                F.cross_entropy(
+                    asr_tok_logits.transpose(1, 2),
+                    inputs["target_asr_speech_tokens"],
+                    reduction="none"
+                ) * inputs["audio_mask"]
+            ).sum() / inputs["audio_mask"].sum().clamp_min(1)
+
+            loss_dict["asr_tok_loss"] = asr_tok_loss
+            loss += asr_tok_loss * self.cfg.get("asr_tok_loss_scale", 1.0)
 
         num_frames = inputs["output_lens"].sum()
         B, T = inputs["code"].shape[:2]
@@ -596,7 +691,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         with ensures_target_precision(self.audio_codec_run_dtype), torch.no_grad():
             audio_pred, audio_len = self.audio_codec.decode(tf_audio_codes_pred, inputs["output_lens"])
 
-        return audio_pred.squeeze(1), audio_len
+        return audio_pred.squeeze(1), audio_len, tts_output
 
     def _get_generation_config(self, guidance_enabled: bool = False):
         """Get default generation config for EAR-TTS."""
@@ -623,7 +718,19 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         results = {}
         inputs = self.prepare_inputs(dataset_batch)
 
-        results["audio_tf"], results["audio_tf_len"] = self.get_teacher_force_inference_audio(dataset_batch)
+        results["audio_tf"], results["audio_tf_len"], tts_output = self.get_teacher_force_inference_audio(dataset_batch)
+
+        if self.cfg.get("use_asr_speech_tokens", False):
+            asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states[:inputs["target_asr_speech_tokens"].size(0)])
+            asr_tok_loss = (
+                F.cross_entropy(
+                    asr_tok_logits.transpose(1, 2),
+                    inputs["target_asr_speech_tokens"],
+                    reduction="none"
+                ) * inputs["audio_mask"]
+            ).sum() / inputs["audio_mask"].sum().clamp_min(1)
+            self.log(name+"_asr_tok_loss", asr_tok_loss.to(self.device), on_epoch=True, sync_dist=True)
+
         if use_dataloader_init:
             # cut it on prompt
             init_inputs = {
@@ -633,6 +740,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 "context_hidden_state": inputs["context_hidden_state"],
                 "subword_ids": inputs["subword_ids"],
                 "subword_mask": inputs["subword_mask"],
+                "asr_speech_tokens_emb": inputs["asr_speech_tokens_emb"],
             }
             # cut init_inputs to consider only the prompt
             for key in init_inputs:
@@ -785,11 +893,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long().repeat(B)
                 new_dataset_batch["audio_prompt"] = speaker_audio
                 new_dataset_batch["audio_prompt_lens"] = speaker_audio_lens
-                self.run_evaluation_one_batch(name, new_dataset_batch)
+                self.run_evaluation_one_batch(name, new_dataset_batch, use_dataloader_init=True if self.cfg.get("use_asr_speech_tokens", None) else False)
 
             # run inference using dataloader speaker references
             else:
-                self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=False)
+                self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=True if self.cfg.get("use_asr_speech_tokens", None) else False)
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -998,6 +1106,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         guidance_enabled=True,
         generation_config=None,
         ignore_eos_flag_stop=True,
+        asr_speech_tokens_emb=None,
     ):
         """
         Runs a single autoregressive prediction step to infer audio codec codes.
@@ -1045,11 +1154,12 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "guidance_enabled": guidance_enabled,
             "generation_config": generation_config,
             "ignore_eos_flag_stop": ignore_eos_flag_stop,
+            "asr_speech_tokens_emb": asr_speech_tokens_emb,
         }
 
         outputs = self.tts_model(**inputs)
 
-        return outputs["codes"], outputs["past_key_values"]
+        return outputs["codes"], outputs["past_key_values"], outputs["hidden_states"]
 
     @torch.no_grad()
     def decode_one_audio_step(self, gen_audio_codes_history, number_prev_tokens=None):
@@ -1183,6 +1293,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         audio_pred = None
         audio_pred_len = torch.zeros(B, device=self.device, dtype=torch.long)
 
+        asr_speech_tokens_emb = init_inputs["asr_speech_tokens_emb"][:, -1:]
+
         for i in range(max_steps):
             step_start = time.time()
             # current subword id is always seem
@@ -1195,8 +1307,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
             # create subword_mask
             current_subword_mask = subword_mask[:, i].unsqueeze(-1)
-
-            code, past_key_values = self.infer_codes_one_step(
+    
+            code, past_key_values, hidden_states = self.infer_codes_one_step(
                 current_subword_id=current_subword_id,
                 prev_subword_id=prev_subword_id,
                 current_subword_mask=current_subword_mask,
@@ -1204,8 +1316,23 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 past_key_values=past_key_values,
                 guidance_enabled=guidance_enabled,
                 generation_config=generation_config,
+                asr_speech_tokens_emb=asr_speech_tokens_emb,
                 ignore_eos_flag_stop=True,
-            )
+            )  
+
+        
+            if self.cfg.get("use_asr_speech_tokens", False): 
+                if guidance_enabled and self.cfg.get("asr_speech_tokens_use_guidance", False):
+                    hidden_states, uncond_hidden_states = hidden_states.chunk(2, dim=0)
+                    logits = self.asr_speech_tokens_head(hidden_states + (generation_config["guidance_scale"] * (hidden_states - uncond_hidden_states)))
+                else:
+                    hidden_states, _ = hidden_states.chunk(2, dim=0)
+                    logits = self.asr_speech_tokens_head(hidden_states)
+
+                cur_asr_speech_tokens = logits.argmax(dim=-1)[:, -1].unsqueeze(-1)
+                asr_speech_tokens_emb = self.asr_speech_tokens_emb(cur_asr_speech_tokens)
+            else:
+                asr_speech_tokens_emb = None
 
             # cache audio tokens
             gen_audio_codes[:, i] = code.squeeze(1)
