@@ -133,6 +133,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         add_audio_prompt: bool = True,
         audio_prompt_duration: float = 3.0,
         num_delay_speech_tokens: int = 0,
+        add_system_prompt: bool = False,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -145,6 +146,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         self.add_audio_prompt = add_audio_prompt
         self.audio_prompt_duration = audio_prompt_duration
         self.num_delay_speech_tokens = num_delay_speech_tokens
+        self.add_system_prompt = add_system_prompt
 
         # compute source and target samples_per_frame
         self.source_samples_per_frame = int(self.source_sample_rate * self.frame_length)
@@ -155,6 +157,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
+
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_audio, target_audio_lens = collate_audio(
             cuts.resample(self.target_sample_rate), recording_field="target_audio"
@@ -190,6 +193,13 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 self.source_samples_per_frame,
             )
 
+        if self.add_system_prompt:
+            system_prompts, system_prompts_lens, system_prompts_raw = collate_system_prompt(cuts, self.tokenizer)
+        else:
+            system_prompts = None
+            system_prompts_lens = None
+            system_prompts_raw = None
+
         # add audio prompt if needed
         (
             target_text_tokens,
@@ -212,6 +222,8 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
             source_audio_lens,
             audio_prompt,
             audio_prompt_lens,
+            system_prompts,
+            system_prompts_lens
         )
 
         # create non_prompt_mask that should mask desc plus audio prompt if used
@@ -269,6 +281,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
             ],
             "audio_prompt": audio_prompt,
             "audio_prompt_lens": audio_prompt_lens,
+            "system_prompts_raw": system_prompts_raw,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
         }
 
@@ -284,6 +297,8 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         source_audio_lens: torch.Tensor,
         audio_prompt: torch.Tensor,
         audio_prompt_lens: torch.Tensor,
+        system_prompts: torch.Tensor = None,
+        system_prompts_lens: torch.Tensor = None,
     ):
         """
         Prepend an audio-based speaker prompt and aligned text tokens to the Duplex S2S inputs.
@@ -361,13 +376,15 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         source_audio_ = []
         target_audio_ = []
         prompt_lens = []
-
         for i in range(target_text_tokens.size(0)):
-            first_text_frame = torch.tensor(
-                [self.tokenizer.eos],
-                dtype=torch.long,
-                device=target_text_tokens.device,
-            )
+            if system_prompts is not None:
+                text_prompt = system_prompts[i][:system_prompts_lens[i]]
+            else:
+                text_prompt = torch.tensor(
+                    [self.tokenizer.eos],
+                    dtype=torch.long,
+                    device=target_text_tokens.device,
+                )
 
             if self.add_audio_prompt:
                 # Compute audio prompt duration in samples (rounded to frame boundaries)
@@ -398,20 +415,20 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
 
                 new_target_text_tokens = torch.cat(
                     [
-                        first_text_frame.to(target_text_tokens.dtype),
+                        text_prompt.to(target_text_tokens.dtype),
                         prompt_audio_text_pad,
                         target_text_tokens[i],
                     ]
                 )
                 target_text_tokens_.append(new_target_text_tokens)
-                target_token_lens[i] += len(first_text_frame) + prompt_audio_text_pad_size
+                target_token_lens[i] += len(text_prompt) + prompt_audio_text_pad_size
 
-                new_source_tokens = torch.cat([first_text_frame, prompt_audio_text_pad, source_tokens[i]])
+                new_source_tokens = torch.cat([text_prompt, prompt_audio_text_pad, source_tokens[i]])
                 source_tokens_.append(new_source_tokens)
-                source_token_lens[i] += len(first_text_frame) + prompt_audio_text_pad_size
+                source_token_lens[i] += len(text_prompt) + prompt_audio_text_pad_size
 
                 # Silence in source audio during prompt processing
-                pad_size_src = (len(first_text_frame) * self.source_samples_per_frame) + prompt_audio.size(1)
+                pad_size_src = (len(text_prompt) * self.source_samples_per_frame) + prompt_audio.size(1)
                 pad_audio_src = torch.zeros(
                     pad_size_src,
                     device=source_audio.device,
@@ -421,7 +438,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 source_audio_lens[i] += pad_size_src
 
                 # Insert prompt audio in the target channel
-                pad_size_tgt = len(first_text_frame) * self.target_samples_per_frame
+                pad_size_tgt = len(text_prompt) * self.target_samples_per_frame
                 pad_audio_tgt = torch.zeros(
                     pad_size_tgt,
                     device=target_audio.device,
@@ -430,17 +447,17 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 target_audio_.append(torch.cat([pad_audio_tgt, prompt_audio[i], target_audio[i]]))
                 target_audio_lens[i] += pad_size_tgt + prompt_audio.size(1)
 
-                prompt_lens.append(len(first_text_frame) + prompt_audio_text_pad_size - 1)
+                prompt_lens.append(len(text_prompt) + prompt_audio_text_pad_size - 1)
 
             else:
                 # Add only a single text-frame (EOS) as prompt
-                target_text_tokens_.append(torch.cat([first_text_frame, target_text_tokens[i]]))
-                target_token_lens[i] += len(first_text_frame)
+                target_text_tokens_.append(torch.cat([text_prompt, target_text_tokens[i]]))
+                target_token_lens[i] += len(text_prompt)
 
-                source_tokens_.append(torch.cat([first_text_frame, source_tokens[i]]))
-                source_token_lens[i] += len(first_text_frame)
+                source_tokens_.append(torch.cat([text_prompt, source_tokens[i]]))
+                source_token_lens[i] += len(text_prompt)
 
-                pad_size_src = len(first_text_frame) * self.source_samples_per_frame
+                pad_size_src = len(text_prompt) * self.source_samples_per_frame
                 pad_audio_src = torch.zeros(
                     pad_size_src,
                     device=source_audio.device,
@@ -449,7 +466,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 source_audio_.append(torch.cat([pad_audio_src, source_audio[i]]))
                 source_audio_lens[i] += pad_size_src
 
-                pad_size_tgt = len(first_text_frame) * self.target_samples_per_frame
+                pad_size_tgt = len(text_prompt) * self.target_samples_per_frame
                 pad_audio_tgt = torch.zeros(
                     pad_size_tgt,
                     device=target_audio.device,
@@ -458,7 +475,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 target_audio_.append(torch.cat([pad_audio_tgt, target_audio[i]]))
                 target_audio_lens[i] += pad_size_tgt
 
-                prompt_lens.append(len(first_text_frame))
+                prompt_lens.append(len(text_prompt))
 
         target_text_tokens = collate_vectors(target_text_tokens_, padding_value=text_pad_id)
         source_tokens = collate_vectors(source_tokens_, padding_value=text_pad_id)
@@ -538,6 +555,48 @@ def add_speech_delay(
     source_audio_lens = source_audio_lens + extra_source_samples
 
     return source_audio, source_audio_lens, target_audio, target_audio_lens
+
+
+def collate_system_prompt(
+    cuts: CutSet,
+    tokenizer: TokenizerSpec,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collate system prompts from cuts.
+    System prompts should be stored in cut.custom['system_prompt'].
+    """
+    pad_id = get_pad_id(tokenizer)
+    tokens = []
+    system_prompts_raw = []
+    for c in cuts:
+        # Check if system prompt exists in custom field
+        if c.custom and c.custom.get("system_prompt", None):
+            prompt_text = c.custom["system_prompt"]
+            tokens.append(
+                torch.as_tensor(
+                    [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos], dtype=torch.long
+                )
+            )
+            system_prompts_raw.append(prompt_text)
+        else:
+            # use dataset type name (defined on the config)
+            if getattr(c, "type", None):
+                prompt_text = c.type
+                tokens.append(
+                    torch.as_tensor(
+                        [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos], dtype=torch.long
+                    )
+                )
+                system_prompts_raw.append(prompt_text)
+            else:
+                print("No system prompt and type on the config was provided ! Using a eos token as prompt")
+                # No system prompt for this cut, add just a eos that indicates that the prompt is finished
+                tokens.append(torch.as_tensor([tokenizer.eos], dtype=torch.long))
+                system_prompts_raw.append("")
+
+    token_lens = torch.tensor([len(tt) for tt in tokens])
+    tokens = collate_vectors(tokens, padding_value=pad_id)
+    return tokens, token_lens, system_prompts_raw
 
 
 def get_audio_prompt(

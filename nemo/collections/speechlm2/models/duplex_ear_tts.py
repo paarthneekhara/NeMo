@@ -749,13 +749,73 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                         [init_inputs[key][i, :plen] for i, plen in enumerate(dataset_batch["prompt_lens"])]
                     )
         else:
+            """
+            def compare_init_inputs(dl_inputs, model_inputs):
+                all_keys = set(dl_inputs.keys()) | set(model_inputs.keys())
+                
+                print(f"{'Key':<25} | {'Match?':<8} | {'Details'}")
+                print("-" * 60)
+                
+                for key in all_keys:
+                    if key not in dl_inputs:
+                        print(f"{key:<25} | MISSING  | Key not in dataloader_init_inputs")
+                        continue
+                    if key not in model_inputs:
+                        print(f"{key:<25} | MISSING  | Key not in model.get_init_inputs")
+                        continue
+                        
+                    t1 = dl_inputs[key]
+                    t2 = model_inputs[key]
+                    
+                    # Handle NoneTypes
+                    if t1 is None or t2 is None:
+                        if t1 == t2:
+                            print(f"{key:<25} | OK       | Both are None")
+                        else:
+                            print(f"{key:<25} | FAIL     | One is None, other is {type(t1 or t2)}")
+                        continue
+
+                    # Compare Shapes
+                    if t1.shape != t2.shape:
+                        print(f"{key:<25} | FAIL     | Shape mismatch: {list(t1.shape)} vs {list(t2.shape)}")
+                        continue
+                        
+                    # Compare Values
+                    if torch.allclose(t1.to(t2.device), t2, atol=1e-6):
+                        print(f"{key:<25} | OK       | Exact/Close match")
+                    else:
+                        diff = (t1.to(t2.device) - t2).abs().max()
+                        print(f"{key:<25} | FAIL     | Value mismatch (Max Diff: {diff:.6f})")
+
+            # cut it on prompt
+            init_inputs = {
+                "code": inputs["code"],
+                "audio_mask": inputs["audio_mask"],
+                "non_prompt_mask": inputs["non_prompt_mask"],
+                "context_hidden_state": inputs["context_hidden_state"],
+                "subword_ids": inputs["subword_ids"],
+                "subword_mask": inputs["subword_mask"],
+                "asr_speech_tokens_emb": inputs["asr_speech_tokens_emb"],
+            }
+            # cut init_inputs to consider only the prompt
+            for key in init_inputs:
+                if init_inputs[key] is not None:
+                    init_inputs[key] = torch.stack(
+                        [init_inputs[key][i, :plen] for i, plen in enumerate(dataset_batch["prompt_lens"])]
+                    )
+            
+            dataloader_init_inputs = copy.deepcopy(init_inputs)
+            """
             # set init inputs and get it
             self.set_init_inputs(
                 speaker_audio=dataset_batch["audio_prompt"],
                 speaker_audio_lens=dataset_batch["audio_prompt_lens"],
+                system_prompt=dataset_batch["system_prompts_raw"][0], # use the first position of the batch as system prompt
             )
             init_inputs = self.get_init_inputs(B=inputs["subword_ids"].size(0))
-
+            # Run the comparison
+            # compare_init_inputs(dataloader_init_inputs, init_inputs)
+            
         # remove the prompt from the target_text_tokens to emulate S2S connected inference
         next_subword_ids = torch.stack(
             [
@@ -893,11 +953,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long().repeat(B)
                 new_dataset_batch["audio_prompt"] = speaker_audio
                 new_dataset_batch["audio_prompt_lens"] = speaker_audio_lens
-                self.run_evaluation_one_batch(name, new_dataset_batch, use_dataloader_init=True if self.cfg.get("use_asr_speech_tokens", None) else False)
+                self.run_evaluation_one_batch(name, new_dataset_batch, use_dataloader_init=False)
 
             # run inference using dataloader speaker references
             else:
-                self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=True if self.cfg.get("use_asr_speech_tokens", None) else False)
+                self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=False)
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -964,20 +1024,25 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             prompt_audio_text_pad_size = int(prompt_audio_size // self.target_samples_per_frame)
 
         # create a eos token id
-        first_text_frame = torch.tensor([self.tokenizer.eos], dtype=torch.long, device=self.device)
+        if system_prompt is not None and self.cfg.get("use_system_prompt", None) and system_prompt != "":
+            text_prompt = torch.as_tensor(
+                    [self.tokenizer.bos] + self.tokenizer.text_to_ids(system_prompt) + [self.tokenizer.eos], dtype=torch.long, device=self.device
+                )
+        else:
+            text_prompt = torch.tensor([self.tokenizer.eos], dtype=torch.long, device=self.device)
 
         # create a padding tensor
         prompt_audio_text_pad = (
-            torch.ones(prompt_audio_text_pad_size, device=self.device, dtype=first_text_frame.dtype) * self.text_pad_id
+            torch.ones(prompt_audio_text_pad_size, device=self.device, dtype=text_prompt.dtype) * self.text_pad_id
         )
         prompt_audio_text_pad[-1] = self.tokenizer.eos
 
         # Prepend an initial text EOS token followed by padding tokens that match
         # the number of audio-prompt frames (in text-token units).
-        target_text_tokens = torch.cat([first_text_frame, prompt_audio_text_pad.to(first_text_frame.dtype)])
+        target_text_tokens = torch.cat([text_prompt, prompt_audio_text_pad.to(text_prompt.dtype)])
 
         # create pad audio for the description
-        pad_size = first_text_frame.size(-1) * self.target_samples_per_frame
+        pad_size = text_prompt.size(-1) * self.target_samples_per_frame
         pad_audio = (
             torch.zeros(pad_size, device=prompt_audio.device, dtype=prompt_audio.dtype)
             .unsqueeze(0)
@@ -987,6 +1052,16 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         # repeat to reaches the batch size
         target_text_tokens = target_text_tokens.unsqueeze(0).repeat(prompt_audio.size(0), 1)
         target_audio = torch.cat([pad_audio, prompt_audio], dim=1)
+
+        if self.cfg.get("use_asr_speech_tokens", False):
+            target_audio_16khz = resample(target_audio, self.target_sample_rate, 16000)
+            # ToDo: find a more efficient way to do it (batched?)
+            asr_speech_tokens_ = extract_speech_token(
+                self.asr_speech_tokenizer,
+                self.asr_tokenizer_feature_extractor,
+                [(target_audio_16khz[i].unsqueeze(0), 16000) for i in range(target_audio_16khz.shape[0])],
+            )
+            target_asr_speech_tokens = torch.tensor(asr_speech_tokens_, dtype=torch.long, device=self.device).unsqueeze(dim=-1)
 
         # extract code codes
         target_audio_len = torch.tensor(
@@ -1024,6 +1099,32 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         # set the extra self.speech_pad_id at first 1 position in non_prompt_mask
         code[row_idx, pos] = self.speech_pad_id
 
+        if self.cfg.get("use_asr_speech_tokens", False):
+            # add the padding token in the prompt positions as done in RVQ speech tokens
+            target_asr_speech_tokens = torch.where(
+                ~non_prompt_mask.unsqueeze(-1).bool(),                    # (B, T, 1) for broadcasting
+                torch.full_like(target_asr_speech_tokens, self.asr_speech_tokens_pad_id),  # fill with pad id
+                target_asr_speech_tokens
+            ).squeeze(-1)
+
+            # shift inputs adding pad token
+            input_asr_speech_tokens = torch.cat(
+                [
+                    torch.full(
+                        [target_asr_speech_tokens.shape[0], 1],
+                        fill_value=self.asr_speech_tokens_pad_id, # we can use pad here, because the RVQ embedding has a BOS token, so the model can reuse that one
+                        device=self.device,
+                        dtype=torch.long,
+                    ),
+                    target_asr_speech_tokens[:, :-1],
+                ],
+                dim=1,
+            )
+            asr_speech_tokens_emb = self.asr_speech_tokens_emb(input_asr_speech_tokens)
+        else:
+            asr_speech_tokens_emb = None
+            target_asr_speech_tokens = None
+
         init_inputs = {
             "code": code[:, :-1],
             "audio_mask": non_prompt_mask.bool()[
@@ -1033,6 +1134,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "subword_ids": subword_ids[:, :-1],
             "subword_mask": subword_mask.bool()[:, :-1],
             "non_prompt_mask": non_prompt_mask.bool()[:, :-1],
+            "asr_speech_tokens_emb": asr_speech_tokens_emb[:, :-1] if asr_speech_tokens_emb is not None else None,
         }
         # register to acess later
         for k, v in init_inputs.items():
@@ -1052,6 +1154,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "subword_ids",
             "subword_mask",
             "non_prompt_mask",
+            "asr_speech_tokens_emb"
         ],
     ):
         """
@@ -1293,7 +1396,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         audio_pred = None
         audio_pred_len = torch.zeros(B, device=self.device, dtype=torch.long)
 
-        asr_speech_tokens_emb = init_inputs["asr_speech_tokens_emb"][:, -1:]
+        asr_speech_tokens_emb = init_inputs["asr_speech_tokens_emb"][:, -1:] if init_inputs["asr_speech_tokens_emb"] is not None else None
 
         for i in range(max_steps):
             step_start = time.time()
