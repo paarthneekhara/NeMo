@@ -248,6 +248,7 @@ def inference(cfg):
         model.set_init_inputs(
             speaker_audio=inputs["context_audio"],
             speaker_audio_lens=inputs["context_audio_lengths"],
+            system_prompt=cfg.get("inference_system_prompt", None)
         )
         init_inputs = model.get_init_inputs(B=inputs["input_ids"].size(0))
 

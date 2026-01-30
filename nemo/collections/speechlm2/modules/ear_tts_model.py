@@ -467,7 +467,8 @@ def build_vocabs(
     return subword_id_to_char_ids, char_vocab, subword_padding_idx
 
 
-@torch.compile
+# @torch.compile
+@torch._dynamo.disable
 def depthsum_encoding_step(
     embs: Tensor,
     r: Tensor,

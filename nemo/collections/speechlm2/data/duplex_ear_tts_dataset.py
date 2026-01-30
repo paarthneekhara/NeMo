@@ -17,6 +17,7 @@ import re
 import torch
 import torch.nn.functional as F
 import torch.utils.data
+from copy import deepcopy
 from lhotse import CutSet, Seconds, compute_num_frames
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
@@ -589,7 +590,7 @@ def collate_system_prompt(
                 )
                 system_prompts_raw.append(prompt_text)
             else:
-                print("No system prompt and type on the config was provided ! Using a eos token as prompt")
+                logging.warning("No system prompt or dataset type defined on the config! Using a eos token as system prompt!")
                 # No system prompt for this cut, add just a eos that indicates that the prompt is finished
                 tokens.append(torch.as_tensor([tokenizer.eos], dtype=torch.long))
                 system_prompts_raw.append("")
@@ -654,6 +655,9 @@ def get_audio_prompt(
         audio_prompt_lens = torch.tensor(audio_prompt_lens).long()
 
     else:
+        # Sanitize cuts to remove out-of-bounds supervisions
+        # this prevents crashes when sampling from truncated audio.
+        cuts = sanitize_cuts(cuts)
         # sample a reference turn from the target-role speakers
         audio_prompt, audio_prompt_lens = collate_random_turn_audio(
             cuts.resample(target_sample_rate),
@@ -662,6 +666,52 @@ def get_audio_prompt(
         )
 
     return audio_prompt, audio_prompt_lens
+
+
+def sanitize_cuts(cuts: CutSet) -> CutSet:
+    """
+    Adjusts supervisions to fit within the cut's truncated duration.
+    
+    - If a supervision extends beyond the cut end, it is TRUNCATED (using deepcopy).
+    - If a supervision starts after the cut end, it is DROPPED.
+
+    Args:
+        cuts (CutSet): The batch of cuts to sanitize.
+
+    Returns:
+        CutSet: A new CutSet with valid, potentially truncated supervisions.
+    """
+    sanitized_list = []
+    
+    for cut in cuts:
+        valid_supervisions = []
+        for sup in cut.supervisions:
+            # Case 1: Supervision starts after the audio ends -> Drop
+            if sup.start >= cut.duration:
+                continue
+            
+            # Case 2: Supervision starts inside but ends after the audio -> Truncate
+            if sup.end > cut.duration:
+                # Calculate the remaining duration available in the audio
+                new_duration = cut.duration - sup.start
+                
+                if new_duration <= 0:
+                    continue
+
+                # Create a deepcopy and update duration
+                new_sup = deepcopy(sup)
+                new_sup.duration = new_duration
+                valid_supervisions.append(new_sup)
+                
+            # Case 3: Supervision is fully inside -> Keep
+            else:
+                valid_supervisions.append(sup)
+
+        # Update the cut with the cleaned list
+        cut.supervisions = valid_supervisions
+        sanitized_list.append(cut)
+
+    return cuts.from_cuts(sanitized_list)
 
 
 def collate_random_turn_audio(
@@ -700,17 +750,28 @@ def collate_random_turn_audio(
     for cut in cuts:
         # Filter supervisions matching roles
         matching_supervisions = [s for s in cut.supervisions if s.speaker in roles]
+        # if there is no target speaker sample, prompt with a silence audio
+        if len(matching_supervisions) == 0:
+            # Create 5 seconds of silence
+            target_duration = 5.0
+            num_samples = int(target_duration * cut.sampling_rate)
 
-        # Randomly select one supervision
-        selected_supervision = random.choice(matching_supervisions)
+            # Create a zero tensor of shape [T] (assuming mono audio)
+            silence_tensor = torch.zeros(num_samples, dtype=torch.float32)
+            selected_turn_audios.append(silence_tensor)
+            selected_turn_audios_lens.append(num_samples)
+            logging.warning("There is no target speaker supervision available on this sample! Using a silence audio as audio prompt!")
+        else:
+            # Randomly select one supervision
+            selected_supervision = random.choice(matching_supervisions)
 
-        # Truncate audio according to supervision
-        truncated_audio = cut.truncate(
-            offset=max(0, selected_supervision.start), duration=selected_supervision.duration
-        ).load_custom(recording_field)
+            # Truncate audio according to supervision
+            truncated_audio = cut.truncate(
+                offset=max(0, selected_supervision.start), duration=selected_supervision.duration
+            ).load_custom(recording_field)
 
-        selected_turn_audios.append(truncated_audio.squeeze(0))
-        selected_turn_audios_lens.append(truncated_audio.shape[-1])
+            selected_turn_audios.append(truncated_audio.squeeze(0))
+            selected_turn_audios_lens.append(truncated_audio.shape[-1])
 
     return collate_vectors(selected_turn_audios, padding_value=0), torch.tensor(selected_turn_audios_lens)
 

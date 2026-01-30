@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-
+import datetime
 import torch
 from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
@@ -23,14 +23,16 @@ from nemo.collections.speechlm2.parts.pretrained import load_checkpoint, set_mod
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
-
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 @hydra_runner(config_path="conf", config_name="duplex_eartts")
 def train(cfg):
     OmegaConf.resolve(cfg)
-    torch.distributed.init_process_group(backend="nccl")
+    torch.distributed.init_process_group(
+        backend="nccl", 
+        timeout=datetime.timedelta(seconds=int(cfg.trainer.strategy.get("timeout", 3600)))
+    )
     torch.set_float32_matmul_precision("medium")
     torch.backends.cudnn.allow_tf32 = True
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
@@ -64,7 +66,6 @@ def train(cfg):
         add_system_prompt=cfg.model.get("use_system_prompt", False)
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
-
     trainer.fit(model, datamodule)
 
 
