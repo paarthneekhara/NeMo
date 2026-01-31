@@ -646,6 +646,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         self.log("weights/mean", weight_mean, on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_start(self) -> None:
+        if torch.distributed.is_initialized():
+            self.trainer.strategy.model.require_backward_grad_sync = False
+
         ensures_codec_target_dtype(
             self
         )  # potentially reloads the audio codec to make sure it's in target codec precision
@@ -656,6 +659,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         self.secs = SECS(self.cfg.get("scoring_se", "titanet_large")).reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
+        if torch.distributed.is_initialized():
+            self.trainer.strategy.model.require_backward_grad_sync = True
         asr_bleu = self.asr_bleu.compute()
         for k, m in asr_bleu.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -703,148 +708,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "eos_threshold": -3.0,
         }
 
-
+    @torch.inference_mode()
     def run_evaluation_one_batch(self, name, dataset_batch, use_dataloader_init=False):
-        """
-        Runs teacher-force evaluation and scoring for a single data batch, logging metrics.
-
-        Args:
-            name (str): Name/id for the batch (for logging).
-            dataset_batch (dict): Batch of data inputs, supports batched text/audio/etc.
-            use_dataloader_init (bool, optional): If True, use dataloader initialization for prompts.
-
-        Returns:
-            None. Outputs are logged and stored in result buffers.
-        """
-        results = {}
-        inputs = self.prepare_inputs(dataset_batch)
-
-        results["audio_tf"], results["audio_tf_len"], tts_output = self.get_teacher_force_inference_audio(dataset_batch)
-
-        if self.cfg.get("use_asr_speech_tokens", False):
-            asr_tok_logits = self.asr_speech_tokens_head(tts_output.hidden_states[:inputs["target_asr_speech_tokens"].size(0)])
-            asr_tok_loss = (
-                F.cross_entropy(
-                    asr_tok_logits.transpose(1, 2),
-                    inputs["target_asr_speech_tokens"],
-                    reduction="none"
-                ) * inputs["audio_mask"]
-            ).sum() / inputs["audio_mask"].sum().clamp_min(1)
-            self.log(name+"_asr_tok_loss", asr_tok_loss.to(self.device), on_epoch=True, sync_dist=True)
-
-        # remove the prompt from the target_text_tokens to emulate S2S connected inference
-        next_subword_ids = torch.stack(
-            [
-                inputs["subword_ids"][i, plen:]  # slice each element
-                for i, plen in enumerate(dataset_batch["prompt_lens"])
-            ]
-        )
-
-        # remove prompt padding from the user audio as autoregressive inference does not return the prompt
-        dataset_batch["source_audio"] = dataset_batch["source_audio"][
-            :, -int(next_subword_ids.size(-1) * self.source_samples_per_frame) :
-        ]
-
-        # clean prompt from the audio
-        results["audio_tf"] = results["audio_tf"][:, -int(next_subword_ids.size(-1) * self.target_samples_per_frame) :]
-        # remove prompt from target audio
-        target_audio_no_prompt = dataset_batch["target_audio"][
-            :, -int(next_subword_ids.size(-1) * self.target_samples_per_frame) :
-        ]
-        target_audio_no_prompt_lens = dataset_batch["target_audio_lens"] - (
-            torch.tensor(
-                dataset_batch["prompt_lens"],
-                dtype=torch.long,
-                device=dataset_batch["target_audio_lens"].device,
-            )
-            * self.target_samples_per_frame
-        )
-
-        with fp32_precision():  # resample is fragile to bfloat16 default dtype
-            metric_audio_pred = results["audio_tf"]
-            metric_audio_pred_lens = target_audio_no_prompt_lens
-
-            # resample audio to the asr sampling rate
-            metric_audio_pred = resample(metric_audio_pred, self.target_sample_rate, 16000)
-            metric_audio_pred_lens = (metric_audio_pred_lens / self.target_sample_rate * 16000).to(torch.long)
-            # reshape target audio without prompt
-            target_audio_no_prompt_16khz = resample(target_audio_no_prompt, self.target_sample_rate, 16000)
-            target_audio_no_prompt_lens_16khz = (target_audio_no_prompt_lens / self.target_sample_rate * 16000).to(
-                torch.long
-            )
-            if self.cfg.get("use_GT_transcriptions_for_metrics", True):
-                # use target audio transcription for metrics
-                target_asr_texts = self.asr_bleu.asr.transcribe(
-                    [
-                        audio[:alen]
-                        for audio, alen in zip(target_audio_no_prompt_16khz, target_audio_no_prompt_lens_16khz)
-                    ],
-                    batch_size=target_audio_no_prompt_16khz.shape[0],
-                    verbose=False,
-                )
-                metric_text = [asr_hyp.text for asr_hyp in target_asr_texts]
-            else:
-                metric_text = dataset_batch["target_texts"]
-
-            asr_hyps = self.asr_bleu.update(
-                name=name,
-                refs=metric_text,
-                pred_audio=metric_audio_pred,
-                pred_audio_lens=metric_audio_pred_lens,
-            )
-
-            self.intelligibility.update(
-                name=name,
-                refs=metric_text,
-                pred_audio=metric_audio_pred,
-                pred_audio_lens=metric_audio_pred_lens,
-                asr_hyps=asr_hyps,
-            )
-
-            # add ground truth intelligibility metrics
-            self.intelligibility.update(
-                name=name + "_gt",
-                refs=dataset_batch["target_texts"],
-                pred_audio=target_audio_no_prompt_16khz,
-                pred_audio_lens=target_audio_no_prompt_lens_16khz,
-                asr_hyps=(
-                    metric_text if self.cfg.get("use_GT_transcriptions_for_metrics", True) else None
-                ),  # reuse GT transcription
-            )
-
-            self.secs.update(
-                name=name,
-                target_audio=target_audio_no_prompt_16khz,
-                target_audio_lens=target_audio_no_prompt_lens_16khz,
-                pred_audio=metric_audio_pred,
-                pred_audio_lens=metric_audio_pred_lens,
-            )
-
-            eou_labels = generate_multiturn_speaking_mask(
-                next_subword_ids, bos_token_id=self.text_bos_id, eos_token_id=self.text_eos_id
-            )
-
-            self.results_logger.update(
-                name=name,
-                refs=dataset_batch["target_texts"],
-                hyps=metric_text,
-                asr_hyps=asr_hyps,
-                samples_id=dataset_batch['sample_id'],
-                pred_audio=results["audio_tf"].float(),
-                pred_audio_tf=results["audio_tf"].float(),
-                pre_audio_trimmed=None,
-                reference_audio=dataset_batch["audio_prompt"].float(),
-                target_audio=target_audio_no_prompt.float(),
-                pred_audio_sr=self.target_sample_rate,
-                user_audio=dataset_batch["source_audio"].float(),
-                user_audio_sr=self.source_sample_rate,
-                eou_pred=eou_labels,
-                fps=self.target_fps,
-                results=results if self.cfg.get("dump_tokens_text", False) else None,
-                tokenizer=self.tokenizer,
-            )
-
-    def run_autoregressive_evaluation(self, name, dataset_batch, use_dataloader_init=False):
         """
         Runs evaluation and scoring for a single data batch, logging metrics and updating result buffers.
 
@@ -1079,6 +944,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 tokenizer=self.tokenizer,
             )
 
+    @torch.inference_mode()
     def validation_step(self, batch: dict, batch_idx: int):
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
@@ -1101,7 +967,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # run inference using dataloader speaker references
             else:
                 self.run_evaluation_one_batch(name, dataset_batch, use_dataloader_init=False)
-   
+
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
 
@@ -1279,11 +1145,14 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             "non_prompt_mask": non_prompt_mask.bool()[:, :-1],
             "asr_speech_tokens_emb": asr_speech_tokens_emb[:, :-1] if asr_speech_tokens_emb is not None else None,
         }
-        # register to acess later
+        self._init_input_cache = {}
         for k, v in init_inputs.items():
-            name = f"init_input_{k}"
-            if v is not None:
-                self.register_buffer(name, v)
+            if v is None:
+                self._init_input_cache[k] = None
+            else:
+                # clone → removes inference tensor flag
+                # detach → ensures no graph refs
+                self._init_input_cache[k] = v.detach().clone()
 
         return init_inputs
 
@@ -1325,23 +1194,22 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         init_inputs = {}
         for name in init_inputs_names:
-            buf_name = f"init_input_{name}"
-            buf = getattr(self, buf_name, None)
+            buf = self._init_input_cache.get(name, None)
 
             if buf is None:
                 init_inputs[name] = None
                 continue
 
-            # Use as-is if batch matches
+            # Batch already matches
             if buf.shape[0] == B:
                 init_inputs[name] = buf
             else:
-                # Otherwise, assume batch=1 and expand to target B
+                # assume batch=1 warmup → expand
                 init_inputs[name] = buf[:1].expand(B, *buf.shape[1:])
 
         return init_inputs
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def infer_codes_one_step(
         self,
         current_subword_id,
@@ -1407,7 +1275,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
         return outputs["codes"], outputs["past_key_values"], outputs["hidden_states"]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def decode_one_audio_step(self, gen_audio_codes_history, number_prev_tokens=None):
         """
         Decodes one step of generated audio codec tokens to raw waveform.
@@ -1438,7 +1306,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         audio_len[:] = self.audio_codec.config.wav_to_token_ratio
         return audio_pred_cur_step, audio_len
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def offline_inference(
         self,
         next_subword_ids: torch.Tensor,
@@ -1553,7 +1421,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
 
             # create subword_mask
             current_subword_mask = subword_mask[:, i].unsqueeze(-1)
-
+    
             code, past_key_values, hidden_states = self.infer_codes_one_step(
                 current_subword_id=current_subword_id,
                 prev_subword_id=prev_subword_id,
@@ -1564,7 +1432,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 generation_config=generation_config,
                 asr_speech_tokens_emb=asr_speech_tokens_emb,
                 ignore_eos_flag_stop=True,
-            )
+            )  
 
         
             if self.cfg.get("use_asr_speech_tokens", False): 
@@ -1840,7 +1708,7 @@ def ensures_codec_target_dtype(model):
 
     """
     if hasattr(model, "audio_codec") and next(model.audio_codec.parameters()).dtype == model.audio_codec_run_dtype:
-        # model.audio_codec.eval()
+        model.audio_codec.eval()
         return  # already correct precision → no-op
 
     setup_audio_codec(model)
@@ -1870,7 +1738,7 @@ def setup_audio_codec(model):
     for p in model.audio_codec.parameters():
         p.requires_grad = False
 
-    # model.audio_codec.eval()
+    model.audio_codec.eval()
 
     assert callable(model.tts_model.set_rvq_embs)
 
