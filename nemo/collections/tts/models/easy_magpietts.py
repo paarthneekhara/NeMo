@@ -301,15 +301,37 @@ class EasyMagpieTTSModel(ModelPT):
             self.phoneme_embeddings = nn.ModuleList(phoneme_embeddings)
             self.phoneme_final_proj = nn.Linear(cfg.hidden_dim, self.phoneme_vocab_size * self.phoneme_stacking_factor)
 
-        self.transformer_backend_config = AutoConfig.from_pretrained(
-            cfg.transformer_hf_backend,
-            trust_remote_code=True,
-        )
+        # Decoder backend selection - supports HuggingFace models or NemotronH
+        self.decoder_type = cfg.get('decoder_type', 'huggingface')  # backward compatible default
+        logging.info(f"Using decoder type: {self.decoder_type}")
 
-        hf_transformer = AutoModelForCausalLM.from_config(self.transformer_backend_config)
-        self.decoder = hf_transformer.model
-        # self.decoder.to(torch.float32)
-        self.lm_text_head = hf_transformer.lm_head
+        if self.decoder_type == 'huggingface':
+            # Existing HuggingFace path
+            self.transformer_backend_config = AutoConfig.from_pretrained(
+                cfg.transformer_hf_backend,
+                trust_remote_code=True,
+            )
+            hf_transformer = AutoModelForCausalLM.from_config(self.transformer_backend_config)
+            self.decoder = hf_transformer.model
+            self.lm_text_head = hf_transformer.lm_head
+
+        elif self.decoder_type == 'nemotron_h':
+            # NemotronH hybrid Mamba2/Attention backend
+            from nemo.collections.tts.modules.nemotron_h_decoder import NemotronHConfig, NemotronHForCausalLM
+
+            # Build config from YAML parameters
+            nemotron_h_config_dict = dict(cfg.get('nemotron_h_config', {}))
+            # Ensure hidden_size matches embedding_dim for compatibility
+            if 'hidden_size' not in nemotron_h_config_dict:
+                nemotron_h_config_dict['hidden_size'] = cfg.embedding_dim
+            nemotron_config = NemotronHConfig(**nemotron_h_config_dict)
+            nemotron_model = NemotronHForCausalLM(nemotron_config)
+            self.decoder = nemotron_model.backbone
+            self.lm_text_head = nemotron_model.lm_head
+            logging.info(f"NemotronH config: {nemotron_config.num_hidden_layers} layers, pattern={nemotron_config.hybrid_override_pattern[:20]}...")
+
+        else:
+            raise ValueError(f"Unknown decoder_type: {self.decoder_type}. Supported: 'huggingface', 'nemotron_h'")
 
         self.text_embedding = nn.Embedding(num_tokens, cfg.embedding_dim)
         self.decoder.set_input_embeddings(self.text_embedding)
