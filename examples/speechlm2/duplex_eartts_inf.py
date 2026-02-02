@@ -244,7 +244,14 @@ def inference(cfg):
 
     for batch_id, batch in enumerate(read_jsonl_batches(cfg.datasets_json_path, cfg.batch_size, max_batches=None)):
         inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.3, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir)
-        
+        if cfg.get("user_custom_speaker_reference", None):
+            wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
+            wav = torch.as_tensor(wav, dtype=torch.float32).unsqueeze(0)
+            inputs["context_audio"] = wav.expand(inputs["input_ids"].size(0), *wav.shape[1:])
+            inputs["context_audio_lengths"][:] = wav.size(-1)
+            inputs["context_audio"] = inputs["context_audio"].to(model.device)
+            inputs["context_audio_lengths"] = inputs["context_audio_lengths"].to(model.device).long()
+
         model.set_init_inputs(
             speaker_audio=inputs["context_audio"],
             speaker_audio_lens=inputs["context_audio_lengths"],

@@ -1310,6 +1310,8 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             # Batch already matches
             if buf.shape[0] == B:
                 init_inputs[name] = buf
+            elif buf.shape[0] >= B:
+                init_inputs[name] = buf[:B]
             else:
                 # assume batch=1 warmup → expand
                 init_inputs[name] = buf[:1].expand(B, *buf.shape[1:])
