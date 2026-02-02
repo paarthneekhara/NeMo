@@ -112,7 +112,7 @@ class NemotronHConfig:
     head_dim: Optional[int] = None
     attention_dropout: float = 0.0
     attention_bias: bool = False
-    max_position_embeddings: int = 8192
+    max_position_embeddings: int = 4096
     
     # Mamba config
     mamba_num_heads: int = 64
