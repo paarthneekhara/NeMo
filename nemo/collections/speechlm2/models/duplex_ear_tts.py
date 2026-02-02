@@ -977,7 +977,115 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
     def test_step(self, *args, **kwargs):
         return self.validation_step(*args, **kwargs)
 
-    def set_init_inputs(self, speaker_audio, speaker_audio_lens, system_prompt=None, user_prompt=None):
+    def set_audio_prompt_lantent(
+        self,
+        speaker_audio,
+        speaker_audio_lens,
+        system_prompt=None,
+        batch_size=1,
+        name="default_speaker",
+    ):
+        """
+        Compute and cache an audio prompt latent representation for a given speaker.
+
+        This function runs a one-time "warmup" forward pass through the TTS model using
+        the provided speaker audio (and optional system prompt) to extract an
+        `audio_prompt_lantent`. The latent is cached and can be reused during inference
+        to bypass (and potentially remove) the speaker-prompt projection path; as a
+        result, this inference path is not intended to support voice cloning from
+        arbitrary user-provided reference audio.
+
+        Typical usage:
+            - Call once per speaker (or per prompt configuration).
+            - Cache the resulting latent under a unique `name`.
+            - Reuse the cached latent during subsequent inference calls.
+
+        Args:
+            speaker_audio (Tensor):
+                Input speaker audio waveform(s), shape [B, T].
+            speaker_audio_lens (Tensor):
+                Lengths of the speaker audio, shape [B].
+            system_prompt (Optional[str]):
+                Optional system prompt text to condition the model during prompt encoding.
+            batch_size (int):
+                Batch size used during the warmup forward pass (commonly 1).
+            name (str):
+                Key under which the computed audio prompt latent is cached.
+
+        Side Effects:
+            - Creates/updates `self.audio_prompt_latents[name]` with a detached, cloned
+            tensor stored on CPU.
+            - Performs a forward pass through `self.tts_model` with caching enabled.
+
+        Returns:
+            Tensor:
+                The cached audio prompt latent (stored on CPU).
+        """
+        self.set_init_inputs(
+            speaker_audio=speaker_audio,
+            speaker_audio_lens=speaker_audio_lens,
+            system_prompt=system_prompt,
+        )
+        init_inputs = self.get_init_inputs(B=batch_size)
+        init_inputs.update(
+            {
+                "use_cache": True,
+                "past_key_values": None,
+                "guidance_enabled": False,
+            }
+        )
+
+        audio_prompt_lantent = self.tts_model(**init_inputs).audio_prompt_lantent
+
+        if not hasattr(self, "audio_prompt_latents"):
+            self.audio_prompt_latents = {}
+
+        cached = audio_prompt_lantent.detach().clone().cpu()
+        self.audio_prompt_latents[name] = cached
+        return cached
+
+    def get_audio_prompt_lantent(self, name, B):
+        """
+        Retrieve a cached audio prompt latent and adapt it to the requested batch size.
+
+        This fetches a latent previously cached via `set_audio_prompt_lantent()` and
+        ensures the returned tensor has batch size `B` by:
+        - returning as-is when the batch already matches,
+        - truncating when the cached batch is larger than `B`,
+        - expanding when the cached batch is smaller (commonly batch=1 warmup).
+
+        Args:
+            name (str):
+                Key of the cached audio prompt latent to retrieve.
+            B (int):
+                Desired batch size.
+
+        Returns:
+            Tensor:
+                Audio prompt latent with batch dimension equal to `B`, moved to `self.device`.
+                Shape: [B, ..., D]
+
+        Raises:
+            KeyError:
+                If `name` does not exist in `self.audio_prompt_latents`.
+        """
+        if not hasattr(self, "audio_prompt_latents") or name not in self.audio_prompt_latents:
+            raise KeyError(
+                f"Unknown audio prompt latent '{name}'. Call set_audio_prompt_lantent(...) first."
+            )
+
+        audio_prompt_latent = self.audio_prompt_latents[name]  # cached on CPU
+
+        if audio_prompt_latent.shape[0] == B:
+            out = audio_prompt_latent
+        elif audio_prompt_latent.shape[0] >= B:
+            out = audio_prompt_latent[:B]
+        else:
+            out = audio_prompt_latent[:1].expand(B, *audio_prompt_latent.shape[1:])
+
+        return out.to(self.device)
+
+    def set_init_inputs(self, speaker_audio, speaker_audio_lens, system_prompt=None):
         """
         Registers and prepares initial input buffers for text/audio prompt and context, to warm up AR inference.
 
@@ -985,7 +1093,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             speaker_audio (torch.Tensor): Batch of prompt audio, (B, T).
             speaker_audio_lens (torch.Tensor): Lengths for each sample in speaker_audio, (B,).
             system_prompt (str, optional): System prompt for context.
-            user_prompt (str, optional): User message for context.
 
         Returns:
             dict: Dictionary of input tensors to be passed to inference, with registered buffers.

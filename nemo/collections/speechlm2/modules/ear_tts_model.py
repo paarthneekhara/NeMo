@@ -350,6 +350,7 @@ class RVQEARTTSOutput:
 
     hidden_states: Tensor | None = None
     past_key_values: Tensor | None = None
+    audio_prompt_lantent: Tensor | None = None
 
     codes: Tensor | None = None
     lm_logits: Tensor | None = None
@@ -1115,6 +1116,13 @@ class RVQEARTTSModel(nn.Module):
                 self.hidden_size, self.hidden_size, self.hidden_size, self.config.num_quantizers
             )
 
+        if self.config.get("audio_prompt_encoder_config", None):
+            # Dedicated projection for audio prompt (pre-BOS)
+            ape_cfg = OmegaConf.to_container(self.config.audio_prompt_encoder_config, resolve=True)
+            model_type = ape_cfg.pop("type")  # remove "type" from kwargs
+            ape_cfg = AutoConfig.for_model(model_type, **ape_cfg)
+            self.audio_prompt_encoder = AutoModel.from_config(ape_cfg)
+
         # Prediction Heads
         if not self.config.disable_eos_prediction:
             self.lm_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -1290,6 +1298,7 @@ class RVQEARTTSModel(nn.Module):
         teacher_forcing_inference: bool = False,
         ignore_eos_flag_stop: bool = False,
         asr_speech_tokens_emb: Tensor | None = None,
+        audio_prompt_lantent: Tensor | None = None,
     ) -> RVQEARTTSOutput:
         """
         Performs a forward pass handling training, generation, or single-step inference.
@@ -1329,10 +1338,46 @@ class RVQEARTTSModel(nn.Module):
                 dropped_code = code
                 uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
 
-            code_embeds = (
-                self.embed_code(self.depthsum_embedding(F.pad(dropped_code[:, :-1], [0, 0, 1, 0])))
-                + (audio_mask & (~F.pad(audio_mask[:, :-1], [1, 0]))).unsqueeze(-1) * self.bos_emb
-            )
+            # code_embeds = (
+            #     self.embed_code(self.depthsum_embedding(F.pad(dropped_code[:, :-1], [0, 0, 1, 0])))
+            #     + (audio_mask & (~F.pad(audio_mask[:, :-1], [1, 0]))).unsqueeze(-1) * self.bos_emb
+            # )
+
+            # Shifted code
+            shifted_code = F.pad(dropped_code[:, :-1], [0, 0, 1, 0])
+
+            # Base embeddings
+            code_embed = self.depthsum_embedding(shifted_code)
+
+            # BOS mask
+            bos_mask = audio_mask & (~F.pad(audio_mask[:, :-1], [1, 0]))  # [B, T]
+            bos_mask = bos_mask.unsqueeze(-1)  # [B, T, 1]
+
+            # Mask for tokens BEFORE BOS
+            pre_bos_mask = (bos_mask.cumsum(dim=1) == 0)  # [B, T, 1]
+
+            # Apply projection to model size 
+            code_embed = self.embed_code(code_embed)
+
+            # Choose projection
+            if self.config.get("audio_prompt_encoder_config", None):
+                # Dedicated projection for audio prompt (pre-BOS)
+                if audio_prompt_lantent is None:
+                    prompt_attn_mask = pre_bos_mask.squeeze(-1).long()
+                    audio_prompt_lantent = self.audio_prompt_encoder(
+                        inputs_embeds=code_embed,
+                        attention_mask=prompt_attn_mask,
+                        return_dict=True,
+                    ).last_hidden_state
+
+                code_embed = torch.where(
+                    pre_bos_mask,
+                    audio_prompt_lantent,
+                    code_embed,
+                )
+
+            # Add BOS embedding
+            code_embeds = code_embed + bos_mask * self.bos_emb
 
         else:  # Inference
             code_embeds = self.embed_code(self.depthsum_embedding(code))
@@ -1408,6 +1453,7 @@ class RVQEARTTSModel(nn.Module):
                 return RVQEARTTSOutput(
                     hidden_states=hidden_states,
                     past_key_values=backbone_outputs.past_key_values,
+                    audio_prompt_lantent=audio_prompt_lantent,
                 )
             else:
                 if teacher_forcing_inference:
