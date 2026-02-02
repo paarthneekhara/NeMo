@@ -238,6 +238,203 @@ class TestHybridCache:
         assert len(cache.value_cache) == config.num_hidden_layers
 
 
+class TestNemotronHCausality:
+    """Test that NemotronH model is causal (future timesteps don't affect previous ones)."""
+    
+    @pytest.fixture
+    def small_config(self):
+        """Create a small config for testing causality."""
+        return NemotronHConfig(
+            hidden_size=64,
+            num_hidden_layers=4,
+            vocab_size=1000,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            mamba_num_heads=8,
+            mamba_head_dim=8,
+            ssm_state_size=16,
+            n_groups=2,
+            intermediate_size=128,
+            hybrid_override_pattern="M*M*",
+        )
+    
+    @pytest.fixture
+    def model(self, small_config):
+        """Create a small model for testing."""
+        model = NemotronHModel(small_config)
+        model.eval()  # Set to eval mode for deterministic behavior
+        return model
+    
+    def test_causality_with_input_modification(self, model, small_config):
+        """
+        Test causality by modifying future timesteps and checking that earlier outputs are unchanged.
+        
+        The test:
+        1. Pass sequence through the model
+        2. Modify a future timestep in the input
+        3. Verify outputs at earlier timesteps remain exactly the same
+        """
+        batch_size, seq_len = 2, 16
+        hidden_size = small_config.hidden_size
+        
+        # Create a base input
+        torch.manual_seed(42)
+        inputs_embeds_original = torch.randn(batch_size, seq_len, hidden_size)
+        
+        # Get output with original input
+        with torch.no_grad():
+            output_original = model(inputs_embeds=inputs_embeds_original.clone())
+        
+        # Test at different positions
+        test_positions = [seq_len // 4, seq_len // 2, 3 * seq_len // 4]
+        
+        for modify_pos in test_positions:
+            # Create modified input where we change timesteps from modify_pos onwards
+            inputs_embeds_modified = inputs_embeds_original.clone()
+            # Add random noise to all positions from modify_pos onwards
+            inputs_embeds_modified[:, modify_pos:, :] += torch.randn(
+                batch_size, seq_len - modify_pos, hidden_size
+            ) * 10.0  # Large modification to ensure it would affect outputs if not causal
+            
+            # Get output with modified input
+            with torch.no_grad():
+                output_modified = model(inputs_embeds=inputs_embeds_modified)
+            
+            # Check that outputs BEFORE modify_pos are unchanged
+            outputs_before_original = output_original.last_hidden_state[:, :modify_pos, :]
+            outputs_before_modified = output_modified.last_hidden_state[:, :modify_pos, :]
+            
+            # Should be exactly equal (within floating point tolerance)
+            assert torch.allclose(outputs_before_original, outputs_before_modified, atol=1e-5), \
+                f"Causality violation: modifying position {modify_pos} affected earlier positions"
+            
+            # Verify that outputs AT and AFTER modify_pos are different (sanity check)
+            outputs_after_original = output_original.last_hidden_state[:, modify_pos:, :]
+            outputs_after_modified = output_modified.last_hidden_state[:, modify_pos:, :]
+            
+            assert not torch.allclose(outputs_after_original, outputs_after_modified, atol=1e-3), \
+                f"Sanity check failed: modifying position {modify_pos} should affect outputs at/after that position"
+    
+    def test_causality_incremental_vs_full(self, model, small_config):
+        """
+        Test causality by comparing incremental (token-by-token) vs full sequence processing.
+        
+        A causal model should produce the same output whether we:
+        1. Process the full sequence at once
+        2. Process tokens incrementally one at a time
+        """
+        batch_size, seq_len = 1, 8  # Smaller seq for incremental test
+        hidden_size = small_config.hidden_size
+        
+        torch.manual_seed(123)
+        inputs_embeds = torch.randn(batch_size, seq_len, hidden_size)
+        
+        # Get output from full sequence
+        with torch.no_grad():
+            output_full = model(inputs_embeds=inputs_embeds)
+        
+        # Get outputs incrementally (one token at a time)
+        # For a causal model, output at each position should match
+        incremental_outputs = []
+        for t in range(1, seq_len + 1):
+            with torch.no_grad():
+                partial_output = model(inputs_embeds=inputs_embeds[:, :t, :])
+            # Take only the last timestep output for comparison
+            incremental_outputs.append(partial_output.last_hidden_state[:, -1:, :])
+        
+        # Stack incremental outputs
+        output_incremental = torch.cat(incremental_outputs, dim=1)
+        
+        # Compare: the full sequence output should match the incrementally computed outputs
+        assert torch.allclose(output_full.last_hidden_state, output_incremental, atol=1e-4), \
+            "Causality violation: incremental processing produces different results than full sequence"
+    
+    def test_causality_causal_lm(self, small_config):
+        """Test causality for NemotronHForCausalLM."""
+        model = NemotronHForCausalLM(small_config)
+        model.eval()
+        
+        batch_size, seq_len = 2, 12
+        hidden_size = small_config.hidden_size
+        
+        torch.manual_seed(456)
+        inputs_embeds_original = torch.randn(batch_size, seq_len, hidden_size)
+        
+        modify_pos = seq_len // 2
+        
+        # Get logits with original input
+        with torch.no_grad():
+            output_original = model(inputs_embeds=inputs_embeds_original.clone())
+        
+        # Modify future positions
+        inputs_embeds_modified = inputs_embeds_original.clone()
+        inputs_embeds_modified[:, modify_pos:, :] += torch.randn(
+            batch_size, seq_len - modify_pos, hidden_size
+        ) * 10.0
+        
+        with torch.no_grad():
+            output_modified = model(inputs_embeds=inputs_embeds_modified)
+        
+        # Check logits before modify_pos are unchanged
+        logits_before_original = output_original.logits[:, :modify_pos, :]
+        logits_before_modified = output_modified.logits[:, :modify_pos, :]
+        
+        assert torch.allclose(logits_before_original, logits_before_modified, atol=1e-5), \
+            "Causality violation in CausalLM: modifying future positions affected earlier logits"
+    
+    def test_causality_different_layer_types(self):
+        """Test causality with different hybrid patterns (Mamba-only, Attention-only, mixed)."""
+        patterns = [
+            "MMMM",  # Mamba only
+            "****",  # Attention only
+            "M*M*",  # Alternating
+            "MM**",  # Mixed blocks
+        ]
+        
+        for pattern in patterns:
+            config = NemotronHConfig(
+                hidden_size=64,
+                num_hidden_layers=4,
+                vocab_size=1000,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                mamba_num_heads=8,
+                mamba_head_dim=8,
+                ssm_state_size=16,
+                n_groups=2,
+                intermediate_size=128,
+                hybrid_override_pattern=pattern,
+            )
+            
+            model = NemotronHModel(config)
+            model.eval()
+            
+            batch_size, seq_len = 2, 8
+            hidden_size = config.hidden_size
+            
+            torch.manual_seed(789)
+            inputs_embeds_original = torch.randn(batch_size, seq_len, hidden_size)
+            
+            modify_pos = 4
+            
+            with torch.no_grad():
+                output_original = model(inputs_embeds=inputs_embeds_original.clone())
+            
+            inputs_embeds_modified = inputs_embeds_original.clone()
+            inputs_embeds_modified[:, modify_pos:, :] += torch.randn(
+                batch_size, seq_len - modify_pos, hidden_size
+            ) * 10.0
+            
+            with torch.no_grad():
+                output_modified = model(inputs_embeds=inputs_embeds_modified)
+            
+            outputs_before_original = output_original.last_hidden_state[:, :modify_pos, :]
+            outputs_before_modified = output_modified.last_hidden_state[:, :modify_pos, :]
+            
+            assert torch.allclose(outputs_before_original, outputs_before_modified, atol=1e-5), \
+                f"Causality violation for pattern '{pattern}': modifying future positions affected earlier outputs"
+
+
 class TestMoELayer:
     """Test Mixture of Experts layer."""
     
@@ -431,6 +628,117 @@ if __name__ == "__main__":
     moe_model = NemotronHModel(moe_config)
     moe_model_output = moe_model(inputs_embeds=test_input)
     print(f"   Full model with MoE: output={moe_model_output.last_hidden_state.shape}")
+    
+    # Test 7: Causality test
+    print("\n7. Testing model causality (future timesteps don't affect previous ones)...")
+    
+    # Create model for causality test
+    causality_config = NemotronHConfig(
+        hidden_size=64,
+        num_hidden_layers=4,
+        vocab_size=1000,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        mamba_num_heads=8,
+        mamba_head_dim=8,
+        ssm_state_size=16,
+        n_groups=2,
+        intermediate_size=128,
+        hybrid_override_pattern="M*M*",
+    )
+    causality_model = NemotronHModel(causality_config)
+    causality_model.eval()
+    
+    batch_size, seq_len = 2, 16
+    hidden_size = 64
+    
+    # Create base input
+    torch.manual_seed(42)
+    inputs_embeds_original = torch.randn(batch_size, seq_len, hidden_size)
+    
+    # Get output with original input
+    with torch.no_grad():
+        output_original = causality_model(inputs_embeds=inputs_embeds_original.clone())
+    
+    # Test at different positions
+    test_positions = [4, 8, 12]
+    causality_passed = True
+    
+    for modify_pos in test_positions:
+        # Create modified input where we change timesteps from modify_pos onwards
+        inputs_embeds_modified = inputs_embeds_original.clone()
+        inputs_embeds_modified[:, modify_pos:, :] += torch.randn(
+            batch_size, seq_len - modify_pos, hidden_size
+        ) * 10.0
+        
+        # Get output with modified input
+        with torch.no_grad():
+            output_modified = causality_model(inputs_embeds=inputs_embeds_modified)
+        
+        # Check that outputs BEFORE modify_pos are unchanged
+        outputs_before_original = output_original.last_hidden_state[:, :modify_pos, :]
+        outputs_before_modified = output_modified.last_hidden_state[:, :modify_pos, :]
+        
+        if torch.allclose(outputs_before_original, outputs_before_modified, atol=1e-5):
+            print(f"   Position {modify_pos}: PASS (earlier outputs unchanged)")
+        else:
+            print(f"   Position {modify_pos}: FAIL (causality violation!)")
+            causality_passed = False
+        
+        # Verify outputs at/after modify_pos are different (sanity check)
+        outputs_after_original = output_original.last_hidden_state[:, modify_pos:, :]
+        outputs_after_modified = output_modified.last_hidden_state[:, modify_pos:, :]
+        
+        if not torch.allclose(outputs_after_original, outputs_after_modified, atol=1e-3):
+            print(f"   Position {modify_pos}: Sanity check PASS (later outputs changed)")
+        else:
+            print(f"   Position {modify_pos}: Sanity check FAIL (later outputs should change)")
+            causality_passed = False
+    
+    # Test with different layer patterns
+    print("\n   Testing causality with different layer patterns...")
+    patterns = ["MMMM", "****", "M*M*", "MM**"]
+    for pattern in patterns:
+        pattern_config = NemotronHConfig(
+            hidden_size=64,
+            num_hidden_layers=4,
+            vocab_size=1000,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            mamba_num_heads=8,
+            mamba_head_dim=8,
+            ssm_state_size=16,
+            n_groups=2,
+            intermediate_size=128,
+            hybrid_override_pattern=pattern,
+        )
+        pattern_model = NemotronHModel(pattern_config)
+        pattern_model.eval()
+        
+        torch.manual_seed(789)
+        test_input = torch.randn(2, 8, 64)
+        modify_pos = 4
+        
+        with torch.no_grad():
+            out_orig = pattern_model(inputs_embeds=test_input.clone())
+        
+        test_input_mod = test_input.clone()
+        test_input_mod[:, modify_pos:, :] += torch.randn(2, 4, 64) * 10.0
+        
+        with torch.no_grad():
+            out_mod = pattern_model(inputs_embeds=test_input_mod)
+        
+        if torch.allclose(out_orig.last_hidden_state[:, :modify_pos, :], 
+                          out_mod.last_hidden_state[:, :modify_pos, :], atol=1e-5):
+            print(f"   Pattern '{pattern}': PASS")
+        else:
+            print(f"   Pattern '{pattern}': FAIL (causality violation!)")
+            causality_passed = False
+    
+    if causality_passed:
+        print("   All causality tests PASSED!")
+    else:
+        print("   WARNING: Some causality tests FAILED!")
     
     print("\n" + "="*50)
     print("All tests passed!")

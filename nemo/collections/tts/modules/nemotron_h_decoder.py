@@ -1217,6 +1217,15 @@ class NemotronHModel(nn.Module):
         
         hidden_states = inputs_embeds
         
+        # Create cache if use_cache=True but no cache provided
+        if use_cache and cache_params is None:
+            cache_params = HybridMambaAttentionDynamicCache(
+                self.config,
+                batch_size=hidden_states.shape[0],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        
         if cache_position is None:
             cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
         
