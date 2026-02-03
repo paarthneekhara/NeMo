@@ -89,40 +89,12 @@ def load_model(
             model_cfg.train_ds = None
             model_cfg.validation_ds = None
 
-            # Handle legacy config options
-            if "t5_encoder" in model_cfg:
-                model_cfg.encoder = model_cfg.t5_encoder
-                del model_cfg.t5_encoder
-            if "t5_decoder" in model_cfg:
-                model_cfg.decoder = model_cfg.t5_decoder
-                del model_cfg.t5_decoder
-            if hasattr(model_cfg, 'decoder') and hasattr(model_cfg.decoder, 'prior_eps'):
-                del model_cfg.decoder.prior_eps
-            if hasattr(model_cfg, 'use_local_transformer') and model_cfg.use_local_transformer:
-                model_cfg.local_transformer_type = "autoregressive"
-                del model_cfg.use_local_transformer
-            if hasattr(model_cfg, 'downsample_factor'):
-                model_cfg.frame_stacking_factor = model_cfg.downsample_factor
-                del model_cfg.downsample_factor
-            if hasattr(model_cfg, 'sample_rate'):
-                del model_cfg.sample_rate
-
         model = EasyMagpieTTSModel(cfg=model_cfg)
 
         # Load weights
         ckpt = torch.load(checkpoint_file, weights_only=False)
         state_dict = ckpt['state_dict']
-        # Rename legacy keys
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if 't5_encoder' in key:
-                new_key = key.replace('t5_encoder', 'encoder')
-            elif 't5_decoder' in key:
-                new_key = key.replace('t5_decoder', 'decoder')
-            else:
-                new_key = key
-            new_state_dict[new_key] = value
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(state_dict)
 
     elif nemo_file is not None:
         # Load from .nemo file
@@ -133,9 +105,6 @@ def load_model(
             model_cfg.codecmodel_path = codecmodel_path
             model_cfg.train_ds = None
             model_cfg.validation_ds = None
-
-            if hasattr(model_cfg, 'sample_rate'):
-                del model_cfg.sample_rate
 
         model = EasyMagpieTTSModel.restore_from(nemo_file, override_config_path=model_cfg)
 
