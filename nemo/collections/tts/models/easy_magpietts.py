@@ -132,6 +132,76 @@ class ProcessBatchOutput:
     selected_training_mode: Optional[str] = None
 
 
+@dataclass
+class StreamingState:
+    """
+    State for streaming TTS inference (batch size=1 only).
+
+    This dataclass maintains all the necessary state for autoregressive streaming
+    generation, allowing text tokens to be fed incrementally.
+
+    The streaming operates in three phases:
+    1. Prompt phase (text_tokens_seen < phoneme_delay): Only text, no predictions
+    2. Phoneme-only phase (phoneme_delay <= text_tokens_seen < speech_delay): Phoneme predictions only
+    3. Audio phase (text_tokens_seen >= speech_delay): Both phoneme and audio predictions
+
+    Attributes:
+        past_key_values: KV cache from the transformer for efficient autoregressive decoding.
+        cache_seq_len: Current sequence length in the cache.
+        all_predictions: List of predicted audio codes at each timestep.
+        all_phoneme_predictions: List of predicted phoneme tokens at each timestep.
+        context_audio_codes: Processed context audio codes with special tokens.
+        context_audio_codes_lens: Length of context audio codes.
+        context_lens: Total context length (task_embedding + context_audio + context_text).
+        text_tokens_seen: Number of text tokens processed so far.
+        phoneme_steps: Number of phoneme prediction steps taken (starts at 0 when entering phoneme phase).
+        audio_steps: Number of audio prediction steps taken (starts at 0 when entering audio phase).
+        phoneme_stream_ended: Whether the phoneme stream has ended (EOS detected).
+        finished: Whether generation is complete (audio EOS detected).
+        device: Device tensors are on.
+        training_mode: The training mode being used for inference.
+        use_cfg: Whether classifier-free guidance is enabled.
+        cfg_scale: CFG scale factor.
+        use_local_transformer: Whether to use local transformer for inference.
+        temperature: Sampling temperature.
+        topk: Top-k sampling parameter.
+        dummy_context_embedding_unconditional: Unconditional embedding for CFG (if enabled).
+        last_hidden: Last hidden state from transformer.
+        text_finished: Whether text input has finished (no more text tokens coming).
+        phoneme_input_type: 'gt' or 'pred' for phoneme tokens.
+        phoneme_sampling_method: 'argmax' or 'sample' for phoneme token selection.
+        last_phoneme_tokens: Last predicted phoneme tokens (used as input for next step).
+        last_audio_codes: Last predicted audio codes (used as input for next step).
+    """
+
+    past_key_values: Optional[Tuple]
+    cache_seq_len: int
+    all_predictions: List[torch.Tensor]
+    all_phoneme_predictions: List[torch.Tensor]
+    context_audio_codes: torch.Tensor
+    context_audio_codes_lens: torch.Tensor
+    context_lens: torch.Tensor
+    text_tokens_seen: int
+    phoneme_steps: int
+    audio_steps: int
+    phoneme_stream_ended: bool
+    finished: bool
+    device: torch.device
+    training_mode: TrainingMode
+    use_cfg: bool
+    cfg_scale: float
+    use_local_transformer: bool
+    temperature: float
+    topk: int
+    dummy_context_embedding_unconditional: Optional[torch.Tensor]
+    last_hidden: torch.Tensor
+    text_finished: bool
+    phoneme_input_type: str
+    phoneme_sampling_method: str
+    last_phoneme_tokens: Optional[torch.Tensor]
+    last_audio_codes: Optional[torch.Tensor]
+
+
 def worker_init_fn(worker_id):
     # For mp.set_start_method("spawn", force=True)
     # The dataset class should be picklable, so we initialize non-picklable objects here
@@ -2523,6 +2593,593 @@ class EasyMagpieTTSModel(ModelPT):
             }
 
             return predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens, rtf_metrics
+
+    # ==================== Streaming TTS Inference (batch_size=1) ====================
+
+    def streaming_init(
+        self,
+        context_audio_codes: torch.Tensor,
+        context_audio_codes_lens: torch.Tensor,
+        context_text_tokens: torch.Tensor,
+        context_text_tokens_lens: torch.Tensor,
+        inference_mode: Optional[str] = None,
+        use_cfg: bool = False,
+        cfg_scale: float = 1.0,
+        use_local_transformer: bool = False,
+        temperature: float = 0.7,
+        topk: int = 80,
+        phoneme_input_type: str = 'pred',
+        phoneme_sampling_method: str = 'argmax',
+    ) -> StreamingState:
+        """
+        Initialize streaming TTS inference state.
+
+        This prepares the model for streaming inference by processing the context
+        (audio + context text) and returning a StreamingState that can be used
+        with streaming_step() to incrementally generate audio.
+
+        Note: This function does NOT take the main text input. Text tokens are
+        provided incrementally via streaming_step().
+
+        The streaming inference follows two phases:
+        1. Prompt phase: First `streaming_speech_delay` text tokens are processed
+           without generating audio (building up context).
+        2. Generation phase: Audio BOS is added and audio codes are generated
+           autoregressively, with remaining text tokens added to audio embeddings.
+
+        Args:
+            context_audio_codes: Pre-computed audio codes for context audio (1, C, T').
+            context_audio_codes_lens: Length of context audio codes (1,).
+            context_text_tokens: Context text token IDs for speaker/style conditioning (1, L).
+            context_text_tokens_lens: Length of context text (1,).
+            inference_mode: Name of the inference mode to use (e.g., "streaming_4_8").
+                If None, uses the default inference mode.
+            use_cfg: Whether to use classifier-free guidance.
+            cfg_scale: CFG scale factor (higher = stronger conditioning).
+            use_local_transformer: Whether to use local transformer for AR sampling.
+            temperature: Sampling temperature for audio codes.
+            topk: Top-k sampling parameter.
+            phoneme_input_type: 'gt' or 'pred' for phoneme tokens (use 'pred' for streaming).
+            phoneme_sampling_method: 'argmax' or 'sample' for phoneme token selection.
+
+        Returns:
+            StreamingState: Initial state for streaming inference.
+        """
+        assert context_audio_codes.size(0) == 1, "Streaming inference only supports batch_size=1"
+
+        with torch.inference_mode():
+            device = context_audio_codes.device
+
+            # Resolve inference mode
+            mode_name = inference_mode if inference_mode is not None else self.default_inference_mode
+            if mode_name not in self.mode_name_to_mode:
+                available_modes = list(self.mode_name_to_mode.keys())
+                raise ValueError(f"Unknown inference mode '{mode_name}'. Available modes: {available_modes}")
+
+            selected_training_mode = self.mode_name_to_mode[mode_name]
+            current_mode_idx = selected_training_mode.mode_idx
+
+            # Process context audio codes
+            if self._codec_converter is not None:
+                context_audio_codes = self._codec_converter.convert_original_to_new(
+                    audio_tokens=context_audio_codes, audio_lens=context_audio_codes_lens
+                ).long()
+
+            context_audio_codes, context_audio_codes_lens = self.add_special_tokens(
+                codes=context_audio_codes,
+                codes_len=context_audio_codes_lens,
+                bos_id=self.context_audio_bos_id,
+                eos_id=self.context_audio_eos_id,
+            )
+
+            context_audio_codes, context_audio_codes_lens = self.stack_codes(
+                context_audio_codes,
+                context_audio_codes_lens,
+                self.audio_bos_id,
+                self.audio_eos_id,
+                self.frame_stacking_factor,
+                self.num_audio_codebooks,
+            )
+            context_audio_embedded = self.embed_audio_tokens(context_audio_codes)  # (1, T', E)
+
+            # Process context text
+            context_text_embedded = self.decoder.get_input_embeddings()(context_text_tokens)  # (1, L, E)
+
+            # Prepare task embedding
+            task_embedding = None
+            task_embedding_lens = None
+            if self.task_embedding is not None and current_mode_idx is not None:
+                mode_idx_tensor = torch.full((1,), current_mode_idx, dtype=torch.long, device=device)
+                task_embedding = self.task_embedding(mode_idx_tensor).unsqueeze(1)  # (1, 1, E)
+                task_embedding_lens = torch.ones(1, dtype=torch.long, device=device)
+
+            # Build context embedding (task_embedding + context_audio + context_text)
+            # No main text is included in the initial context - it will come via streaming_step
+            if task_embedding is not None:
+                context_embedding, context_lens = self.join_embeddings_temporally(
+                    embeddings=[task_embedding, context_audio_embedded, context_text_embedded],
+                    lengths=[task_embedding_lens, context_audio_codes_lens, context_text_tokens_lens],
+                )
+            else:
+                context_embedding, context_lens = self.join_embeddings_temporally(
+                    embeddings=[context_audio_embedded, context_text_embedded],
+                    lengths=[context_audio_codes_lens, context_text_tokens_lens],
+                )
+
+            # Setup classifier-free guidance if enabled
+            dummy_context_embedding_unconditional = None
+            if use_cfg:
+                dummy_context_embedding_unconditional = self.decoder.get_input_embeddings()(
+                    torch.full((1, 1), self.cfg_unk_token_id, device=device)
+                )
+                # Create unconditional context (same length as conditional)
+                dummy_context_expanded = dummy_context_embedding_unconditional.expand(
+                    -1, context_embedding.size(1), -1
+                )
+                # Concatenate conditional and unconditional: (2, T, E)
+                context_embedding = torch.cat([context_embedding, dummy_context_expanded], dim=0)
+
+            # First forward pass to process context
+            context_len_int = context_lens[0].item()
+            cache_position = torch.arange(context_len_int, device=device)
+            transformer_out = self.forward(
+                inputs_embeds=context_embedding[:, :context_len_int, :],
+                attention_mask=None,
+                use_cache=True,
+                past_key_values=None,
+                cache_position=cache_position,
+            )
+
+            last_hidden = transformer_out.last_hidden_state
+            past_kv = transformer_out.past_key_values
+            current_cache_seq_len = context_len_int
+
+            # Initialize streaming state
+            state = StreamingState(
+                past_key_values=past_kv,
+                cache_seq_len=current_cache_seq_len,
+                all_predictions=[],
+                all_phoneme_predictions=[],
+                context_audio_codes=context_audio_codes,
+                context_audio_codes_lens=context_audio_codes_lens,
+                context_lens=context_lens,
+                text_tokens_seen=0,
+                phoneme_steps=0,
+                audio_steps=0,
+                phoneme_stream_ended=False,
+                finished=False,
+                device=device,
+                training_mode=selected_training_mode,
+                use_cfg=use_cfg,
+                cfg_scale=cfg_scale,
+                use_local_transformer=use_local_transformer,
+                temperature=temperature,
+                topk=topk,
+                dummy_context_embedding_unconditional=dummy_context_embedding_unconditional,
+                last_hidden=last_hidden,
+                text_finished=False,
+                phoneme_input_type=phoneme_input_type,
+                phoneme_sampling_method=phoneme_sampling_method,
+                last_phoneme_tokens=None,
+                last_audio_codes=None,
+            )
+
+            return state
+
+    def streaming_step(
+        self,
+        state: StreamingState,
+        text_token: Optional[torch.Tensor] = None,
+    ) -> Tuple[StreamingState, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform one streaming inference step.
+
+        This function processes one text token (or signals end of text with None)
+        and generates predictions according to the streaming delays.
+
+        The streaming operates in three phases:
+        1. Prompt phase (text_tokens_seen < phoneme_delay):
+           - Only text tokens are processed, KV cache is extended
+           - No phoneme or audio predictions
+        2. Phoneme-only phase (phoneme_delay <= text_tokens_seen < speech_delay):
+           - Starts with phoneme BOS on first step
+           - Only phoneme predictions (no audio)
+           - Input: text embedding + phoneme embedding
+        3. Audio phase (text_tokens_seen >= speech_delay):
+           - Starts with audio BOS on first step
+           - Both phoneme and audio predictions
+           - Input: text embedding + phoneme embedding + audio embedding
+
+        IMPORTANT: Only ONE forward call to the decoder per streaming_step.
+
+        Args:
+            state: Current StreamingState from streaming_init or previous streaming_step.
+            text_token: Next text token to process, shape (1,), or None if text has finished.
+                When None is passed, the model continues generating until EOS.
+
+        Returns:
+            Tuple of:
+                - Updated StreamingState
+                - Predicted audio codes for this step (1, num_codebooks) or None if not in audio phase
+                - Predicted phoneme tokens for this step (1, phoneme_stacking_factor) or None if not in phoneme phase
+        """
+        if state.finished:
+            return state, None, None
+
+        with torch.inference_mode():
+            device = state.device
+            streaming_speech_delay = state.training_mode.streaming_speech_delay
+            streaming_phonemes_delay = state.training_mode.streaming_phonemes_delay
+
+            # Handle text input
+            text_embedded = None
+            if text_token is not None and not state.text_finished:
+                # Embed the text token - text_token has shape (1,), need (1, 1) for embedding
+                text_token_2d = text_token.unsqueeze(0)  # (1, 1)
+                text_embedded = self.decoder.get_input_embeddings()(text_token_2d)  # (1, 1, E)
+
+                # Handle BPE char tokenizer - add character-aware subword encoding
+                if self.use_bpe_char_tokenizer:
+                    # Create mask for single token (all ones)
+                    text_mask = torch.ones_like(text_token_2d, dtype=torch.bool)
+                    cas_embedding = self.cas_encoder(text_token_2d, subword_mask=text_mask)  # (1, 1, E)
+                    text_embedded = text_embedded + cas_embedding
+
+                state.text_tokens_seen += 1
+            elif text_token is None and not state.text_finished:
+                # Text finished signal
+                state.text_finished = True
+
+            # Determine current phase based on text_tokens_seen
+            # Note: We check AFTER incrementing text_tokens_seen
+            in_prompt_phase = state.text_tokens_seen < streaming_phonemes_delay and not state.text_finished
+            in_phoneme_only_phase = (
+                streaming_phonemes_delay <= state.text_tokens_seen < streaming_speech_delay
+                and not state.text_finished
+            ) or (state.text_finished and state.audio_steps == 0 and state.phoneme_steps < (streaming_speech_delay - streaming_phonemes_delay))
+            in_audio_phase = (
+                state.text_tokens_seen >= streaming_speech_delay
+                or (state.text_finished and not in_phoneme_only_phase)
+            )
+
+            # ==================== PROMPT PHASE ====================
+            # Only text tokens, update KV cache, no predictions
+            if in_prompt_phase:
+                if text_embedded is None:
+                    # No text token in prompt phase and text not finished - shouldn't happen
+                    return state, None, None
+
+                next_input = text_embedded
+
+                # Handle CFG
+                if state.use_cfg:
+                    next_input_unconditional = state.dummy_context_embedding_unconditional
+                    next_input = torch.cat([next_input, next_input_unconditional], dim=0)
+
+                # Single forward pass
+                cache_position = torch.tensor([state.cache_seq_len], device=device)
+                transformer_out = self.forward(
+                    inputs_embeds=next_input,
+                    attention_mask=None,
+                    use_cache=True,
+                    past_key_values=state.past_key_values,
+                    cache_position=cache_position,
+                )
+
+                state.last_hidden = transformer_out.last_hidden_state
+                state.past_key_values = transformer_out.past_key_values
+                state.cache_seq_len += 1
+
+                return state, None, None
+
+            # ==================== PHONEME-ONLY PHASE ====================
+            # Phoneme predictions only, no audio
+            if in_phoneme_only_phase and self.phoneme_tokenizer is not None:
+                # Build input embedding
+                next_input = torch.zeros(1, 1, self.cfg.embedding_dim, device=device)
+
+                # Add text embedding if available
+                if text_embedded is not None:
+                    next_input = next_input + text_embedded
+
+                # Add phoneme embedding (BOS on first step, or last predicted phoneme)
+                if state.phoneme_steps == 0:
+                    # First step in phoneme phase - use phoneme BOS
+                    phoneme_bos = torch.full(
+                        (1, self.phoneme_stacking_factor, 1),
+                        self.phoneme_tokenizer.bos_token_id,
+                        device=device,
+                    ).long()
+                    phoneme_embedded = self.embed_phoneme_tokens(phoneme_bos)
+                    next_input = next_input + phoneme_embedded
+                elif state.last_phoneme_tokens is not None and not state.phoneme_stream_ended:
+                    # Use last predicted phoneme
+                    phoneme_embedded = self.embed_phoneme_tokens(state.last_phoneme_tokens.unsqueeze(2))
+                    next_input = next_input + phoneme_embedded
+
+                # Handle CFG
+                if state.use_cfg:
+                    next_input_unconditional = state.dummy_context_embedding_unconditional
+                    next_input = torch.cat([next_input, next_input_unconditional], dim=0)
+
+                # Single forward pass
+                cache_position = torch.tensor([state.cache_seq_len], device=device)
+                transformer_out = self.forward(
+                    inputs_embeds=next_input,
+                    attention_mask=None,
+                    use_cache=True,
+                    past_key_values=state.past_key_values,
+                    cache_position=cache_position,
+                )
+
+                state.last_hidden = transformer_out.last_hidden_state
+                state.past_key_values = transformer_out.past_key_values
+                state.cache_seq_len += 1
+                state.phoneme_steps += 1
+
+                # Predict phonemes from last_hidden
+                pred_phoneme_tokens = self._predict_phoneme_tokens(state)
+
+                # Store and update state
+                state.last_phoneme_tokens = pred_phoneme_tokens
+                state.all_phoneme_predictions.append(pred_phoneme_tokens)
+
+                # Check for phoneme EOS
+                if torch.any(pred_phoneme_tokens == self.phoneme_tokenizer.eos_token_id):
+                    state.phoneme_stream_ended = True
+
+                return state, None, pred_phoneme_tokens
+
+            # ==================== AUDIO PHASE ====================
+            # Both phoneme and audio predictions
+            if in_audio_phase:
+                # Build input embedding
+                next_input = torch.zeros(1, 1, self.cfg.embedding_dim, device=device)
+
+                # Add text embedding if available
+                if text_embedded is not None:
+                    next_input = next_input + text_embedded
+
+                # Add phoneme embedding if phoneme tokenizer exists and phoneme not ended
+                if self.phoneme_tokenizer is not None and not state.phoneme_stream_ended:
+                    if state.phoneme_steps == 0 and state.audio_steps == 0:
+                        # First step ever in phoneme - use phoneme BOS
+                        phoneme_bos = torch.full(
+                            (1, self.phoneme_stacking_factor, 1),
+                            self.phoneme_tokenizer.bos_token_id,
+                            device=device,
+                        ).long()
+                        phoneme_embedded = self.embed_phoneme_tokens(phoneme_bos)
+                        next_input = next_input + phoneme_embedded
+                    elif state.last_phoneme_tokens is not None:
+                        phoneme_embedded = self.embed_phoneme_tokens(state.last_phoneme_tokens.unsqueeze(2))
+                        next_input = next_input + phoneme_embedded
+
+                # Add audio embedding (BOS on first audio step, or last predicted audio)
+                if state.audio_steps == 0:
+                    # First step in audio phase - use audio BOS
+                    audio_bos = torch.full(
+                        (1, self.num_audio_codebooks * self.frame_stacking_factor, 1),
+                        self.audio_bos_id,
+                        device=device,
+                    ).long()
+                    audio_embedded = self.embed_audio_tokens(audio_bos)
+                    next_input = next_input + audio_embedded
+                elif state.last_audio_codes is not None:
+                    audio_embedded = self.embed_audio_tokens(state.last_audio_codes.unsqueeze(2))
+                    next_input = next_input + audio_embedded
+
+                # Handle CFG
+                new_audio_emb_for_cfg = None
+                if state.use_cfg:
+                    # For unconditional, only use audio embedding (no text/phoneme conditioning)
+                    if state.audio_steps == 0:
+                        audio_bos = torch.full(
+                            (1, self.num_audio_codebooks * self.frame_stacking_factor, 1),
+                            self.audio_bos_id,
+                            device=device,
+                        ).long()
+                        new_audio_emb_for_cfg = self.embed_audio_tokens(audio_bos)
+                    elif state.last_audio_codes is not None:
+                        new_audio_emb_for_cfg = self.embed_audio_tokens(state.last_audio_codes.unsqueeze(2))
+                    else:
+                        new_audio_emb_for_cfg = torch.zeros(1, 1, self.cfg.embedding_dim, device=device)
+
+                    next_input = torch.cat([next_input, new_audio_emb_for_cfg], dim=0)
+
+                # Single forward pass
+                cache_position = torch.tensor([state.cache_seq_len], device=device)
+                transformer_out = self.forward(
+                    inputs_embeds=next_input,
+                    attention_mask=None,
+                    use_cache=True,
+                    past_key_values=state.past_key_values,
+                    cache_position=cache_position,
+                )
+
+                state.last_hidden = transformer_out.last_hidden_state
+                state.past_key_values = transformer_out.past_key_values
+                state.cache_seq_len += 1
+                state.audio_steps += 1
+                state.phoneme_steps += 1
+
+                # Predict audio codes
+                audio_codes_next, all_codes_next_argmax = self._predict_audio_codes(state)
+
+                # Predict phonemes if phoneme tokenizer exists and not ended
+                pred_phoneme_tokens = None
+                if self.phoneme_tokenizer is not None and not state.phoneme_stream_ended:
+                    pred_phoneme_tokens = self._predict_phoneme_tokens(state)
+                    state.last_phoneme_tokens = pred_phoneme_tokens
+                    state.all_phoneme_predictions.append(pred_phoneme_tokens)
+
+                    # Check for phoneme EOS
+                    if torch.any(pred_phoneme_tokens == self.phoneme_tokenizer.eos_token_id):
+                        state.phoneme_stream_ended = True
+
+                # Check for audio EOS
+                if torch.any(all_codes_next_argmax == self.audio_eos_id) or torch.any(
+                    audio_codes_next == self.audio_eos_id
+                ):
+                    state.finished = True
+
+                # Store predictions
+                state.last_audio_codes = audio_codes_next
+                state.all_predictions.append(audio_codes_next)
+
+                return state, audio_codes_next, pred_phoneme_tokens
+
+            # Fallback - shouldn't reach here
+            return state, None, None
+
+    def _predict_phoneme_tokens(self, state: StreamingState) -> torch.Tensor:
+        """Predict phoneme tokens from the last hidden state."""
+        actual_batch_size = 1
+        last_hidden = state.last_hidden
+
+        # Get phoneme logits
+        all_code_logits_t_phoneme = self.phoneme_final_proj(last_hidden[:, -1, :])
+        all_code_logits_t_phoneme = all_code_logits_t_phoneme[:actual_batch_size]
+
+        # Sample phonemes
+        if state.phoneme_sampling_method == 'argmax':
+            pred_phoneme_tokens = self.sample_codes_from_logits_phoneme(
+                all_code_logits_t_phoneme, temperature=0.01
+            )
+        else:
+            pred_phoneme_tokens = self.sample_codes_from_logits_phoneme(
+                all_code_logits_t_phoneme, temperature=state.temperature, topk=state.topk
+            )
+
+        return pred_phoneme_tokens
+
+    def _predict_audio_codes(
+        self, state: StreamingState
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict audio codes from the last hidden state."""
+        actual_batch_size = 1
+        last_hidden = state.last_hidden
+
+        # Compute audio logits
+        last_hidden_audio = self.audio_out_projection(last_hidden[:, -1, :])
+        all_code_logits_t = self.final_proj(last_hidden_audio)
+
+        # Apply CFG if enabled
+        if state.use_cfg:
+            conditional_logits = all_code_logits_t[:actual_batch_size]
+            unconditional_logits = all_code_logits_t[actual_batch_size:]
+            all_code_logits_t = state.cfg_scale * conditional_logits + (1.0 - state.cfg_scale) * unconditional_logits
+
+        # Sample audio codes
+        audio_codes_next, all_codes_next_argmax = self._sample_audio_codes(
+            last_hidden=last_hidden,
+            all_code_logits_t=all_code_logits_t,
+            temperature=state.temperature,
+            topk=state.topk,
+            use_local_transformer_for_inference=state.use_local_transformer,
+            use_cfg=state.use_cfg,
+            cfg_scale=state.cfg_scale,
+        )
+
+        return audio_codes_next, all_codes_next_argmax
+
+    def streaming_decode(
+        self,
+        state: StreamingState,
+        previous_decode_length: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Decode accumulated audio codes to waveform, returning only the new chunk.
+
+        This function takes all predicted codes so far and decodes them, but only
+        returns the newly generated audio portion (after previous_decode_length).
+
+        Args:
+            state: Current StreamingState containing all_predictions.
+            previous_decode_length: Number of audio samples already decoded and returned
+                in previous calls. Use 0 on first call.
+
+        Returns:
+            Tuple of:
+                - new_audio: Newly generated audio waveform (1, new_samples)
+                - new_audio_len: Length of new audio (1,)
+                - total_decode_length: Total decoded length so far (use as previous_decode_length
+                    for next call)
+        """
+        if len(state.all_predictions) == 0:
+            return (
+                torch.zeros(1, 0, device=state.device),
+                torch.zeros(1, dtype=torch.long, device=state.device),
+                previous_decode_length,
+            )
+
+        with torch.inference_mode():
+            # Stack all predictions
+            predicted_codes = torch.stack(state.all_predictions, dim=-1)  # (1, num_codebooks, T)
+            predicted_codes_lens = torch.tensor([predicted_codes.size(-1)], device=state.device)
+
+            # Remove EOS tokens if present
+            predicted_codes_clean, predicted_codes_lens_clean = self.remove_eos_token(
+                predicted_codes, predicted_codes_lens
+            )
+
+            # Decode to audio
+            audio, audio_len, _ = self.codes_to_audio(predicted_codes_clean, predicted_codes_lens_clean)
+
+            # Extract only new audio
+            total_decode_length = audio_len[0].item()
+            if total_decode_length <= previous_decode_length:
+                return (
+                    torch.zeros(1, 0, device=state.device),
+                    torch.zeros(1, dtype=torch.long, device=state.device),
+                    previous_decode_length,
+                )
+
+            new_audio = audio[:, previous_decode_length:total_decode_length]
+            new_audio_len = torch.tensor([total_decode_length - previous_decode_length], device=state.device)
+
+            return new_audio, new_audio_len, total_decode_length
+
+    def streaming_finalize(
+        self,
+        state: StreamingState,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Finalize streaming and return the complete generated audio.
+
+        This function should be called after all streaming_step() calls are complete
+        (i.e., when state.finished is True or max steps reached).
+
+        Args:
+            state: Final StreamingState after streaming is complete.
+
+        Returns:
+            Tuple of:
+                - audio: Complete generated audio waveform (1, audio_len)
+                - audio_len: Length of generated audio (1,)
+                - codes: All generated audio codes (1, num_codebooks, T)
+                - codes_len: Length of generated codes (1,)
+        """
+        if len(state.all_predictions) == 0:
+            return (
+                torch.zeros(1, 0, device=state.device),
+                torch.zeros(1, dtype=torch.long, device=state.device),
+                torch.zeros(1, self.num_audio_codebooks * self.frame_stacking_factor, 0, device=state.device),
+                torch.zeros(1, dtype=torch.long, device=state.device),
+            )
+
+        with torch.inference_mode():
+            # Stack all predictions
+            predicted_codes = torch.stack(state.all_predictions, dim=-1)  # (1, num_codebooks, T)
+            predicted_codes_lens = torch.tensor([predicted_codes.size(-1)], device=state.device)
+
+            # Remove EOS tokens
+            predicted_codes, predicted_codes_lens = self.remove_eos_token(predicted_codes, predicted_codes_lens)
+
+            # Decode to audio
+            audio, audio_len, decoded_codes = self.codes_to_audio(predicted_codes, predicted_codes_lens)
+
+            return audio, audio_len, predicted_codes, predicted_codes_lens
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:
