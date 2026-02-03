@@ -143,27 +143,50 @@ def load_audio(audio_path: str, target_sample_rate: int) -> torch.Tensor:
     return torch.from_numpy(audio).unsqueeze(0)  # (1, num_samples)
 
 
+def get_num_audio_samples_to_slice(duration: float, sample_rate: int, codec_model_samples_per_frame: int) -> int:
+    """
+    Get the precise number of audio samples to slice for a given duration.
+
+    This ensures the audio is sliced to an exact number of samples that aligns
+    with the codec model's frame size.
+
+    Args:
+        duration: Target duration in seconds.
+        sample_rate: Sample rate of the audio.
+        codec_model_samples_per_frame: Number of samples per codec frame (codec downsample factor).
+
+    Returns:
+        Number of audio samples aligned to codec frame boundaries.
+    """
+    num_codec_frames = int(duration * sample_rate / codec_model_samples_per_frame)
+    num_audio_samples = num_codec_frames * codec_model_samples_per_frame
+    return num_audio_samples
+
+
 def adjust_audio_to_duration(
     audio: torch.Tensor,
     sample_rate: int,
     target_duration: float,
+    codec_model_samples_per_frame: int,
 ) -> torch.Tensor:
     """
-    Adjust audio to exactly target_duration seconds.
+    Adjust audio to exactly target_duration seconds, aligned to codec frame boundaries.
 
     If audio is longer than target_duration, take the first target_duration seconds.
     If audio is shorter, repeat it until it reaches target_duration seconds.
+    The resulting length is aligned to codec frame boundaries.
 
     Args:
         audio: Audio tensor of shape (1, num_samples).
         sample_rate: Sample rate of the audio.
         target_duration: Target duration in seconds.
+        codec_model_samples_per_frame: Number of samples per codec frame (codec downsample factor).
 
     Returns:
         Audio tensor of shape (1, target_num_samples) where
-        target_num_samples = int(target_duration * sample_rate).
+        target_num_samples is aligned to codec frame boundaries.
     """
-    target_num_samples = int(target_duration * sample_rate)
+    target_num_samples = get_num_audio_samples_to_slice(target_duration, sample_rate, codec_model_samples_per_frame)
     current_num_samples = audio.size(1)
 
     if current_num_samples >= target_num_samples:
@@ -513,11 +536,12 @@ def main():
     original_duration = context_audio.size(1) / model.sample_rate
     logging.info(f"Original context audio duration: {original_duration:.2f}s")
 
-    # Adjust context audio to target duration
+    # Adjust context audio to target duration (aligned to codec frame boundaries)
     context_audio = adjust_audio_to_duration(
         context_audio,
         sample_rate=model.sample_rate,
         target_duration=args.context_duration,
+        codec_model_samples_per_frame=model.codec_model_samples_per_frame,
     )
     context_audio_lens = torch.tensor([context_audio.size(1)], dtype=torch.long)
     adjusted_duration = context_audio.size(1) / model.sample_rate
