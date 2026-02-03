@@ -263,6 +263,7 @@ def run_streaming_inference(
         main_tokenizer_name = tokenizer_name
 
     text_tokens = model.tokenizer.encode(text, tokenizer_name=main_tokenizer_name)
+    text_tokens = text_tokens + [model.eos_id]
     text_tokens = torch.tensor(text_tokens, dtype=torch.long, device=device)
 
     # Get streaming delays for logging
