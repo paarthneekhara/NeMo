@@ -1123,6 +1123,14 @@ class RVQEARTTSModel(nn.Module):
             ape_cfg = AutoConfig.for_model(model_type, **ape_cfg)
             self.audio_prompt_encoder = AutoModel.from_config(ape_cfg)
 
+        if self.config.get("use_audio_prompt_frozen_projection", False):
+            U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
+            V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
+            smin, smax = 0.4, 2.5
+            s = (smin + (smax - smin) * torch.rand(self.hidden_size)) 
+            W = U @ torch.diag(s) @ V.T
+            self.register_buffer("audio_prompt_projection_W", W) # register as buffer to avoid weight update
+
         # Prediction Heads
         if not self.config.disable_eos_prediction:
             self.lm_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -1369,6 +1377,17 @@ class RVQEARTTSModel(nn.Module):
                         attention_mask=prompt_attn_mask,
                         return_dict=True,
                     ).last_hidden_state
+
+                code_embed = torch.where(
+                    pre_bos_mask,
+                    audio_prompt_lantent,
+                    code_embed,
+                )
+
+            if self.config.get("use_audio_prompt_frozen_projection", False):
+                if audio_prompt_lantent is None:
+                    W = self.audio_prompt_projection_W.to(code_embed.device, code_embed.dtype)
+                    audio_prompt_lantent = torch.nn.functional.linear(code_embed, W.T)
 
                 code_embed = torch.where(
                     pre_bos_mask,
