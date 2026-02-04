@@ -197,6 +197,8 @@ def run_streaming_inference(
     context_audio_lens: torch.Tensor,
     context_text: str,
     text: str,
+    phoneme_text: Optional[str] = None,
+    use_gt_phonemes: bool = False,
     inference_mode: Optional[str] = None,
     use_cfg: bool = False,
     cfg_scale: float = 1.5,
@@ -205,6 +207,7 @@ def run_streaming_inference(
     topk: int = 80,
     max_steps: int = 500,
     verbose: bool = True,
+    force_dropout_text: bool = False,
 ) -> tuple:
     """
     Run streaming TTS inference.
@@ -215,6 +218,8 @@ def run_streaming_inference(
         context_audio_lens: Length of context audio (1,).
         context_text: Context text for speaker conditioning.
         text: Main text to synthesize.
+        phoneme_text: Optional phoneme text for GT conditioning. If None, uses text.
+        use_gt_phonemes: If True, use GT phonemes as decoder input (teacher forcing).
         inference_mode: Inference mode name (e.g., "streaming_4_8").
         use_cfg: Whether to use classifier-free guidance.
         cfg_scale: CFG scale factor.
@@ -225,7 +230,8 @@ def run_streaming_inference(
         verbose: Whether to print progress.
 
     Returns:
-        Tuple of (audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens).
+        Tuple of (output, timing_info, context_audio_decoded, context_audio_decoded_lens).
+        output is StreamingFinalizeOutput with audio, codes, and phoneme predictions.
         context_audio_decoded is the decoded context audio from the model's internal codes (for sanity checking).
     """
     device = next(model.parameters()).device
@@ -257,6 +263,21 @@ def run_streaming_inference(
     text_tokens = text_tokens + [model.eos_id]
     text_tokens = torch.tensor(text_tokens, dtype=torch.long, device=device)
 
+    # Tokenize phoneme text if provided (for GT phoneme conditioning)
+    gt_phoneme_tokens = None
+    gt_phoneme_tokens_lens = None
+    if model.phoneme_tokenizer is not None:
+        phoneme_source = phoneme_text if phoneme_text is not None else text
+        phoneme_tokens_list = model.phoneme_tokenizer.encode(phoneme_source)
+        # Add BOS and EOS
+        bos_id = model.phoneme_tokenizer.bos_token_id
+        eos_id = model.phoneme_tokenizer.eos_token_id
+        phoneme_tokens_list = [bos_id] + phoneme_tokens_list + [eos_id]
+        gt_phoneme_tokens = torch.tensor([phoneme_tokens_list], dtype=torch.long, device=device)
+        gt_phoneme_tokens_lens = torch.tensor([len(phoneme_tokens_list)], dtype=torch.long, device=device)
+
+    phoneme_input_type = 'gt' if use_gt_phonemes else 'pred'
+
     # Get streaming delays for logging
     mode_name = inference_mode or model.default_inference_mode
     training_mode = model.mode_name_to_mode.get(mode_name, model.training_modes[0])
@@ -267,6 +288,9 @@ def run_streaming_inference(
         logging.info(f"Context audio codes shape: {context_audio_codes.shape}")
         logging.info(f"Context text tokens: {context_text_tokens.shape}")
         logging.info(f"Main text tokens: {text_tokens.shape} ({len(text_tokens)} tokens)")
+        if gt_phoneme_tokens is not None:
+            logging.info(f"GT phoneme tokens: {gt_phoneme_tokens.shape} ({gt_phoneme_tokens_lens[0].item()} tokens)")
+        logging.info(f"Phoneme input type: {phoneme_input_type}")
         logging.info(f"Using inference mode: {mode_name}")
         logging.info(f"Phoneme delay: {phoneme_delay}, Speech delay: {speech_delay}")
         logging.info("Phases: Prompt (0 to phoneme_delay) -> Phoneme-only (phoneme_delay to speech_delay) -> Audio")
@@ -285,6 +309,9 @@ def run_streaming_inference(
         use_local_transformer=use_local_transformer,
         temperature=temperature,
         topk=topk,
+        phoneme_input_type=phoneme_input_type,
+        gt_phoneme_tokens=gt_phoneme_tokens,
+        gt_phoneme_tokens_lens=gt_phoneme_tokens_lens,
     )
 
     init_time = time.time() - start_time
@@ -314,7 +341,7 @@ def run_streaming_inference(
 
     for i, token in enumerate(text_tokens):
         state, audio_codes, phoneme_tokens = model.streaming_step(
-            state, text_token=token.unsqueeze(0)
+            state, text_tokens=token.unsqueeze(0), force_dropout_text=force_dropout_text
         )
 
         # Track which phase we're in
@@ -346,7 +373,7 @@ def run_streaming_inference(
     # Continue generating until finished (text has ended)
     continuation_steps = 0
     while not state.finished and continuation_steps < max_steps:
-        state, audio_codes, phoneme_tokens = model.streaming_step(state, text_token=None)
+        state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=None, force_dropout_text=force_dropout_text)
 
         if audio_codes is not None:
             num_audio_frames += 1
@@ -372,9 +399,12 @@ def run_streaming_inference(
         logging.info(f"Continuation steps: {continuation_steps}")
 
     # Finalize and get complete audio
-    audio, audio_len, codes, codes_len = model.streaming_finalize(state)
+    output = model.streaming_finalize(state)
 
     total_time = time.time() - start_time
+
+    if verbose and output.phoneme_text:
+        logging.info(f"Predicted phoneme text: {output.phoneme_text[0]}")
 
     timing_info = {
         'init_time': init_time,
@@ -388,7 +418,7 @@ def run_streaming_inference(
         'continuation_steps': continuation_steps,
     }
 
-    return audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens
+    return output, timing_info, context_audio_decoded, context_audio_decoded_lens
 
 
 def run_batched_streaming_inference(
@@ -397,6 +427,8 @@ def run_batched_streaming_inference(
     context_audio_lens_list: list[torch.Tensor],
     context_texts: list[str],
     texts: list[str],
+    phoneme_texts: Optional[list[str]] = None,
+    use_gt_phonemes: bool = False,
     inference_mode: Optional[str] = None,
     use_cfg: bool = False,
     cfg_scale: float = 1.5,
@@ -405,6 +437,7 @@ def run_batched_streaming_inference(
     topk: int = 80,
     max_steps: int = 500,
     verbose: bool = True,
+    force_dropout_text: bool = False,
 ) -> tuple:
     """
     Run batched streaming TTS inference.
@@ -419,6 +452,8 @@ def run_batched_streaming_inference(
         context_audio_lens_list: List of context audio lengths, each (1,).
         context_texts: List of context texts for speaker conditioning.
         texts: List of main texts to synthesize.
+        phoneme_texts: Optional list of phoneme texts for GT conditioning. If None, uses texts.
+        use_gt_phonemes: If True, use GT phonemes as decoder input (teacher forcing).
         inference_mode: Inference mode name (e.g., "streaming_4_8").
         use_cfg: Whether to use classifier-free guidance.
         cfg_scale: CFG scale factor.
@@ -429,7 +464,7 @@ def run_batched_streaming_inference(
         verbose: Whether to print progress.
 
     Returns:
-        Tuple of (audio, audio_len, codes, codes_len, timing_info).
+        Tuple of (output, timing_info) where output is StreamingFinalizeOutput.
     """
     device = next(model.parameters()).device
     batch_size = len(context_audios)
@@ -492,6 +527,27 @@ def run_batched_streaming_inference(
 
     max_text_len = max(len(t) for t in text_tokens_list)
 
+    # Tokenize phoneme texts if model has phoneme tokenizer
+    gt_phoneme_tokens = None
+    gt_phoneme_tokens_lens = None
+    if model.phoneme_tokenizer is not None:
+        phoneme_sources = phoneme_texts if phoneme_texts is not None else texts
+        bos_id = model.phoneme_tokenizer.bos_token_id
+        eos_id = model.phoneme_tokenizer.eos_token_id
+        phoneme_tokens_lists = []
+        for ptext in phoneme_sources:
+            tokens = model.phoneme_tokenizer.encode(ptext)
+            tokens = [bos_id] + tokens + [eos_id]
+            phoneme_tokens_lists.append(tokens)
+        max_phoneme_len = max(len(t) for t in phoneme_tokens_lists)
+        gt_phoneme_tokens = torch.zeros(batch_size, max_phoneme_len, dtype=torch.long, device=device)
+        gt_phoneme_tokens_lens = torch.zeros(batch_size, dtype=torch.long, device=device)
+        for i, tokens in enumerate(phoneme_tokens_lists):
+            gt_phoneme_tokens[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=device)
+            gt_phoneme_tokens_lens[i] = len(tokens)
+
+    phoneme_input_type = 'gt' if use_gt_phonemes else 'pred'
+
     # Get streaming delays for logging
     mode_name = inference_mode or model.default_inference_mode
     training_mode = model.mode_name_to_mode.get(mode_name, model.training_modes[0])
@@ -506,6 +562,10 @@ def run_batched_streaming_inference(
         logging.info(f"Context text tokens lens: {context_text_tokens_lens.tolist()}")
         logging.info(f"Max text tokens: {max_text_len}")
         logging.info(f"Text tokens per item: {[len(t) for t in text_tokens_list]}")
+        if gt_phoneme_tokens is not None:
+            logging.info(f"GT phoneme tokens shape: {gt_phoneme_tokens.shape}")
+            logging.info(f"GT phoneme tokens lens: {gt_phoneme_tokens_lens.tolist()}")
+        logging.info(f"Phoneme input type: {phoneme_input_type}")
         logging.info(f"Using inference mode: {mode_name}")
         logging.info(f"Phoneme delay: {phoneme_delay}, Speech delay: {speech_delay}")
 
@@ -523,6 +583,9 @@ def run_batched_streaming_inference(
         use_local_transformer=use_local_transformer,
         temperature=temperature,
         topk=topk,
+        phoneme_input_type=phoneme_input_type,
+        gt_phoneme_tokens=gt_phoneme_tokens,
+        gt_phoneme_tokens_lens=gt_phoneme_tokens_lens,
     )
 
     init_time = time.time() - start_time
@@ -562,9 +625,9 @@ def run_batched_streaming_inference(
         all_text_done = text_finished_mask.all() and not in_context_phase.any()
 
         if all_text_done:
-            state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=None)
+            state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=None, force_dropout_text=force_dropout_text)
         else:
-            state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=text_tokens_batch)
+            state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=text_tokens_batch, force_dropout_text=force_dropout_text)
 
         if audio_codes is not None:
             num_audio_frames += 1
@@ -589,9 +652,13 @@ def run_batched_streaming_inference(
         logging.info(f"Audio frames generated: {num_audio_frames}")
 
     # Finalize and get complete audio
-    audio, audio_len, codes, codes_len = model.streaming_finalize(state)
+    output = model.streaming_finalize(state)
 
     total_time = time.time() - start_time
+
+    if verbose and output.phoneme_text:
+        for i, ptext in enumerate(output.phoneme_text):
+            logging.info(f"Predicted phoneme text [{i}]: {ptext}")
 
     timing_info = {
         'init_time': init_time,
@@ -602,7 +669,7 @@ def run_batched_streaming_inference(
         'total_steps': step_count,
     }
 
-    return audio, audio_len, codes, codes_len, timing_info
+    return output, timing_info
 
 
 def main():
@@ -672,6 +739,20 @@ def main():
         required=True,
         help='Text(s) to synthesize. Provide one per context audio for batched inference.',
     )
+    input_group.add_argument(
+        '--phoneme_text',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Phoneme text(s) for GT phoneme conditioning. If not provided, uses --text. '
+             'Provide one per context audio for batched inference.',
+    )
+    input_group.add_argument(
+        '--use_gt_phonemes',
+        action='store_true',
+        help='Use ground-truth phonemes as decoder input (teacher forcing). '
+             'If not set, uses model-predicted phonemes.',
+    )
 
     # Output arguments
     output_group = parser.add_argument_group('Output')
@@ -736,6 +817,11 @@ def main():
         action='store_true',
         help='Print detailed progress information',
     )
+    infer_group.add_argument(
+        '--force_dropout_text',
+        action='store_true',
+        help='Force dropout of text embeddings (pass zeros) to test phoneme-only inference',
+    )
 
     args = parser.parse_args()
 
@@ -779,6 +865,15 @@ def main():
     elif len(texts) != batch_size:
         parser.error(f"Number of texts ({len(texts)}) must match number of context_audios ({batch_size}) or be 1")
 
+    # Handle phoneme_text - default to text if not provided
+    phoneme_texts = args.phoneme_text
+    if phoneme_texts is None:
+        phoneme_texts = texts
+    elif len(phoneme_texts) == 1 and batch_size > 1:
+        phoneme_texts = phoneme_texts * batch_size
+    elif len(phoneme_texts) != batch_size:
+        parser.error(f"Number of phoneme_texts ({len(phoneme_texts)}) must match number of context_audios ({batch_size}) or be 1")
+
     # Load and process context audios
     context_audios = []
     context_audio_lens_list = []
@@ -800,16 +895,20 @@ def main():
     logging.info(f"\nBatch size: {batch_size}")
     logging.info(f"Context texts: {context_texts}")
     logging.info(f"Texts to synthesize: {texts}")
+    logging.info(f"Phoneme texts: {phoneme_texts}")
+    logging.info(f"Use GT phonemes: {args.use_gt_phonemes}")
 
     # Use single-sample or batched inference
     if batch_size == 1:
         logging.info("\n=== Running single-sample streaming inference ===")
-        audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens = run_streaming_inference(
+        output, timing_info, context_audio_decoded, context_audio_decoded_lens = run_streaming_inference(
             model=model,
             context_audio=context_audios[0],
             context_audio_lens=context_audio_lens_list[0],
             context_text=context_texts[0],
             text=texts[0],
+            phoneme_text=phoneme_texts[0],
+            use_gt_phonemes=args.use_gt_phonemes,
             inference_mode=args.inference_mode,
             use_cfg=args.use_cfg,
             cfg_scale=args.cfg_scale,
@@ -818,6 +917,7 @@ def main():
             topk=args.topk,
             max_steps=args.max_steps,
             verbose=args.verbose,
+            force_dropout_text=args.force_dropout_text,
         )
 
         # Save output
@@ -825,7 +925,7 @@ def main():
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        audio_np = audio[0, :audio_len[0].item()].cpu().numpy()
+        audio_np = output.audio[0, :output.audio_len[0].item()].cpu().numpy()
         sf.write(args.output_path, audio_np, model.output_sample_rate)
         logging.info(f"Output saved to: {args.output_path}")
 
@@ -837,8 +937,10 @@ def main():
 
         logging.info(f"Context audio (decoded from codes) saved to: {context_output_path}")
         logging.info(f"Context audio duration: {context_audio_decoded_lens[0].item() / model.output_sample_rate:.2f}s")
-        logging.info(f"Audio duration: {audio_len[0].item() / model.output_sample_rate:.2f}s")
-        logging.info(f"Generated codes shape: {codes.shape}")
+        logging.info(f"Audio duration: {output.audio_len[0].item() / model.output_sample_rate:.2f}s")
+        logging.info(f"Generated codes shape: {output.audio_codes.shape}")
+        if output.phoneme_text:
+            logging.info(f"Predicted phoneme text: {output.phoneme_text[0]}")
 
         # Print timing summary
         logging.info("\n=== Timing Summary ===")
@@ -853,18 +955,20 @@ def main():
         logging.info(f"Continuation steps: {timing_info['continuation_steps']}")
 
         # Calculate RTF
-        audio_duration = audio_len[0].item() / model.output_sample_rate
+        audio_duration = output.audio_len[0].item() / model.output_sample_rate
         rtf = audio_duration / timing_info['total_time']
         logging.info(f"Real-time factor (RTF): {rtf:.2f}x")
 
     else:
         logging.info(f"\n=== Running batched streaming inference (batch_size={batch_size}) ===")
-        audio, audio_len, codes, codes_len, timing_info = run_batched_streaming_inference(
+        output, timing_info = run_batched_streaming_inference(
             model=model,
             context_audios=context_audios,
             context_audio_lens_list=context_audio_lens_list,
             context_texts=context_texts,
             texts=texts,
+            phoneme_texts=phoneme_texts,
+            use_gt_phonemes=args.use_gt_phonemes,
             inference_mode=args.inference_mode,
             use_cfg=args.use_cfg,
             cfg_scale=args.cfg_scale,
@@ -873,6 +977,7 @@ def main():
             topk=args.topk,
             max_steps=args.max_steps,
             verbose=args.verbose,
+            force_dropout_text=args.force_dropout_text,
         )
 
         # Save outputs for each batch item
@@ -884,12 +989,14 @@ def main():
 
         for i in range(batch_size):
             output_path_i = f"{output_base}_{i}{output_ext}"
-            audio_np = audio[i, :audio_len[i].item()].cpu().numpy()
+            audio_np = output.audio[i, :output.audio_len[i].item()].cpu().numpy()
             sf.write(output_path_i, audio_np, model.output_sample_rate)
-            audio_duration_i = audio_len[i].item() / model.output_sample_rate
+            audio_duration_i = output.audio_len[i].item() / model.output_sample_rate
             logging.info(f"Output {i+1}/{batch_size} saved to: {output_path_i} (duration: {audio_duration_i:.2f}s)")
+            if output.phoneme_text and i < len(output.phoneme_text):
+                logging.info(f"  Predicted phoneme text: {output.phoneme_text[i]}")
 
-        logging.info(f"\nGenerated codes shape: {codes.shape}")
+        logging.info(f"\nGenerated codes shape: {output.audio_codes.shape}")
 
         # Print timing summary
         logging.info("\n=== Timing Summary ===")
@@ -901,7 +1008,7 @@ def main():
         logging.info(f"Total steps: {timing_info['total_steps']}")
 
         # Calculate average RTF
-        total_audio_duration = sum(audio_len[i].item() for i in range(batch_size)) / model.output_sample_rate
+        total_audio_duration = sum(output.audio_len[i].item() for i in range(batch_size)) / model.output_sample_rate
         avg_rtf = total_audio_duration / timing_info['total_time']
         logging.info(f"Average real-time factor (RTF): {avg_rtf:.2f}x")
         logging.info(f"Total audio duration (all items): {total_audio_duration:.2f}s")
