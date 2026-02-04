@@ -147,6 +147,10 @@ class StreamingState:
         phoneme_sampling_method: 'argmax' or 'sample' for phoneme token selection.
         last_phoneme_tokens: Last predicted phoneme tokens (B, phoneme_stacking_factor).
         last_audio_codes: Last predicted audio codes (B, num_codebooks).
+        audio_prediction_start_idx: Global step index where audio predictions start per batch item (B,).
+        audio_prediction_end_idx: Global step index where audio predictions end per batch item (B,), -1 if not ended.
+        phoneme_prediction_start_idx: Global step index where phoneme predictions start per batch item (B,).
+        phoneme_prediction_end_idx: Global step index where phoneme predictions end per batch item (B,), -1 if not ended.
     """
 
     batch_size: int
@@ -179,6 +183,10 @@ class StreamingState:
     phoneme_sampling_method: str
     last_phoneme_tokens: Optional[torch.Tensor]
     last_audio_codes: Optional[torch.Tensor]
+    audio_prediction_start_idx: torch.Tensor
+    audio_prediction_end_idx: torch.Tensor
+    phoneme_prediction_start_idx: torch.Tensor
+    phoneme_prediction_end_idx: torch.Tensor
 
 
 def worker_init_fn(worker_id):
@@ -2259,6 +2267,10 @@ class EasyMagpieTTSModel(ModelPT):
                 phoneme_sampling_method=phoneme_sampling_method,
                 last_phoneme_tokens=None,
                 last_audio_codes=None,
+                audio_prediction_start_idx=torch.full((batch_size,), -1, dtype=torch.long, device=device),
+                audio_prediction_end_idx=torch.full((batch_size,), -1, dtype=torch.long, device=device),
+                phoneme_prediction_start_idx=torch.full((batch_size,), -1, dtype=torch.long, device=device),
+                phoneme_prediction_end_idx=torch.full((batch_size,), -1, dtype=torch.long, device=device),
             )
 
             return state
@@ -2465,16 +2477,47 @@ class EasyMagpieTTSModel(ModelPT):
 
             # Phoneme predictions for items in phoneme or audio phase
             if needs_phoneme.any() and self.phoneme_tokenizer is not None:
+                # Track phoneme prediction start index for items just entering phoneme phase
+                first_phoneme_step = needs_phoneme & (state.phoneme_prediction_start_idx == -1)
+                if first_phoneme_step.any():
+                    current_phoneme_step_idx = len(state.all_phoneme_predictions)  # before append
+                    state.phoneme_prediction_start_idx = torch.where(
+                        first_phoneme_step,
+                        torch.full_like(state.phoneme_prediction_start_idx, current_phoneme_step_idx),
+                        state.phoneme_prediction_start_idx
+                    )
+
                 # Check which items should predict phonemes (not ended)
                 pred_phoneme_tokens = self._predict_phoneme_tokens(state)  # (B, phoneme_stacking_factor)
                 state.last_phoneme_tokens = pred_phoneme_tokens
                 state.all_phoneme_predictions.append(pred_phoneme_tokens)
+
                 # Check for phoneme EOS per item
                 phoneme_eos_detected = needs_phoneme & (pred_phoneme_tokens == self.phoneme_tokenizer.eos_token_id).any(dim=1)  # (B,)
                 state.phoneme_stream_ended = state.phoneme_stream_ended | phoneme_eos_detected
 
+                # Track phoneme prediction end index for items that just ended
+                newly_ended_phoneme = phoneme_eos_detected & (state.phoneme_prediction_end_idx == -1)
+                if newly_ended_phoneme.any():
+                    current_phoneme_step_idx = len(state.all_phoneme_predictions)  # after append
+                    state.phoneme_prediction_end_idx = torch.where(
+                        newly_ended_phoneme,
+                        torch.full_like(state.phoneme_prediction_end_idx, current_phoneme_step_idx),
+                        state.phoneme_prediction_end_idx
+                    )
+
             # Audio predictions for items in audio phase
             if needs_audio.any():
+                # Track audio prediction start index for items just entering audio phase
+                first_audio_step = needs_audio & (state.audio_prediction_start_idx == -1)
+                if first_audio_step.any():
+                    current_audio_step_idx = len(state.all_predictions)  # before append
+                    state.audio_prediction_start_idx = torch.where(
+                        first_audio_step,
+                        torch.full_like(state.audio_prediction_start_idx, current_audio_step_idx),
+                        state.audio_prediction_start_idx
+                    )
+
                 audio_codes_next, all_codes_next_argmax = self._predict_audio_codes(state)  # (B, num_codebooks)
 
                 # Update last_audio_codes (only for items in audio phase)
@@ -2492,6 +2535,16 @@ class EasyMagpieTTSModel(ModelPT):
                     | (audio_codes_next == self.audio_eos_id).any(dim=1)
                 )  # (B,)
                 state.finished = state.finished | audio_eos_detected
+
+                # Track audio prediction end index for items that just ended
+                newly_ended_audio = audio_eos_detected & (state.audio_prediction_end_idx == -1)
+                if newly_ended_audio.any():
+                    current_audio_step_idx = len(state.all_predictions)  # after append
+                    state.audio_prediction_end_idx = torch.where(
+                        newly_ended_audio,
+                        torch.full_like(state.audio_prediction_end_idx, current_audio_step_idx),
+                        state.audio_prediction_end_idx
+                    )
 
             return state, audio_codes_next, pred_phoneme_tokens
 
@@ -2638,13 +2691,46 @@ class EasyMagpieTTSModel(ModelPT):
 
         with torch.inference_mode():
             # Stack all predictions - each is (B, num_codebooks), stack gives (B, num_codebooks, T)
-            predicted_codes = torch.stack(state.all_predictions, dim=-1)  # (B, num_codebooks, T)
-            T = predicted_codes.size(-1)
+            all_codes = torch.stack(state.all_predictions, dim=-1)  # (B, num_codebooks, T_total)
+            total_steps = all_codes.size(-1)
+            num_codebooks = all_codes.size(1)
 
-            # Create per-batch-item lengths (all same for now, will be adjusted by remove_eos_token)
-            predicted_codes_lens = torch.full((batch_size,), T, dtype=torch.long, device=state.device)
+            # Compute start and end indices for each batch item
+            # If start_idx is -1, item never started audio predictions - use 0
+            # If end_idx is -1, item never ended - use total_steps
+            start_indices = torch.clamp(state.audio_prediction_start_idx, min=0)
+            end_indices = torch.where(
+                state.audio_prediction_end_idx >= 0,
+                state.audio_prediction_end_idx,
+                torch.full_like(state.audio_prediction_end_idx, total_steps)
+            )
 
-            # Remove EOS tokens
+            # Calculate per-item lengths
+            predicted_codes_lens = end_indices - start_indices
+            max_len = predicted_codes_lens.max().item()
+
+            # Handle case where all items have zero-length predictions
+            if max_len == 0:
+                return (
+                    torch.zeros(batch_size, 0, device=state.device),
+                    torch.zeros(batch_size, dtype=torch.long, device=state.device),
+                    torch.zeros(batch_size, num_codebooks, 0, device=state.device, dtype=all_codes.dtype),
+                    torch.zeros(batch_size, dtype=torch.long, device=state.device),
+                )
+
+            # Create padded output tensor and slice each item's valid predictions
+            predicted_codes = torch.zeros(
+                batch_size, num_codebooks, max_len,
+                dtype=all_codes.dtype, device=state.device
+            )
+            for i in range(batch_size):
+                start = start_indices[i].item()
+                end = end_indices[i].item()
+                length = end - start
+                if length > 0:
+                    predicted_codes[i, :, :length] = all_codes[i, :, start:end]
+
+            # Remove EOS tokens (adjusts lengths based on EOS positions within valid range)
             predicted_codes, predicted_codes_lens = self.remove_eos_token(predicted_codes, predicted_codes_lens)
 
             # Decode to audio

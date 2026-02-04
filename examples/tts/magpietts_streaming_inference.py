@@ -150,23 +150,33 @@ def adjust_audio_to_duration(
     audio: torch.Tensor,
     sample_rate: int,
     target_duration: float,
+    codec_model_samples_per_frame: int,
 ) -> torch.Tensor:
     """
-    Adjust audio to exactly target_duration seconds.
+    Adjust audio to target_duration seconds, aligned to codec frame boundaries.
 
-    If audio is longer than target_duration, take the first target_duration seconds.
+    The target number of samples is calculated to align with codec frame boundaries:
+    1. Convert target_duration to number of codec frames
+    2. Convert codec frames back to samples
+
+    If audio is longer than target, take the first target_duration seconds.
     If audio is shorter, repeat it until it reaches target_duration seconds.
 
     Args:
         audio: Audio tensor of shape (1, num_samples).
         sample_rate: Sample rate of the audio.
         target_duration: Target duration in seconds.
+        codec_model_samples_per_frame: Number of audio samples per codec frame
+            (codec downsampling factor).
 
     Returns:
-        Audio tensor of shape (1, target_num_samples) where
-        target_num_samples = int(target_duration * sample_rate).
+        Audio tensor of shape (1, target_num_samples) where target_num_samples
+        is aligned to codec frame boundaries.
     """
-    target_num_samples = int(target_duration * sample_rate)
+    # Calculate target samples aligned to codec frame boundaries
+    # Same logic as text_to_speech_dataset.py
+    num_codec_frames = int(target_duration * sample_rate / codec_model_samples_per_frame)
+    target_num_samples = num_codec_frames * codec_model_samples_per_frame
     current_num_samples = audio.size(1)
 
     if current_num_samples >= target_num_samples:
@@ -244,6 +254,7 @@ def run_streaming_inference(
         main_tokenizer_name = tokenizer_name
 
     text_tokens = model.tokenizer.encode(text, tokenizer_name=main_tokenizer_name)
+    text_tokens = text_tokens + [model.eos_id]
     text_tokens = torch.tensor(text_tokens, dtype=torch.long, device=device)
 
     # Get streaming delays for logging
@@ -476,6 +487,7 @@ def run_batched_streaming_inference(
     text_tokens_list = []
     for text in texts:
         tokens = model.tokenizer.encode(text, tokenizer_name=main_tokenizer_name)
+        tokens = tokens + [model.eos_id]
         text_tokens_list.append(torch.tensor(tokens, dtype=torch.long, device=device))
 
     max_text_len = max(len(t) for t in text_tokens_list)
@@ -777,10 +789,10 @@ def main():
         original_duration = audio.size(1) / model.sample_rate
         logging.info(f"  Original duration: {original_duration:.2f}s")
 
-        # Adjust to target duration
-        audio = adjust_audio_to_duration(audio, model.sample_rate, duration)
+        # Adjust to target duration (aligned to codec frame boundaries)
+        audio = adjust_audio_to_duration(audio, model.sample_rate, duration, model.codec_model_samples_per_frame)
         adjusted_duration = audio.size(1) / model.sample_rate
-        logging.info(f"  Adjusted duration: {adjusted_duration:.2f}s (target: {duration}s)")
+        logging.info(f"  Adjusted duration: {adjusted_duration:.2f}s (target: {duration}s, codec-aligned)")
 
         context_audios.append(audio)
         context_audio_lens_list.append(torch.tensor([audio.size(1)], dtype=torch.long))
