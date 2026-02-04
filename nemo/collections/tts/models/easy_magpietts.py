@@ -955,13 +955,13 @@ class EasyMagpieTTSModel(ModelPT):
                     wandb_audio_log[f"Audio/Example_{idx}"] = list()
                     if context_audio_np is not None:
                         wandb_audio_log[f"Audio/Example_{idx}"].append(
-                            wandb.Audio(context_audio_np, sample_rate=self.sample_rate, caption="context")
+                            wandb.Audio(context_audio_np, sample_rate=self.output_sample_rate, caption="context")
                         )
                     wandb_audio_log[f"Audio/Example_{idx}"].append(
-                        wandb.Audio(pred_audio_np, sample_rate=self.sample_rate, caption="prediction")
+                        wandb.Audio(pred_audio_np, sample_rate=self.output_sample_rate, caption="prediction")
                     )
                     wandb_audio_log[f"Audio/Example_{idx}"].append(
-                        wandb.Audio(target_audio_np, sample_rate=self.sample_rate, caption="target")
+                        wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
                     )
 
                 if is_tb:
@@ -970,19 +970,19 @@ class EasyMagpieTTSModel(ModelPT):
                             f'Example_{idx}/context',
                             context_audio_np,
                             global_step=self.global_step,
-                            sample_rate=self.sample_rate,
+                            sample_rate=self.output_sample_rate,
                         )
                     logger.experiment.add_audio(
                         f'Example_{idx}/prediction',
                         pred_audio_np,
                         global_step=self.global_step,
-                        sample_rate=self.sample_rate,
+                        sample_rate=self.output_sample_rate,
                     )
                     logger.experiment.add_audio(
                         f'Example_{idx}/target',
                         target_audio_np,
                         global_step=self.global_step,
-                        sample_rate=self.sample_rate,
+                        sample_rate=self.output_sample_rate,
                     )
 
         return wandb_audio_log
@@ -2580,7 +2580,7 @@ class EasyMagpieTTSModel(ModelPT):
             end_time = time.time()
             total_audio_duration_generated = (
                 predicted_audio_lens.max().item() * predicted_audio_lens.shape[0]
-            ) / self.sample_rate
+            ) / self.output_sample_rate
             rtf = total_audio_duration_generated / (end_time - start_time)
 
             rtf_metrics = {
@@ -2808,8 +2808,8 @@ class EasyMagpieTTSModel(ModelPT):
 
         with torch.inference_mode():
             device = state.device
-            streaming_speech_delay = state.training_mode.streaming_speech_delay
-            streaming_phonemes_delay = state.training_mode.streaming_phonemes_delay
+            streaming_speech_delay = state.training_mode.streaming_speech_delay + 1
+            streaming_phonemes_delay = state.training_mode.streaming_phonemes_delay + 1
 
             # Handle text input
             text_embedded = None

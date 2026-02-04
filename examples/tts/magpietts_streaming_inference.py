@@ -143,50 +143,27 @@ def load_audio(audio_path: str, target_sample_rate: int) -> torch.Tensor:
     return torch.from_numpy(audio).unsqueeze(0)  # (1, num_samples)
 
 
-def get_num_audio_samples_to_slice(duration: float, sample_rate: int, codec_model_samples_per_frame: int) -> int:
-    """
-    Get the precise number of audio samples to slice for a given duration.
-
-    This ensures the audio is sliced to an exact number of samples that aligns
-    with the codec model's frame size.
-
-    Args:
-        duration: Target duration in seconds.
-        sample_rate: Sample rate of the audio.
-        codec_model_samples_per_frame: Number of samples per codec frame (codec downsample factor).
-
-    Returns:
-        Number of audio samples aligned to codec frame boundaries.
-    """
-    num_codec_frames = int(duration * sample_rate / codec_model_samples_per_frame)
-    num_audio_samples = num_codec_frames * codec_model_samples_per_frame
-    return num_audio_samples
-
-
 def adjust_audio_to_duration(
     audio: torch.Tensor,
     sample_rate: int,
     target_duration: float,
-    codec_model_samples_per_frame: int,
 ) -> torch.Tensor:
     """
-    Adjust audio to exactly target_duration seconds, aligned to codec frame boundaries.
+    Adjust audio to exactly target_duration seconds.
 
     If audio is longer than target_duration, take the first target_duration seconds.
     If audio is shorter, repeat it until it reaches target_duration seconds.
-    The resulting length is aligned to codec frame boundaries.
 
     Args:
         audio: Audio tensor of shape (1, num_samples).
         sample_rate: Sample rate of the audio.
         target_duration: Target duration in seconds.
-        codec_model_samples_per_frame: Number of samples per codec frame (codec downsample factor).
 
     Returns:
         Audio tensor of shape (1, target_num_samples) where
-        target_num_samples is aligned to codec frame boundaries.
+        target_num_samples = int(target_duration * sample_rate).
     """
-    target_num_samples = get_num_audio_samples_to_slice(target_duration, sample_rate, codec_model_samples_per_frame)
+    target_num_samples = int(target_duration * sample_rate)
     current_num_samples = audio.size(1)
 
     if current_num_samples >= target_num_samples:
@@ -235,7 +212,8 @@ def run_streaming_inference(
         verbose: Whether to print progress.
 
     Returns:
-        Tuple of (audio, audio_len, codes, codes_len, timing_info).
+        Tuple of (audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens).
+        context_audio_decoded is the decoded context audio from the model's internal codes (for sanity checking).
     """
     device = next(model.parameters()).device
 
@@ -263,7 +241,6 @@ def run_streaming_inference(
         main_tokenizer_name = tokenizer_name
 
     text_tokens = model.tokenizer.encode(text, tokenizer_name=main_tokenizer_name)
-    text_tokens = text_tokens + [model.eos_id]
     text_tokens = torch.tensor(text_tokens, dtype=torch.long, device=device)
 
     # Get streaming delays for logging
@@ -299,6 +276,20 @@ def run_streaming_inference(
     init_time = time.time() - start_time
     if verbose:
         logging.info(f"Streaming init completed in {init_time:.3f}s")
+
+    # Decode and return context audio for sanity check
+    # The context_audio_codes in state have special tokens and are stacked
+    # We need to remove special tokens and decode them
+    with torch.inference_mode():
+        ctx_codes = state.context_audio_codes.clone()
+        ctx_codes_lens = state.context_audio_codes_lens.clone()
+        # Remove special tokens (BOS and EOS)
+        ctx_codes, ctx_codes_lens = model.remove_special_tokens(
+            codes=ctx_codes,
+            codes_len=ctx_codes_lens,
+        )
+        # codes_to_audio will handle unstacking internally
+        context_audio_decoded, context_audio_decoded_lens, _ = model.codes_to_audio(ctx_codes, ctx_codes_lens)
 
     # Feed text tokens one at a time
     generation_start = time.time()
@@ -383,7 +374,7 @@ def run_streaming_inference(
         'continuation_steps': continuation_steps,
     }
 
-    return audio, audio_len, codes, codes_len, timing_info
+    return audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens
 
 
 def main():
@@ -537,12 +528,11 @@ def main():
     original_duration = context_audio.size(1) / model.sample_rate
     logging.info(f"Original context audio duration: {original_duration:.2f}s")
 
-    # Adjust context audio to target duration (aligned to codec frame boundaries)
+    # Adjust context audio to target duration
     context_audio = adjust_audio_to_duration(
         context_audio,
         sample_rate=model.sample_rate,
         target_duration=args.context_duration,
-        codec_model_samples_per_frame=model.codec_model_samples_per_frame,
     )
     context_audio_lens = torch.tensor([context_audio.size(1)], dtype=torch.long)
     adjusted_duration = context_audio.size(1) / model.sample_rate
@@ -553,7 +543,7 @@ def main():
     logging.info(f"Text to synthesize: {args.text}")
 
     # Run streaming inference
-    audio, audio_len, codes, codes_len, timing_info = run_streaming_inference(
+    audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens = run_streaming_inference(
         model=model,
         context_audio=context_audio,
         context_audio_lens=context_audio_lens,
@@ -575,10 +565,19 @@ def main():
         os.makedirs(output_dir)
 
     audio_np = audio[0, :audio_len[0].item()].cpu().numpy()
-    sf.write(args.output_path, audio_np, model.sample_rate)
+    sf.write(args.output_path, audio_np, model.output_sample_rate)
 
     logging.info(f"Output saved to: {args.output_path}")
-    logging.info(f"Audio duration: {audio_len[0].item() / model.sample_rate:.2f}s")
+
+    # Save decoded context audio for sanity check (next to the predicted output)
+    output_base, output_ext = os.path.splitext(args.output_path)
+    context_output_path = f"{output_base}_context_decoded{output_ext}"
+    context_audio_np = context_audio_decoded[0, :context_audio_decoded_lens[0].item()].cpu().numpy()
+    sf.write(context_output_path, context_audio_np, model.output_sample_rate)
+
+    logging.info(f"Context audio (decoded from codes) saved to: {context_output_path}")
+    logging.info(f"Context audio duration: {context_audio_decoded_lens[0].item() / model.output_sample_rate:.2f}s")
+    logging.info(f"Audio duration: {audio_len[0].item() / model.output_sample_rate:.2f}s")
     logging.info(f"Generated codes shape: {codes.shape}")
 
     # Print timing summary
@@ -594,7 +593,7 @@ def main():
     logging.info(f"Continuation steps: {timing_info['continuation_steps']}")
 
     # Calculate RTF
-    audio_duration = audio_len[0].item() / model.sample_rate
+    audio_duration = audio_len[0].item() / model.output_sample_rate
     rtf = audio_duration / timing_info['total_time']
     logging.info(f"Real-time factor (RTF): {rtf:.2f}x")
 
