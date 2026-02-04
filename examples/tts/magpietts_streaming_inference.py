@@ -14,12 +14,14 @@
 """
 MagpieTTS Streaming Inference Test Script.
 
-This script tests the streaming TTS inference functionality for batch_size=1.
-It loads a model, processes context audio/text, and generates audio by feeding
-text tokens one at a time through the streaming interface.
+This script tests the streaming TTS inference functionality, supporting both
+single sample (batch_size=1) and batched inference (batch_size>1).
+
+For batched inference, each item in the batch can have different context lengths
+and be in different processing phases (context, prompt, phoneme-only, audio).
 
 Example usage:
-    # From checkpoint
+    # Single sample inference from checkpoint
     python examples/tts/magpietts_streaming_inference.py \
         --hparams_file /path/to/hparams.yaml \
         --checkpoint_file /path/to/model.ckpt \
@@ -28,12 +30,13 @@ Example usage:
         --text "Hello, this is a test of streaming TTS inference." \
         --output_path /path/to/output.wav
 
-    # From .nemo file
+    # Batched inference with multiple context audios
     python examples/tts/magpietts_streaming_inference.py \
         --nemo_file /path/to/model.nemo \
         --codecmodel_path /path/to/codec.nemo \
-        --context_audio /path/to/context.wav \
-        --text "Hello, this is a test of streaming TTS inference." \
+        --context_audio /path/to/context1.wav /path/to/context2.wav \
+        --context_duration 3.0 5.0 \
+        --text "First text to synthesize." "Second text to synthesize." \
         --output_path /path/to/output.wav
 """
 from __future__ import annotations
@@ -377,6 +380,219 @@ def run_streaming_inference(
     return audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens
 
 
+def run_batched_streaming_inference(
+    model: EasyMagpieTTSModel,
+    context_audios: list[torch.Tensor],
+    context_audio_lens_list: list[torch.Tensor],
+    context_texts: list[str],
+    texts: list[str],
+    inference_mode: Optional[str] = None,
+    use_cfg: bool = False,
+    cfg_scale: float = 1.5,
+    use_local_transformer: bool = False,
+    temperature: float = 0.7,
+    topk: int = 80,
+    max_steps: int = 500,
+    verbose: bool = True,
+) -> tuple:
+    """
+    Run batched streaming TTS inference.
+
+    Each batch item can have different context lengths. The streaming processes
+    only the minimum context length initially, then continues processing remaining
+    context per-item in the "context phase" before moving to prompt/audio phases.
+
+    Args:
+        model: The loaded EasyMagpieTTSModel.
+        context_audios: List of context audio tensors, each (1, num_samples).
+        context_audio_lens_list: List of context audio lengths, each (1,).
+        context_texts: List of context texts for speaker conditioning.
+        texts: List of main texts to synthesize.
+        inference_mode: Inference mode name (e.g., "streaming_4_8").
+        use_cfg: Whether to use classifier-free guidance.
+        cfg_scale: CFG scale factor.
+        use_local_transformer: Whether to use local transformer.
+        temperature: Sampling temperature.
+        topk: Top-k sampling parameter.
+        max_steps: Maximum generation steps.
+        verbose: Whether to print progress.
+
+    Returns:
+        Tuple of (audio, audio_len, codes, codes_len, timing_info).
+    """
+    device = next(model.parameters()).device
+    batch_size = len(context_audios)
+
+    assert len(context_texts) == batch_size, "Number of context texts must match batch size"
+    assert len(texts) == batch_size, "Number of texts must match batch size"
+
+    # Encode context audio to codes for each item
+    context_audio_codes_list = []
+    context_audio_codes_lens_list = []
+
+    with torch.inference_mode():
+        for i in range(batch_size):
+            context_audio = context_audios[i].to(device)
+            context_audio_lens = context_audio_lens_list[i].to(device)
+            codes, codes_lens = model.audio_to_codes(context_audio, context_audio_lens)
+            context_audio_codes_list.append(codes)
+            context_audio_codes_lens_list.append(codes_lens)
+
+    # Pad and batch context audio codes
+    max_context_len = max(c.size(-1) for c in context_audio_codes_list)
+    num_codebooks = context_audio_codes_list[0].size(1)
+
+    context_audio_codes = torch.zeros(batch_size, num_codebooks, max_context_len, dtype=torch.long, device=device)
+    context_audio_codes_lens = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    for i in range(batch_size):
+        codes = context_audio_codes_list[i]
+        codes_len = context_audio_codes_lens_list[i]
+        context_audio_codes[i, :, :codes.size(-1)] = codes[0]
+        context_audio_codes_lens[i] = codes_len[0]
+
+    # Tokenize context texts
+    tokenizer_name = model.text_conditioning_tokenizer_name
+    context_text_tokens_list = []
+    for ctx_text in context_texts:
+        tokens = model.tokenizer.encode(ctx_text, tokenizer_name=tokenizer_name)
+        context_text_tokens_list.append(tokens)
+
+    # Pad and batch context text tokens
+    max_context_text_len = max(len(t) for t in context_text_tokens_list)
+    context_text_tokens = torch.zeros(batch_size, max_context_text_len, dtype=torch.long, device=device)
+    context_text_tokens_lens = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    for i, tokens in enumerate(context_text_tokens_list):
+        context_text_tokens[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=device)
+        context_text_tokens_lens[i] = len(tokens)
+
+    # Tokenize main texts
+    if hasattr(model.tokenizer, 'tokenizers') and 'english_phoneme' in model.tokenizer.tokenizers:
+        main_tokenizer_name = 'english_phoneme'
+    else:
+        main_tokenizer_name = tokenizer_name
+
+    text_tokens_list = []
+    for text in texts:
+        tokens = model.tokenizer.encode(text, tokenizer_name=main_tokenizer_name)
+        text_tokens_list.append(torch.tensor(tokens, dtype=torch.long, device=device))
+
+    max_text_len = max(len(t) for t in text_tokens_list)
+
+    # Get streaming delays for logging
+    mode_name = inference_mode or model.default_inference_mode
+    training_mode = model.mode_name_to_mode.get(mode_name, model.training_modes[0])
+    phoneme_delay = training_mode.streaming_phonemes_delay
+    speech_delay = training_mode.streaming_speech_delay
+
+    if verbose:
+        logging.info(f"Batch size: {batch_size}")
+        logging.info(f"Context audio codes shape: {context_audio_codes.shape}")
+        logging.info(f"Context audio codes lens: {context_audio_codes_lens.tolist()}")
+        logging.info(f"Context text tokens shape: {context_text_tokens.shape}")
+        logging.info(f"Context text tokens lens: {context_text_tokens_lens.tolist()}")
+        logging.info(f"Max text tokens: {max_text_len}")
+        logging.info(f"Text tokens per item: {[len(t) for t in text_tokens_list]}")
+        logging.info(f"Using inference mode: {mode_name}")
+        logging.info(f"Phoneme delay: {phoneme_delay}, Speech delay: {speech_delay}")
+
+    # Initialize streaming state
+    start_time = time.time()
+
+    state = model.streaming_init(
+        context_audio_codes=context_audio_codes,
+        context_audio_codes_lens=context_audio_codes_lens,
+        context_text_tokens=context_text_tokens,
+        context_text_tokens_lens=context_text_tokens_lens,
+        inference_mode=inference_mode,
+        use_cfg=use_cfg,
+        cfg_scale=cfg_scale,
+        use_local_transformer=use_local_transformer,
+        temperature=temperature,
+        topk=topk,
+    )
+
+    init_time = time.time() - start_time
+    if verbose:
+        logging.info(f"Streaming init completed in {init_time:.3f}s")
+        logging.info(f"Initial context_position: {state.context_position.tolist()}")
+        logging.info(f"Full context lens: {state.full_context_lens.tolist()}")
+
+    # Feed text tokens one at a time
+    generation_start = time.time()
+    step_count = 0
+    num_audio_frames = 0
+
+    # Track which items have finished their text
+    text_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+    text_finished_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    # Main streaming loop
+    while not state.finished.all() and step_count < max_steps + max_text_len:
+        # Determine which items are in context phase
+        in_context_phase = state.context_position < state.full_context_lens
+
+        # Prepare text tokens for this step
+        # Items in context phase: use 0 (will be ignored)
+        # Items not in context phase: use their next text token or 0 if text finished
+        text_tokens_batch = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        for i in range(batch_size):
+            if not in_context_phase[i] and not text_finished_mask[i]:
+                if text_positions[i] < len(text_tokens_list[i]):
+                    text_tokens_batch[i] = text_tokens_list[i][text_positions[i]]
+                    text_positions[i] += 1
+                else:
+                    text_finished_mask[i] = True
+
+        # Determine if we should pass None (all items have finished text and exited context)
+        all_text_done = text_finished_mask.all() and not in_context_phase.any()
+
+        if all_text_done:
+            state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=None)
+        else:
+            state, audio_codes, phoneme_tokens = model.streaming_step(state, text_tokens=text_tokens_batch)
+
+        if audio_codes is not None:
+            num_audio_frames += 1
+
+        step_count += 1
+
+        if verbose and step_count % 20 == 0:
+            in_ctx = state.context_position < state.full_context_lens
+            logging.info(
+                f"Step {step_count}: "
+                f"in_context_phase={in_ctx.tolist()}, "
+                f"text_positions={text_positions.tolist()}, "
+                f"audio_frames={num_audio_frames}, "
+                f"finished={state.finished.tolist()}"
+            )
+
+    generation_time = time.time() - generation_start
+
+    if verbose:
+        logging.info(f"Generation completed in {generation_time:.3f}s")
+        logging.info(f"Total steps: {step_count}")
+        logging.info(f"Audio frames generated: {num_audio_frames}")
+
+    # Finalize and get complete audio
+    audio, audio_len, codes, codes_len = model.streaming_finalize(state)
+
+    total_time = time.time() - start_time
+
+    timing_info = {
+        'init_time': init_time,
+        'generation_time': generation_time,
+        'total_time': total_time,
+        'num_text_tokens': [len(t) for t in text_tokens_list],
+        'num_audio_frames': num_audio_frames,
+        'total_steps': step_count,
+    }
+
+    return audio, audio_len, codes, codes_len, timing_info
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MagpieTTS Streaming Inference Test Script",
@@ -415,27 +631,34 @@ def main():
     input_group.add_argument(
         '--context_audio',
         type=str,
+        nargs='+',
         required=True,
-        help='Path to context audio file for speaker cloning',
+        help='Path(s) to context audio file(s) for speaker cloning. '
+             'Multiple files enable batched inference.',
     )
     input_group.add_argument(
         '--context_text',
         type=str,
-        default="[NO TEXT CONTEXT]",
-        help='Context text for speaker conditioning (default: "[NO TEXT CONTEXT]")',
+        nargs='+',
+        default=["[NO TEXT CONTEXT]"],
+        help='Context text(s) for speaker conditioning. Provide one per context audio, '
+             'or a single value to use for all. (default: "[NO TEXT CONTEXT]")',
     )
     input_group.add_argument(
         '--context_duration',
         type=float,
-        default=5.0,
-        help='Target duration for context audio in seconds. If audio is longer, '
+        nargs='+',
+        default=[5.0],
+        help='Target duration(s) for context audio in seconds. Provide one per context audio, '
+             'or a single value to use for all. If audio is longer, '
              'first N seconds are used. If shorter, audio is repeated. (default: 5.0)',
     )
     input_group.add_argument(
         '--text',
         type=str,
+        nargs='+',
         required=True,
-        help='Text to synthesize',
+        help='Text(s) to synthesize. Provide one per context audio for batched inference.',
     )
 
     # Output arguments
@@ -522,80 +745,154 @@ def main():
 
     model = model.float()
 
-    # Load context audio
-    logging.info(f"Loading context audio from: {args.context_audio}")
-    context_audio = load_audio(args.context_audio, model.sample_rate)
-    original_duration = context_audio.size(1) / model.sample_rate
-    logging.info(f"Original context audio duration: {original_duration:.2f}s")
+    # Determine batch size from number of context audios
+    batch_size = len(args.context_audio)
 
-    # Adjust context audio to target duration
-    context_audio = adjust_audio_to_duration(
-        context_audio,
-        sample_rate=model.sample_rate,
-        target_duration=args.context_duration,
-    )
-    context_audio_lens = torch.tensor([context_audio.size(1)], dtype=torch.long)
-    adjusted_duration = context_audio.size(1) / model.sample_rate
+    # Expand context_text, context_duration, and text to match batch_size
+    context_texts = args.context_text
+    if len(context_texts) == 1 and batch_size > 1:
+        context_texts = context_texts * batch_size
+    elif len(context_texts) != batch_size:
+        parser.error(f"Number of context_texts ({len(context_texts)}) must match number of context_audios ({batch_size}) or be 1")
 
-    logging.info(f"Adjusted context audio to {adjusted_duration:.2f}s (target: {args.context_duration}s)")
-    logging.info(f"Context audio shape: {context_audio.shape}, sample_rate={model.sample_rate}")
-    logging.info(f"Context text: {args.context_text}")
-    logging.info(f"Text to synthesize: {args.text}")
+    context_durations = args.context_duration
+    if len(context_durations) == 1 and batch_size > 1:
+        context_durations = context_durations * batch_size
+    elif len(context_durations) != batch_size:
+        parser.error(f"Number of context_durations ({len(context_durations)}) must match number of context_audios ({batch_size}) or be 1")
 
-    # Run streaming inference
-    audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens = run_streaming_inference(
-        model=model,
-        context_audio=context_audio,
-        context_audio_lens=context_audio_lens,
-        context_text=args.context_text,
-        text=args.text,
-        inference_mode=args.inference_mode,
-        use_cfg=args.use_cfg,
-        cfg_scale=args.cfg_scale,
-        use_local_transformer=args.use_local_transformer,
-        temperature=args.temperature,
-        topk=args.topk,
-        max_steps=args.max_steps,
-        verbose=args.verbose,
-    )
+    texts = args.text
+    if len(texts) == 1 and batch_size > 1:
+        texts = texts * batch_size
+    elif len(texts) != batch_size:
+        parser.error(f"Number of texts ({len(texts)}) must match number of context_audios ({batch_size}) or be 1")
 
-    # Save output
-    output_dir = os.path.dirname(args.output_path)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    # Load and process context audios
+    context_audios = []
+    context_audio_lens_list = []
 
-    audio_np = audio[0, :audio_len[0].item()].cpu().numpy()
-    sf.write(args.output_path, audio_np, model.output_sample_rate)
+    for i, (audio_path, duration) in enumerate(zip(args.context_audio, context_durations)):
+        logging.info(f"Loading context audio {i+1}/{batch_size} from: {audio_path}")
+        audio = load_audio(audio_path, model.sample_rate)
+        original_duration = audio.size(1) / model.sample_rate
+        logging.info(f"  Original duration: {original_duration:.2f}s")
 
-    logging.info(f"Output saved to: {args.output_path}")
+        # Adjust to target duration
+        audio = adjust_audio_to_duration(audio, model.sample_rate, duration)
+        adjusted_duration = audio.size(1) / model.sample_rate
+        logging.info(f"  Adjusted duration: {adjusted_duration:.2f}s (target: {duration}s)")
 
-    # Save decoded context audio for sanity check (next to the predicted output)
-    output_base, output_ext = os.path.splitext(args.output_path)
-    context_output_path = f"{output_base}_context_decoded{output_ext}"
-    context_audio_np = context_audio_decoded[0, :context_audio_decoded_lens[0].item()].cpu().numpy()
-    sf.write(context_output_path, context_audio_np, model.output_sample_rate)
+        context_audios.append(audio)
+        context_audio_lens_list.append(torch.tensor([audio.size(1)], dtype=torch.long))
 
-    logging.info(f"Context audio (decoded from codes) saved to: {context_output_path}")
-    logging.info(f"Context audio duration: {context_audio_decoded_lens[0].item() / model.output_sample_rate:.2f}s")
-    logging.info(f"Audio duration: {audio_len[0].item() / model.output_sample_rate:.2f}s")
-    logging.info(f"Generated codes shape: {codes.shape}")
+    logging.info(f"\nBatch size: {batch_size}")
+    logging.info(f"Context texts: {context_texts}")
+    logging.info(f"Texts to synthesize: {texts}")
 
-    # Print timing summary
-    logging.info("\n=== Timing Summary ===")
-    logging.info(f"Init time: {timing_info['init_time']:.3f}s")
-    logging.info(f"Generation time: {timing_info['generation_time']:.3f}s")
-    logging.info(f"Total time: {timing_info['total_time']:.3f}s")
-    logging.info(f"Text tokens processed: {timing_info['num_text_tokens']}")
-    logging.info(f"  - Prompt phase tokens: {timing_info['prompt_phase_tokens']}")
-    logging.info(f"  - Phoneme-only phase tokens: {timing_info['phoneme_only_phase_tokens']}")
-    logging.info(f"Audio frames generated: {timing_info['num_audio_frames']}")
-    logging.info(f"Phoneme frames generated: {timing_info['num_phoneme_frames']}")
-    logging.info(f"Continuation steps: {timing_info['continuation_steps']}")
+    # Use single-sample or batched inference
+    if batch_size == 1:
+        logging.info("\n=== Running single-sample streaming inference ===")
+        audio, audio_len, codes, codes_len, timing_info, context_audio_decoded, context_audio_decoded_lens = run_streaming_inference(
+            model=model,
+            context_audio=context_audios[0],
+            context_audio_lens=context_audio_lens_list[0],
+            context_text=context_texts[0],
+            text=texts[0],
+            inference_mode=args.inference_mode,
+            use_cfg=args.use_cfg,
+            cfg_scale=args.cfg_scale,
+            use_local_transformer=args.use_local_transformer,
+            temperature=args.temperature,
+            topk=args.topk,
+            max_steps=args.max_steps,
+            verbose=args.verbose,
+        )
 
-    # Calculate RTF
-    audio_duration = audio_len[0].item() / model.output_sample_rate
-    rtf = audio_duration / timing_info['total_time']
-    logging.info(f"Real-time factor (RTF): {rtf:.2f}x")
+        # Save output
+        output_dir = os.path.dirname(args.output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        audio_np = audio[0, :audio_len[0].item()].cpu().numpy()
+        sf.write(args.output_path, audio_np, model.output_sample_rate)
+        logging.info(f"Output saved to: {args.output_path}")
+
+        # Save decoded context audio for sanity check
+        output_base, output_ext = os.path.splitext(args.output_path)
+        context_output_path = f"{output_base}_context_decoded{output_ext}"
+        context_audio_np = context_audio_decoded[0, :context_audio_decoded_lens[0].item()].cpu().numpy()
+        sf.write(context_output_path, context_audio_np, model.output_sample_rate)
+
+        logging.info(f"Context audio (decoded from codes) saved to: {context_output_path}")
+        logging.info(f"Context audio duration: {context_audio_decoded_lens[0].item() / model.output_sample_rate:.2f}s")
+        logging.info(f"Audio duration: {audio_len[0].item() / model.output_sample_rate:.2f}s")
+        logging.info(f"Generated codes shape: {codes.shape}")
+
+        # Print timing summary
+        logging.info("\n=== Timing Summary ===")
+        logging.info(f"Init time: {timing_info['init_time']:.3f}s")
+        logging.info(f"Generation time: {timing_info['generation_time']:.3f}s")
+        logging.info(f"Total time: {timing_info['total_time']:.3f}s")
+        logging.info(f"Text tokens processed: {timing_info['num_text_tokens']}")
+        logging.info(f"  - Prompt phase tokens: {timing_info['prompt_phase_tokens']}")
+        logging.info(f"  - Phoneme-only phase tokens: {timing_info['phoneme_only_phase_tokens']}")
+        logging.info(f"Audio frames generated: {timing_info['num_audio_frames']}")
+        logging.info(f"Phoneme frames generated: {timing_info['num_phoneme_frames']}")
+        logging.info(f"Continuation steps: {timing_info['continuation_steps']}")
+
+        # Calculate RTF
+        audio_duration = audio_len[0].item() / model.output_sample_rate
+        rtf = audio_duration / timing_info['total_time']
+        logging.info(f"Real-time factor (RTF): {rtf:.2f}x")
+
+    else:
+        logging.info(f"\n=== Running batched streaming inference (batch_size={batch_size}) ===")
+        audio, audio_len, codes, codes_len, timing_info = run_batched_streaming_inference(
+            model=model,
+            context_audios=context_audios,
+            context_audio_lens_list=context_audio_lens_list,
+            context_texts=context_texts,
+            texts=texts,
+            inference_mode=args.inference_mode,
+            use_cfg=args.use_cfg,
+            cfg_scale=args.cfg_scale,
+            use_local_transformer=args.use_local_transformer,
+            temperature=args.temperature,
+            topk=args.topk,
+            max_steps=args.max_steps,
+            verbose=args.verbose,
+        )
+
+        # Save outputs for each batch item
+        output_dir = os.path.dirname(args.output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        output_base, output_ext = os.path.splitext(args.output_path)
+
+        for i in range(batch_size):
+            output_path_i = f"{output_base}_{i}{output_ext}"
+            audio_np = audio[i, :audio_len[i].item()].cpu().numpy()
+            sf.write(output_path_i, audio_np, model.output_sample_rate)
+            audio_duration_i = audio_len[i].item() / model.output_sample_rate
+            logging.info(f"Output {i+1}/{batch_size} saved to: {output_path_i} (duration: {audio_duration_i:.2f}s)")
+
+        logging.info(f"\nGenerated codes shape: {codes.shape}")
+
+        # Print timing summary
+        logging.info("\n=== Timing Summary ===")
+        logging.info(f"Init time: {timing_info['init_time']:.3f}s")
+        logging.info(f"Generation time: {timing_info['generation_time']:.3f}s")
+        logging.info(f"Total time: {timing_info['total_time']:.3f}s")
+        logging.info(f"Text tokens per item: {timing_info['num_text_tokens']}")
+        logging.info(f"Audio frames generated: {timing_info['num_audio_frames']}")
+        logging.info(f"Total steps: {timing_info['total_steps']}")
+
+        # Calculate average RTF
+        total_audio_duration = sum(audio_len[i].item() for i in range(batch_size)) / model.output_sample_rate
+        avg_rtf = total_audio_duration / timing_info['total_time']
+        logging.info(f"Average real-time factor (RTF): {avg_rtf:.2f}x")
+        logging.info(f"Total audio duration (all items): {total_audio_duration:.2f}s")
 
 
 if __name__ == "__main__":
