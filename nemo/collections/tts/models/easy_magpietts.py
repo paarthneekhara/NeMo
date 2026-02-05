@@ -2062,7 +2062,7 @@ class EasyMagpieTTSModel(ModelPT):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sample audio codes from logits using either local transformer or parallel sampling.
-        
+
         Returns:
             audio_codes_next: Sampled codes with temperature/topk (B, num_codebooks)
             all_codes_next_argmax: Argmax sampled codes for EOS detection (B, num_codebooks)
@@ -2084,9 +2084,7 @@ class EasyMagpieTTSModel(ModelPT):
             all_codes_next_argmax = audio_codes_next
         else:
             # Parallel sampling from all codebook logits
-            audio_codes_next = self.sample_codes_from_logits(
-                all_code_logits_t, temperature=temperature, topk=topk
-            )
+            audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk)
             # Argmax sampling for reliable EOS detection
             all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01)
 
