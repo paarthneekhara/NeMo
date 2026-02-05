@@ -15,7 +15,7 @@ import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import wandb
@@ -201,6 +201,17 @@ class StreamingFinalizeOutput:
     audio_codes_len: torch.Tensor  # (B,) length of codes per batch item
     phoneme_tokens: List[List[int]]  # List of phoneme token sequences per batch item
     phoneme_text: List[str]  # Decoded phoneme strings per batch item
+
+
+@dataclass
+class InferBatchOutput:
+    """Output dataclass for EasyMagpieTTS infer_batch method."""
+
+    predicted_audio: torch.Tensor  # (B, T_audio)
+    predicted_audio_lens: torch.Tensor  # (B,)
+    predicted_codes: torch.Tensor  # (B, num_codebooks, T_frames)
+    predicted_codes_lens: torch.Tensor  # (B,)
+    rtf_metrics: Dict[str, Any]
 
 
 def worker_init_fn(worker_id):
@@ -2018,47 +2029,7 @@ class EasyMagpieTTSModel(ModelPT):
     def setup_test_data(self, cfg):
         self._test_dl = self._setup_test_dataloader(cfg)
 
-    def _log_phoneme_predictions(
-        self,
-        pred_phoneme_token_lists: List[List[int]],
-        gt_phoneme_token_lists: List[List[int]],
-        batch_size: int,
-    ) -> None:
-        """Log predicted vs ground truth phoneme tokens for debugging."""
-        for item_idx in range(batch_size):
-            logging.info(f"Predicted phoneme tokens for item {item_idx}: {pred_phoneme_token_lists[item_idx]}")
-            logging.info(f"GT phoneme tokens for item {item_idx}: {gt_phoneme_token_lists[item_idx]}")
-            predicted_phoneme_text = self.phoneme_tokenizer.decode(pred_phoneme_token_lists[item_idx])
-            gt_phoneme_text = self.phoneme_tokenizer.decode(gt_phoneme_token_lists[item_idx])
-            logging.info(f"Predicted phoneme text for item {item_idx}: {predicted_phoneme_text}")
-            logging.info(f"GT phoneme text for item {item_idx}: {gt_phoneme_text}")
-
-    def _collect_phoneme_tokens_for_logging(
-        self,
-        pred_phoneme_tokens: torch.Tensor,
-        gt_phoneme_tokens_current: torch.Tensor,
-        use_phoneme_input: torch.Tensor,
-        pred_phoneme_token_lists: List[List[int]],
-        gt_phoneme_token_lists: List[List[int]],
-        batch_size: int,
-    ) -> None:
-        """Collect phoneme tokens into lists for later logging (does not print)."""
-        special_tokens = {
-            self.phoneme_tokenizer.eos_token_id,
-            self.phoneme_tokenizer.bos_token_id,
-            self.phoneme_tokenizer.pad,
-        }
-        for item_idx in range(batch_size):
-            if use_phoneme_input[item_idx, 0, 0] > 0:
-                for phoneme_channel_idx in range(self.phoneme_stacking_factor):
-                    pred_token = pred_phoneme_tokens[item_idx, phoneme_channel_idx].item()
-                    if pred_token not in special_tokens:
-                        pred_phoneme_token_lists[item_idx].append(pred_token)
-
-                    gt_token = gt_phoneme_tokens_current[item_idx, phoneme_channel_idx].item()
-                    if gt_token not in special_tokens:
-                        gt_phoneme_token_lists[item_idx].append(gt_token)
-
+    
     def _sample_audio_codes(
         self,
         last_hidden: torch.Tensor,
@@ -2113,7 +2084,7 @@ class EasyMagpieTTSModel(ModelPT):
         use_local_transformer: bool = False,
         temperature: float = 0.7,
         topk: int = 80,
-        phoneme_input_type: str = 'pred',
+        phoneme_input_type: str = 'predicted',
         phoneme_sampling_method: str = 'argmax',
         gt_phoneme_tokens: Optional[torch.Tensor] = None,
         gt_phoneme_tokens_lens: Optional[torch.Tensor] = None,
@@ -2151,7 +2122,7 @@ class EasyMagpieTTSModel(ModelPT):
             use_local_transformer: Whether to use local transformer for AR sampling.
             temperature: Sampling temperature for audio codes.
             topk: Top-k sampling parameter.
-            phoneme_input_type: 'gt' or 'pred' for phoneme tokens (use 'pred' for streaming).
+            phoneme_input_type: 'gt' or 'predicted' for phoneme tokens (use 'predicted' for streaming).
             phoneme_sampling_method: 'argmax' or 'sample' for phoneme token selection.
             gt_phoneme_tokens: Optional GT phoneme tokens (B, L) with BOS/EOS for teacher forcing.
             gt_phoneme_tokens_lens: Lengths of GT phoneme tokens (B,).
@@ -2482,9 +2453,13 @@ class EasyMagpieTTSModel(ModelPT):
             if state.use_cfg:
                 # For unconditional branch, use dummy embedding for non-audio items
                 # and audio-only embedding for audio items
-                next_input_unconditional = state.dummy_context_embedding_unconditional.expand(batch_size, 1, -1)
-
-                # For audio phase items, use audio embedding for unconditional
+                next_input_unconditional_context = state.dummy_context_embedding_unconditional.expand(batch_size, 1, -1)
+                # After the context is finished, we use zero embedding for the unconditional branch until audio phase starts
+                next_input_unconditional_zeros = torch.zeros_like(next_input_unconditional_context)
+                context_mask = needs_context.view(batch_size, 1, 1).float()
+                next_input_unconditional = context_mask * next_input_unconditional_context + (1 - context_mask) * next_input_unconditional_zeros
+                
+                # For audio phase items, we use audio embedding for the unconditional branch
                 if needs_audio.any():
                     audio_mask = needs_audio.view(batch_size, 1, 1).float()
                     next_input_unconditional = next_input_unconditional * (1 - audio_mask) + audio_emb * audio_mask
@@ -2815,6 +2790,147 @@ class EasyMagpieTTSModel(ModelPT):
                 audio_codes_len=predicted_codes_lens,
                 phoneme_tokens=phoneme_tokens_list,
                 phoneme_text=phoneme_text_list,
+            )
+
+    def infer_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        max_decoder_steps: int = 500,
+        temperature: float = 0.7,
+        topk: int = 80,
+        use_cfg: bool = False,
+        cfg_scale: float = 1.0,
+        use_local_transformer_for_inference: bool = False,
+        phoneme_input_type: str = 'pred',
+        phoneme_sampling_method: str = 'argmax',
+        force_dropout_text: bool = False,
+    ) -> InferBatchOutput:
+        """
+        Batch inference using streaming infrastructure.
+
+        This is a simple wrapper around streaming_init, streaming_step, and streaming_finalize
+        that processes a batch dictionary similar to training_step/validation_step.
+
+        Args:
+            batch: Dictionary containing:
+                - text: Text token IDs (B, L)
+                - text_lens: Lengths (B,)
+                - context_text_tokens: Context text tokens (B, L')
+                - context_text_tokens_lens: Lengths (B,)
+                - context_audio_codes: Context audio codes (B, C, T) OR
+                - context_audio / context_audio_lens: Raw context audio to encode
+                - phoneme_tokens (optional): GT phoneme tokens (B, L'')
+                - phoneme_tokens_lens (optional): Lengths (B,)
+            max_decoder_steps: Maximum number of decoder steps.
+            temperature: Sampling temperature for audio codes.
+            topk: Top-k sampling parameter.
+            use_cfg: Whether to use classifier-free guidance.
+            cfg_scale: CFG scale factor.
+            use_local_transformer_for_inference: Whether to use local transformer.
+            phoneme_input_type: 'gt' or 'pred' for phoneme tokens.
+            phoneme_sampling_method: 'argmax' or 'sample' for phoneme token selection.
+            force_dropout_text: Whether to dropout text embeddings.
+
+        Returns:
+            InferBatchOutput containing predicted audio, codes, and RTF metrics.
+        """
+        with torch.inference_mode():
+            start_time = time.time()
+
+            # Extract tensors from batch
+            text = batch['text']
+            text_lens = batch['text_lens']
+            context_text_tokens = batch['context_text_tokens']
+            context_text_tokens_lens = batch['context_text_tokens_lens']
+
+            # Handle context audio - either use codes directly or encode from audio
+            if 'context_audio_codes' in batch:
+                context_audio_codes = batch['context_audio_codes']
+                context_audio_codes_lens = batch['context_audio_codes_lens']
+            else:
+                context_audio = batch['context_audio']
+                context_audio_lens = batch['context_audio_lens']
+                context_audio_codes, context_audio_codes_lens = self.audio_to_codes(
+                    context_audio, context_audio_lens
+                )
+
+            # Optional GT phoneme tokens for teacher forcing
+            gt_phoneme_tokens = batch.get('phoneme_tokens')
+            gt_phoneme_tokens_lens = batch.get('phoneme_tokens_lens')
+
+            batch_size = text.size(0)
+
+            # Initialize streaming state
+            state = self.streaming_init(
+                context_audio_codes=context_audio_codes,
+                context_audio_codes_lens=context_audio_codes_lens,
+                context_text_tokens=context_text_tokens,
+                context_text_tokens_lens=context_text_tokens_lens,
+                use_cfg=use_cfg,
+                cfg_scale=cfg_scale,
+                use_local_transformer=use_local_transformer_for_inference,
+                temperature=temperature,
+                topk=topk,
+                phoneme_input_type=phoneme_input_type,
+                phoneme_sampling_method=phoneme_sampling_method,
+                gt_phoneme_tokens=gt_phoneme_tokens,
+                gt_phoneme_tokens_lens=gt_phoneme_tokens_lens,
+            )
+
+            time_to_first_prediction = None
+            generation_start_time = time.time()
+            device = text.device
+
+            # Generate until all items are finished or max steps reached
+            while not state.finished.all() and len(state.all_predictions) < max_decoder_steps:
+                # Gather the correct text token for each batch item based on text_tokens_seen
+                # Items in context phase will have their token ignored by streaming_step
+                positions = state.text_tokens_seen.clamp(max=text.size(1) - 1)
+                current_tokens = text[torch.arange(batch_size, device=device), positions]
+
+                # For items that have exhausted their text, provide EOS token
+                text_exhausted = state.text_tokens_seen >= text_lens
+                current_tokens = torch.where(text_exhausted, torch.full_like(current_tokens, self.eos_id), current_tokens)
+
+                state, audio_codes, phoneme_tokens = self.streaming_step(
+                    state=state,
+                    text_tokens=current_tokens,
+                    force_dropout_text=force_dropout_text,
+                )
+
+                # Record time to first audio prediction
+                if time_to_first_prediction is None and audio_codes is not None:
+                    time_to_first_prediction = time.time() - start_time
+
+            tts_generation_time = time.time() - generation_start_time
+
+            # Finalize and decode audio
+            finalize_output = self.streaming_finalize(state)
+
+            end_time = time.time()
+            total_time = end_time - start_time
+
+            # Compute RTF metrics
+            total_audio_samples = finalize_output.audio_len.sum().item()
+            total_audio_duration = total_audio_samples / self.output_sample_rate
+            num_frames = len(state.all_predictions)
+            tts_generation_time_per_frame = tts_generation_time / num_frames if num_frames > 0 else 0.0
+
+            rtf_metrics = {
+                'rtf': total_audio_duration / total_time if total_time > 0 else 0.0,
+                'time_to_first_prediction': time_to_first_prediction,
+                'tts_generation_time': tts_generation_time,
+                'max_frames_generated': num_frames,
+                'tts_generation_time_per_frame': tts_generation_time_per_frame,
+                'batch_size': batch_size,
+            }
+
+            return InferBatchOutput(
+                predicted_audio=finalize_output.audio,
+                predicted_audio_lens=finalize_output.audio_len,
+                predicted_codes=finalize_output.audio_codes,
+                predicted_codes_lens=finalize_output.audio_codes_len,
+                rtf_metrics=rtf_metrics,
             )
 
     @classmethod
