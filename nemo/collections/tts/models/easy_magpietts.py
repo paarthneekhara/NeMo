@@ -2441,8 +2441,6 @@ class EasyMagpieTTSModel(ModelPT):
                 next_input_unconditional_zeros = torch.zeros_like(next_input_unconditional_context)
                 context_mask = needs_context.view(batch_size, 1, 1).float()
                 next_input_unconditional = context_mask * next_input_unconditional_context + (1 - context_mask) * next_input_unconditional_zeros
-                # TODO: Remove this line after testing
-                next_input_unconditional = next_input_unconditional_context
                 
                 # For audio phase items, we use audio embedding for the unconditional branch
                 if needs_audio.any():
