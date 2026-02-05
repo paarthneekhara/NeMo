@@ -2313,8 +2313,8 @@ class EasyMagpieTTSModel(ModelPT):
         with torch.inference_mode():
             device = state.device
             batch_size = state.batch_size
-            streaming_speech_delay = state.training_mode.streaming_speech_delay + 1
-            streaming_phonemes_delay = state.training_mode.streaming_phonemes_delay + 1
+            streaming_speech_delay = state.training_mode.streaming_speech_delay
+            streaming_phonemes_delay = state.training_mode.streaming_phonemes_delay
 
             # ==================== DETERMINE PHASES PER BATCH ITEM ====================
             needs_context = state.context_position < state.full_context_lens  # (B,) bool
