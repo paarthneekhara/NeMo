@@ -1057,7 +1057,7 @@ class EasyMagpieTTSModel(ModelPT):
 
         return joined, out_lengths
 
-    def prepare_context_tensors_simple(
+    def prepare_context_tensors(
         self,
         context_text_tokens: torch.Tensor,
         context_text_tokens_lens: torch.Tensor,
@@ -1072,9 +1072,7 @@ class EasyMagpieTTSModel(ModelPT):
         Prepare context tensors (without text) for the simplified process_batch.
 
         This function processes context audio and context text to create the combined
-        context embedding. Unlike prepare_context_tensors, this does NOT include the
-        main text input - text is handled separately as a channel.
-
+        context embedding.
         Args:
             context_text_tokens: Context text token IDs for speaker/style conditioning (B, L)
             context_text_tokens_lens: Length of context text for each batch item (B,)
@@ -1562,7 +1560,7 @@ class EasyMagpieTTSModel(ModelPT):
 
         # 1. Prepare context tensors (without text)
         context_embedding, context_lens, context_audio_codes_processed, context_audio_codes_lens_processed = (
-            self.prepare_context_tensors_simple(
+            self.prepare_context_tensors(
                 context_text_tokens=context_text_tokens,
                 context_text_tokens_lens=context_text_tokens_lens,
                 context_audio_codes=context_audio_codes,
@@ -2163,54 +2161,16 @@ class EasyMagpieTTSModel(ModelPT):
                 raise ValueError(f"Unknown inference mode '{mode_name}'. Available modes: {available_modes}")
 
             selected_training_mode = self.mode_name_to_mode[mode_name]
-            current_mode_idx = selected_training_mode.mode_idx
 
-            # Process context audio codes
-            if self._codec_converter is not None:
-                context_audio_codes = self._codec_converter.convert_original_to_new(
-                    audio_tokens=context_audio_codes, audio_lens=context_audio_codes_lens
-                ).long()
-
-            context_audio_codes, context_audio_codes_lens = self.add_special_tokens(
-                codes=context_audio_codes,
-                codes_len=context_audio_codes_lens,
-                bos_id=self.context_audio_bos_id,
-                eos_id=self.context_audio_eos_id,
+            # Prepare context embedding using shared helper
+            context_embedding, context_lens, context_audio_codes, context_audio_codes_lens = self.prepare_context_tensors(
+                context_text_tokens=context_text_tokens,
+                context_text_tokens_lens=context_text_tokens_lens,
+                context_audio_codes=context_audio_codes,
+                context_audio_codes_lens=context_audio_codes_lens,
+                training_mode=selected_training_mode,
+                dropout_conditional_input=False,
             )
-
-            context_audio_codes, context_audio_codes_lens = self.stack_codes(
-                context_audio_codes,
-                context_audio_codes_lens,
-                self.audio_bos_id,
-                self.audio_eos_id,
-                self.frame_stacking_factor,
-                self.num_audio_codebooks,
-            )
-            context_audio_embedded = self.embed_audio_tokens(context_audio_codes)  # (B, T', E)
-
-            # Process context text
-            context_text_embedded = self.decoder.get_input_embeddings()(context_text_tokens)  # (B, L, E)
-
-            # Prepare task embedding
-            task_embedding = None
-            task_embedding_lens = None
-            if self.task_embedding is not None and current_mode_idx is not None:
-                mode_idx_tensor = torch.full((batch_size,), current_mode_idx, dtype=torch.long, device=device)
-                task_embedding = self.task_embedding(mode_idx_tensor).unsqueeze(1)  # (B, 1, E)
-                task_embedding_lens = torch.ones(batch_size, dtype=torch.long, device=device)
-
-            # Build context embedding (task_embedding + context_audio + context_text)
-            # No main text is included in the initial context - it will come via streaming_step
-            if task_embedding is not None:
-                context_embedding, context_lens = self.join_embeddings_temporally(
-                    embeddings=[task_embedding, context_audio_embedded, context_text_embedded],
-                    lengths=[task_embedding_lens, context_audio_codes_lens, context_text_tokens_lens],
-                )
-            else:
-                context_embedding, context_lens = self.join_embeddings_temporally(
-                    embeddings=[context_audio_embedded, context_text_embedded],
-                    lengths=[context_audio_codes_lens, context_text_tokens_lens],
-                )
 
             # Store full context embedding and lens before any CFG manipulation
             full_context_embedding = context_embedding.clone()  # (B, T_max, E)
@@ -2481,6 +2441,8 @@ class EasyMagpieTTSModel(ModelPT):
                 next_input_unconditional_zeros = torch.zeros_like(next_input_unconditional_context)
                 context_mask = needs_context.view(batch_size, 1, 1).float()
                 next_input_unconditional = context_mask * next_input_unconditional_context + (1 - context_mask) * next_input_unconditional_zeros
+                # TODO: Remove this line after testing
+                next_input_unconditional = next_input_unconditional_context
                 
                 # For audio phase items, we use audio embedding for the unconditional branch
                 if needs_audio.any():
