@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import random
 import time
+
+import soundfile as sf
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -1903,6 +1906,46 @@ class EasyMagpieTTSModel(ModelPT):
             for logger in self.loggers:
                 if isinstance(logger, WandbLogger) and wandb_log_dict:
                     logger.experiment.log(wandb_log_dict)
+
+        # Run inference and save generated audio
+        infer_output = self.infer_batch(batch, max_decoder_steps=220, temperature=0.7, topk=80)
+
+        # Get audio output directory
+        audio_dir = None
+        for logger in self.loggers:
+            if hasattr(logger, 'log_dir') and logger.log_dir:
+                audio_dir = os.path.join(logger.log_dir, 'val_audios', f'epoch_{self.current_epoch}')
+                os.makedirs(audio_dir, exist_ok=True)
+                break
+
+        # Process and save each sample
+        for idx in range(infer_output.predicted_audio.size(0)):
+            audio_np = infer_output.predicted_audio[idx].float().detach().cpu().numpy()
+            audio_np = audio_np[: infer_output.predicted_audio_lens[idx]]
+
+            # Log first batch on first device to wandb/tensorboard (first 3 samples)
+            if batch_idx == 0 and self.global_rank == 0 and idx < 3:
+                for logger in self.loggers:
+                    if isinstance(logger, WandbLogger):
+                        logger.experiment.log(
+                            {
+                                f"Audio_Generated/Example_{idx}": wandb.Audio(
+                                    audio_np, sample_rate=self.output_sample_rate, caption="generated"
+                                )
+                            }
+                        )
+                    elif isinstance(logger, TensorBoardLogger):
+                        logger.experiment.add_audio(
+                            f'Example_{idx}/generated',
+                            audio_np,
+                            global_step=self.global_step,
+                            sample_rate=self.output_sample_rate,
+                        )
+
+            # Save audio to disk immediately (all batches, all ranks)
+            if audio_dir:
+                audio_path = os.path.join(audio_dir, f'rank{self.global_rank}_batch{batch_idx}_idx{idx}.wav')
+                sf.write(audio_path, audio_np, self.output_sample_rate)
 
         local_transformer_loss = batch_output.local_transformer_loss
         val_output = {
