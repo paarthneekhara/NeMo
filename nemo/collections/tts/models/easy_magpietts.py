@@ -1762,21 +1762,31 @@ class EasyMagpieTTSModel(ModelPT):
         )
 
     def training_step(self, batch, batch_idx):
-        # Extract inputs from batch and pass explicitly to process_batch
-        # import ipdb; ipdb.set_trace()
+        if 'context_audio_codes' in batch:
+            context_audio_codes = batch['context_audio_codes']
+            context_audio_codes_lens = batch['context_audio_codes_lens']
+        else:
+            context_audio = batch['context_audio']
+            context_audio_lens = batch['context_audio_lens']
+            context_audio_codes, context_audio_codes_lens = self.audio_to_codes(context_audio, context_audio_lens)
+        
+        if 'audio_codes' in batch:
+            audio_codes = batch['audio_codes']
+            audio_codes_lens = batch['audio_codes_lens']
+        else:
+            audio = batch['audio']
+            audio_lens = batch['audio_lens']
+            audio_codes, audio_codes_lens = self.audio_to_codes(audio, audio_lens)
+
         batch_output = self.process_batch(
             text=batch['text'],
             text_lens=batch['text_lens'],
             context_text_tokens=batch['context_text_tokens'],
             context_text_tokens_lens=batch['context_text_tokens_lens'],
-            audio=batch.get('audio'),
-            audio_lens=batch.get('audio_lens'),
-            audio_codes=batch.get('audio_codes'),
-            audio_codes_lens=batch.get('audio_codes_lens'),
-            context_audio=batch.get('context_audio'),
-            context_audio_lens=batch.get('context_audio_lens'),
-            context_audio_codes=batch.get('context_audio_codes'),
-            context_audio_codes_lens=batch.get('context_audio_codes_lens'),
+            audio_codes=audio_codes,
+            audio_codes_lens=audio_codes_lens,
+            context_audio_codes=context_audio_codes,
+            context_audio_codes_lens=context_audio_codes_lens,
             phoneme_tokens=batch.get('phoneme_tokens'),
             phoneme_tokens_lens=batch.get('phoneme_tokens_lens'),
             mode="train",
@@ -1841,19 +1851,31 @@ class EasyMagpieTTSModel(ModelPT):
 
     def validation_step(self, batch, batch_idx):
         # Extract inputs from batch and pass explicitly to process_batch
+        if 'context_audio_codes' in batch:
+            context_audio_codes = batch['context_audio_codes']
+            context_audio_codes_lens = batch['context_audio_codes_lens']
+        else:
+            context_audio = batch['context_audio']
+            context_audio_lens = batch['context_audio_lens']
+            context_audio_codes, context_audio_codes_lens = self.audio_to_codes(context_audio, context_audio_lens)
+        
+        if 'audio_codes' in batch:
+            audio_codes = batch['audio_codes']
+            audio_codes_lens = batch['audio_codes_lens']
+        else:
+            audio = batch['audio']
+            audio_lens = batch['audio_lens']
+            audio_codes, audio_codes_lens = self.audio_to_codes(audio, audio_lens)
+        
         batch_output = self.process_batch(
             text=batch['text'],
             text_lens=batch['text_lens'],
             context_text_tokens=batch['context_text_tokens'],
             context_text_tokens_lens=batch['context_text_tokens_lens'],
-            audio=batch.get('audio'),
-            audio_lens=batch.get('audio_lens'),
-            audio_codes=batch.get('audio_codes'),
-            audio_codes_lens=batch.get('audio_codes_lens'),
-            context_audio=batch.get('context_audio'),
-            context_audio_lens=batch.get('context_audio_lens'),
-            context_audio_codes=batch.get('context_audio_codes'),
-            context_audio_codes_lens=batch.get('context_audio_codes_lens'),
+            audio_codes=audio_codes,
+            audio_codes_lens=audio_codes_lens,
+            context_audio_codes=context_audio_codes,
+            context_audio_codes_lens=context_audio_codes_lens,
             phoneme_tokens=batch.get('phoneme_tokens'),
             phoneme_tokens_lens=batch.get('phoneme_tokens_lens'),
             mode="val",
