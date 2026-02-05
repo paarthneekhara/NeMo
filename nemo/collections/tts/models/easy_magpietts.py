@@ -120,7 +120,7 @@ class StreamingState:
         batch_size: Number of items in the batch.
         past_key_values: KV cache from the transformer for efficient autoregressive decoding.
         cache_seq_len: Current sequence length in the cache.
-        all_predictions: List of predicted audio codes at each timestep, each tensor is (B, num_codebooks).
+        all_predictions: List of predicted audio codes at each timestep, each tensor is (B, C, S) unstacked.
         all_phoneme_predictions: List of predicted phoneme tokens at each timestep, each tensor is (B, phoneme_stacking_factor).
         context_audio_codes: Processed context audio codes with special tokens.
         context_audio_codes_lens: Length of context audio codes.
@@ -147,8 +147,8 @@ class StreamingState:
         phoneme_sampling_method: 'argmax' or 'sample' for phoneme token selection.
         last_phoneme_tokens: Last predicted phoneme tokens (B, phoneme_stacking_factor).
         last_audio_codes: Last predicted audio codes (B, num_codebooks).
-        audio_prediction_start_idx: Global step index where audio predictions start per batch item (B,).
-        audio_prediction_end_idx: Global step index where audio predictions end per batch item (B,), -1 if not ended.
+        audio_prediction_start_idx: Global frame index where audio predictions start per batch item (B,).
+        audio_prediction_end_idx: Global frame index where audio predictions end per batch item (B,), -1 if not ended.
         phoneme_prediction_start_idx: Global step index where phoneme predictions start per batch item (B,).
         phoneme_prediction_end_idx: Global step index where phoneme predictions end per batch item (B,), -1 if not ended.
     """
@@ -2321,7 +2321,8 @@ class EasyMagpieTTSModel(ModelPT):
         Returns:
             Tuple of:
                 - Updated StreamingState
-                - Predicted audio codes for this step (B, num_codebooks) or None if no items in audio phase
+                - Predicted audio codes for this step (B, C, S) unstacked, or None if no items in audio phase
+                  where C = num_audio_codebooks and S = frame_stacking_factor
                 - Predicted phoneme tokens for this step (B, phoneme_stacking_factor) or None if no items in phoneme phase
         """
         if state.finished.all():
@@ -2534,40 +2535,62 @@ class EasyMagpieTTSModel(ModelPT):
                 # Track audio prediction start index for items just entering audio phase
                 first_audio_step = needs_audio & (state.audio_prediction_start_idx == -1)
                 if first_audio_step.any():
-                    current_audio_step_idx = len(state.all_predictions)  # before append
+                    # Track start in terms of frames (not steps)
+                    current_frame_idx = sum(p.size(-1) for p in state.all_predictions)  # total frames so far
                     state.audio_prediction_start_idx = torch.where(
                         first_audio_step,
-                        torch.full_like(state.audio_prediction_start_idx, current_audio_step_idx),
+                        torch.full_like(state.audio_prediction_start_idx, current_frame_idx),
                         state.audio_prediction_start_idx
                     )
 
-                audio_codes_next, all_codes_next_argmax = self._predict_audio_codes(state)  # (B, num_codebooks)
+                audio_codes_next_stacked, all_codes_next_argmax = self._predict_audio_codes(state)  # (B, C*S)
 
-                # Update last_audio_codes (only for items in audio phase)
+                # Unstack immediately: (B, C*S) -> (B, C, S) where S = frame_stacking_factor
+                S = self.frame_stacking_factor
+                C = self.num_audio_codebooks
+                audio_codes_unstacked = audio_codes_next_stacked.view(batch_size, C, S)  # (B, C, S)
+
+                # Update last_audio_codes with stacked format (needed for next step's embedding)
                 if state.last_audio_codes is None:
-                    state.last_audio_codes = audio_codes_next
+                    state.last_audio_codes = audio_codes_next_stacked
                 else:
-                    update_mask = needs_audio.view(batch_size, 1).expand_as(audio_codes_next)
-                    state.last_audio_codes = torch.where(update_mask, audio_codes_next, state.last_audio_codes)
+                    update_mask = needs_audio.view(batch_size, 1).expand_as(audio_codes_next_stacked)
+                    state.last_audio_codes = torch.where(update_mask, audio_codes_next_stacked, state.last_audio_codes)
 
-                state.all_predictions.append(audio_codes_next)
+                # Check for EOS in each frame and track exact end position
+                # all_codes_next_argmax is also (B, C*S), reshape to (B, C, S)
+                all_codes_argmax_unstacked = all_codes_next_argmax.view(batch_size, C, S)
 
-                # Check for audio EOS per item
-                audio_eos_detected = (
-                    (all_codes_next_argmax == self.audio_eos_id).any(dim=1)
-                    | (audio_codes_next == self.audio_eos_id).any(dim=1)
+                # For each batch item, find if/where EOS occurs in this step's frames
+                eos_in_sampled = (audio_codes_unstacked == self.audio_eos_id)  # (B, C, S)
+                eos_in_argmax = (all_codes_argmax_unstacked == self.audio_eos_id)  # (B, C, S)
+                eos_any_codebook = eos_in_sampled.any(dim=1) | eos_in_argmax.any(dim=1)  # (B, S)
+
+                # Find first frame with EOS per batch item (or S if none)
+                eos_frame_idx = torch.where(
+                    eos_any_codebook.any(dim=1),
+                    eos_any_codebook.int().argmax(dim=1),  # first frame with EOS
+                    torch.full((batch_size,), S, device=device)  # no EOS in this step
                 )  # (B,)
+
+                audio_eos_detected = eos_any_codebook.any(dim=1)  # (B,)
                 state.finished = state.finished | audio_eos_detected
 
-                # Track audio prediction end index for items that just ended
+                # Track audio prediction end index (in frames) for items that just ended
                 newly_ended_audio = audio_eos_detected & (state.audio_prediction_end_idx == -1)
                 if newly_ended_audio.any():
-                    current_audio_step_idx = len(state.all_predictions)  # after append
+                    # End index = current frame count + frame offset where EOS was found
+                    current_frame_count = len(state.all_predictions) * self.frame_stacking_factor
+                    end_frame_idx = current_frame_count + eos_frame_idx
                     state.audio_prediction_end_idx = torch.where(
                         newly_ended_audio,
-                        torch.full_like(state.audio_prediction_end_idx, current_audio_step_idx),
+                        end_frame_idx,
                         state.audio_prediction_end_idx
                     )
+
+                # Store unstacked codes
+                state.all_predictions.append(audio_codes_unstacked)
+                audio_codes_next = audio_codes_unstacked
 
             return state, audio_codes_next, pred_phoneme_tokens
 
@@ -2656,17 +2679,12 @@ class EasyMagpieTTSModel(ModelPT):
             )
 
         with torch.inference_mode():
-            # Stack all predictions
-            predicted_codes = torch.stack(state.all_predictions, dim=-1)  # (1, num_codebooks, T)
+            # Concatenate all predictions - each is (1, C, S), concat gives (1, C, T_total_frames)
+            predicted_codes = torch.cat(state.all_predictions, dim=-1)  # (1, C, T_total_frames)
             predicted_codes_lens = torch.tensor([predicted_codes.size(-1)], device=state.device)
 
-            # Remove EOS tokens if present
-            predicted_codes_clean, predicted_codes_lens_clean = self.remove_eos_token(
-                predicted_codes, predicted_codes_lens
-            )
-
-            # Decode to audio
-            audio, audio_len, _ = self.codes_to_audio(predicted_codes_clean, predicted_codes_lens_clean)
+            # Decode to audio (codes are already unstacked, no EOS removal needed)
+            audio, audio_len, _ = self.codes_to_audio(predicted_codes, predicted_codes_lens)
 
             # Extract only new audio
             total_decode_length = audio_len[0].item()
@@ -2728,29 +2746,29 @@ class EasyMagpieTTSModel(ModelPT):
             return StreamingFinalizeOutput(
                 audio=torch.zeros(batch_size, 0, device=state.device),
                 audio_len=torch.zeros(batch_size, dtype=torch.long, device=state.device),
-                audio_codes=torch.zeros(batch_size, self.num_audio_codebooks * self.frame_stacking_factor, 0, device=state.device),
+                audio_codes=torch.zeros(batch_size, self.num_audio_codebooks, 0, device=state.device),
                 audio_codes_len=torch.zeros(batch_size, dtype=torch.long, device=state.device),
                 phoneme_tokens=phoneme_tokens_list,
                 phoneme_text=phoneme_text_list,
             )
 
         with torch.inference_mode():
-            # Stack all predictions - each is (B, num_codebooks), stack gives (B, num_codebooks, T)
-            all_codes = torch.stack(state.all_predictions, dim=-1)  # (B, num_codebooks, T_total)
-            total_steps = all_codes.size(-1)
+            # Concatenate all predictions - each is (B, C, S), concat gives (B, C, T_total_frames)
+            all_codes = torch.cat(state.all_predictions, dim=-1)  # (B, C, T_total_frames)
+            total_frames = all_codes.size(-1)
             num_codebooks = all_codes.size(1)
 
-            # Compute start and end indices for each batch item
+            # Start and end indices are in frames (not steps)
             # If start_idx is -1, item never started audio predictions - use 0
-            # If end_idx is -1, item never ended - use total_steps
+            # If end_idx is -1, item never ended - use total_frames
             start_indices = torch.clamp(state.audio_prediction_start_idx, min=0)
             end_indices = torch.where(
                 state.audio_prediction_end_idx >= 0,
                 state.audio_prediction_end_idx,
-                torch.full_like(state.audio_prediction_end_idx, total_steps)
+                torch.full_like(state.audio_prediction_end_idx, total_frames)
             )
 
-            # Calculate per-item lengths
+            # Calculate per-item lengths (in frames)
             predicted_codes_lens = end_indices - start_indices
             max_len = predicted_codes_lens.max().item()
 
@@ -2777,10 +2795,8 @@ class EasyMagpieTTSModel(ModelPT):
                 if length > 0:
                     predicted_codes[i, :, :length] = all_codes[i, :, start:end]
 
-            # Remove EOS tokens (adjusts lengths based on EOS positions within valid range)
-            predicted_codes, predicted_codes_lens = self.remove_eos_token(predicted_codes, predicted_codes_lens)
-
-            # Decode to audio
+            # No need to remove EOS - end_indices already point to the frame before EOS
+            # Decode to audio (codes are already unstacked: B, C, T)
             audio, audio_len, decoded_codes = self.codes_to_audio(predicted_codes, predicted_codes_lens)
 
             return StreamingFinalizeOutput(
