@@ -42,15 +42,18 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import string
 from enum import Enum
 from typing import Optional, Tuple
 
 import librosa
 import matplotlib.pylab as plt
 import numpy as np
+import soundfile as sf
 import torch
 from numba import jit, prange
 
+from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
 from nemo.collections.tts.torch.tts_data_types import DATA_STR2DATA_CLASS, MAIN_DATA_TYPES, WithLens
 from nemo.utils import logging
 from nemo.utils.decorators import deprecated
@@ -940,3 +943,55 @@ def g2p_backward_compatible_support(g2p_target: str) -> str:
     # for backward compatibility
     g2p_target_new = g2p_target.replace("nemo_text_processing.g2p", "nemo.collections.tts.g2p")
     return g2p_target_new
+
+
+def process_text_for_cer(input_text):
+    """
+    Normalizes text for CER/WER calculation.
+    """
+    # Convert text to lowercase
+    lower_case_text = input_text.lower()
+
+    # Remove commas from text
+    no_comma_text = lower_case_text.replace(",", "")
+    # Replace "-" with spaces
+    no_dash_text = no_comma_text.replace("-", " ")
+    no_dash_text = no_dash_text.replace("'", "")
+    no_dash_text = no_dash_text.replace(";", "")
+    no_dash_text = no_dash_text.replace(".", "")
+
+    # Replace double spaces with single space
+    single_space_text = " ".join(no_dash_text.split())
+
+    single_space_text = single_space_text.translate(str.maketrans('', '', string.punctuation))
+
+    # Handle some common errors in ASR transcripts
+    single_space_text = single_space_text.replace("h t t p", "http")
+    single_space_text = single_space_text.replace("w w w", "www")
+
+    return single_space_text
+
+
+def get_speaker_embeddings_from_filepaths(filepaths, speaker_verification_model, device):
+    """
+    Get speaker embeddings from audio filepaths using a speaker verification model.
+    """
+    audio_batch = []
+    audio_lengths = []
+    for filepath in filepaths:
+        audio, sr = sf.read(filepath)
+        if sr != 16000:
+            audio = librosa.core.resample(audio, orig_sr=sr, target_sr=16000)
+        audio_tensor = torch.tensor(audio, dtype=torch.float32, device=device)
+        audio_batch.append(audio_tensor)
+        audio_lengths.append(audio_tensor.size(0))
+
+    batch_audio_lens = torch.tensor(audio_lengths, device=device).long()
+    max_audio_len = int(batch_audio_lens.max().item())
+    audio_batch = stack_tensors(audio_batch, max_lens=[max_audio_len])
+
+    _, speaker_embeddings = speaker_verification_model.forward(
+        input_signal=audio_batch, input_signal_length=batch_audio_lens
+    )
+
+    return speaker_embeddings

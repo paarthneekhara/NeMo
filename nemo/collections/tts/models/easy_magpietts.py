@@ -15,6 +15,7 @@ import os
 import random
 import time
 
+import numpy as np
 import soundfile as sf
 from dataclasses import dataclass
 from functools import partial
@@ -30,6 +31,8 @@ from torch import nn
 from torch.utils.data import get_worker_info
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
+import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import (
     MagpieTTSLhotseDataset,
@@ -45,7 +48,11 @@ from nemo.collections.tts.modules.magpietts_modules import (
     SpecialAudioToken,
     cosine_schedule,
 )
-from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
+from nemo.collections.tts.parts.utils.helpers import (
+    get_mask_from_lengths,
+    get_speaker_embeddings_from_filepaths,
+    process_text_for_cer,
+)
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
@@ -499,6 +506,20 @@ class EasyMagpieTTSModel(ModelPT):
                 )
             self.local_transformer_out_projections = nn.ModuleList(local_transformer_out_projections)
 
+        # Validation inference with metrics (optional)
+        self.run_val_inference = cfg.get('run_val_inference', False)
+        if self.run_val_inference:
+            logging.info("Loading eval models for validation inference (ASR and speaker verification)...")
+            self._eval_asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(
+                model_name="nvidia/parakeet-ctc-0.6b"
+            )
+            self._eval_asr_model.freeze()
+            self._eval_speaker_verification_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
+                model_name='titanet_large'
+            )
+            self._eval_speaker_verification_model.freeze()
+            logging.info("Eval models loaded successfully.")
+
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         """
         Only used for saving checkpoints. On save, we remove _speaker_verification_model and _codec_model
@@ -508,7 +529,7 @@ class EasyMagpieTTSModel(ModelPT):
             return {}
         # Don't save the speaker verification and codec model in the state dict
         state_dict = super().state_dict(destination, prefix, keep_vars)
-        keys_substrings_to_exclude = ['_speaker_verification_model', '_codec_model']
+        keys_substrings_to_exclude = ['_speaker_verification_model', '_codec_model', '_eval_asr_model', '_eval_speaker_verification_model']
         for key in list(state_dict.keys()):
             if any([substring in key for substring in keys_substrings_to_exclude]):
                 del state_dict[key]
@@ -1907,46 +1928,6 @@ class EasyMagpieTTSModel(ModelPT):
                 if isinstance(logger, WandbLogger) and wandb_log_dict:
                     logger.experiment.log(wandb_log_dict)
 
-        # Run inference and save generated audio
-        infer_output = self.infer_batch(batch, max_decoder_steps=220, temperature=0.7, topk=80)
-
-        # Get audio output directory
-        audio_dir = None
-        for logger in self.loggers:
-            if hasattr(logger, 'log_dir') and logger.log_dir:
-                audio_dir = os.path.join(logger.log_dir, 'val_audios', f'epoch_{self.current_epoch}')
-                os.makedirs(audio_dir, exist_ok=True)
-                break
-
-        # Process and save each sample
-        for idx in range(infer_output.predicted_audio.size(0)):
-            audio_np = infer_output.predicted_audio[idx].float().detach().cpu().numpy()
-            audio_np = audio_np[: infer_output.predicted_audio_lens[idx]]
-
-            # Log first batch on first device to wandb/tensorboard (first 3 samples)
-            if batch_idx == 0 and self.global_rank == 0 and idx < 3:
-                for logger in self.loggers:
-                    if isinstance(logger, WandbLogger):
-                        logger.experiment.log(
-                            {
-                                f"Audio_Generated/Example_{idx}": wandb.Audio(
-                                    audio_np, sample_rate=self.output_sample_rate, caption="generated"
-                                )
-                            }
-                        )
-                    elif isinstance(logger, TensorBoardLogger):
-                        logger.experiment.add_audio(
-                            f'Example_{idx}/generated',
-                            audio_np,
-                            global_step=self.global_step,
-                            sample_rate=self.output_sample_rate,
-                        )
-
-            # Save audio to disk immediately (all batches, all ranks)
-            if audio_dir:
-                audio_path = os.path.join(audio_dir, f'rank{self.global_rank}_batch{batch_idx}_idx{idx}.wav')
-                sf.write(audio_path, audio_np, self.output_sample_rate)
-
         local_transformer_loss = batch_output.local_transformer_loss
         val_output = {
             'val_loss': loss,
@@ -1957,6 +1938,97 @@ class EasyMagpieTTSModel(ModelPT):
         if self.phoneme_tokenizer is not None:
             phoneme_loss = batch_output.phoneme_loss
             val_output['val_phoneme_loss'] = phoneme_loss
+
+        # Run inference and compute metrics if enabled
+        if self.run_val_inference:
+            infer_output = self.infer_batch(batch, max_decoder_steps=220, temperature=0.7, topk=80)
+
+            # Get audio output directory
+            audio_dir = self.trainer.log_dir
+            audio_dir = os.path.join(audio_dir, 'val_audios', f'epoch_{self.trainer.current_epoch}')
+            os.makedirs(audio_dir, exist_ok=True)
+
+            # Save predicted and context audio, collect paths for metrics
+            predicted_audio_paths = []
+            context_audio_paths = []
+            for idx in range(infer_output.predicted_audio.size(0)):
+                audio_np = infer_output.predicted_audio[idx].float().detach().cpu().numpy()
+                audio_np = audio_np[: infer_output.predicted_audio_lens[idx]]
+
+                # Log first batch on first device to wandb/tensorboard (first 3 samples)
+                if batch_idx == 0 and self.global_rank == 0 and idx < 3:
+                    for logger in self.loggers:
+                        if isinstance(logger, WandbLogger):
+                            logger.experiment.log(
+                                {
+                                    f"Audio_Generated/Example_{idx}": wandb.Audio(
+                                        audio_np, sample_rate=self.output_sample_rate, caption="generated"
+                                    )
+                                }
+                            )
+                        elif isinstance(logger, TensorBoardLogger):
+                            logger.experiment.add_audio(
+                                f'Example_{idx}/generated',
+                                audio_np,
+                                global_step=self.global_step,
+                                sample_rate=self.output_sample_rate,
+                            )
+
+                # Save predicted audio to disk
+                if audio_dir:
+                    audio_path = os.path.join(audio_dir, f'rank{self.global_rank}_batch{batch_idx}_idx{idx}.wav')
+                    sf.write(audio_path, audio_np, self.output_sample_rate)
+                    predicted_audio_paths.append(audio_path)
+
+                    # Save context audio for SSIM computation
+                    ctx_audio, ctx_audio_len, _ = self.codes_to_audio(
+                        context_audio_codes[idx : idx + 1], context_audio_codes_lens[idx : idx + 1]
+                    )
+                    ctx_audio_np = ctx_audio[0].float().detach().cpu().numpy()[: ctx_audio_len[0]]
+                    ctx_path = os.path.join(audio_dir, f'rank{self.global_rank}_batch{batch_idx}_idx{idx}_context.wav')
+                    sf.write(ctx_path, ctx_audio_np, self.output_sample_rate)
+                    context_audio_paths.append(ctx_path)
+
+            # Compute metrics if we have audio paths
+            if predicted_audio_paths and context_audio_paths:
+                with torch.no_grad():
+                    # ASR transcription for CER/WER
+                    pred_transcripts = self._eval_asr_model.transcribe(
+                        predicted_audio_paths, batch_size=len(predicted_audio_paths)
+                    )
+                    pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
+
+                    # Speaker embeddings for SSIM
+                    pred_embeddings = get_speaker_embeddings_from_filepaths(
+                        predicted_audio_paths, self._eval_speaker_verification_model, self.device
+                    )
+                    ctx_embeddings = get_speaker_embeddings_from_filepaths(
+                        context_audio_paths, self._eval_speaker_verification_model, self.device
+                    )
+
+                # Compute per-sample metrics and print for debugging
+                batch_cer, batch_wer, batch_ssim = [], [], []
+                for idx in range(len(predicted_audio_paths)):
+                    gt_transcript = process_text_for_cer(batch['raw_texts'][idx])
+                    cer = word_error_rate([pred_transcripts[idx]], [gt_transcript], use_cer=True)
+                    wer = word_error_rate([pred_transcripts[idx]], [gt_transcript], use_cer=False)
+                    pred_emb = pred_embeddings[idx].cpu().float().numpy()
+                    ctx_emb = ctx_embeddings[idx].cpu().float().numpy()
+                    ssim = np.dot(pred_emb, ctx_emb) / (np.linalg.norm(pred_emb) * np.linalg.norm(ctx_emb))
+                    batch_cer.append(cer)
+                    batch_wer.append(wer)
+                    batch_ssim.append(ssim)
+
+                    # Print per-file metrics for debugging
+                    logging.info(
+                        f"[Val] rank{self.global_rank}_batch{batch_idx}_idx{idx}: "
+                        f"CER={cer:.4f}, WER={wer:.4f}, SSIM={ssim:.4f} | "
+                        f"GT: '{gt_transcript[:50]}...' | Pred: '{pred_transcripts[idx][:50]}...'"
+                    )
+
+                val_output['val_cer'] = torch.tensor(np.mean(batch_cer))
+                val_output['val_wer'] = torch.tensor(np.mean(batch_wer))
+                val_output['val_ssim'] = torch.tensor(np.mean(batch_ssim))
 
         self.validation_step_outputs.append(val_output)
 
@@ -1977,6 +2049,25 @@ class EasyMagpieTTSModel(ModelPT):
         if self.phoneme_tokenizer is not None:
             val_phoneme_loss = collect("val_phoneme_loss")
             self.log("val/phoneme_loss", val_phoneme_loss, prog_bar=True, sync_dist=True)
+
+        if self.run_val_inference:
+            # Collect metrics only from outputs that have them
+            def collect_if_exists(key):
+                values = [x[key] for x in self.validation_step_outputs if key in x]
+                if values:
+                    return torch.stack(values).mean()
+                return None
+
+            val_cer = collect_if_exists("val_cer")
+            val_wer = collect_if_exists("val_wer")
+            val_ssim = collect_if_exists("val_ssim")
+
+            if val_cer is not None:
+                self.log("val/cer", val_cer, prog_bar=True, sync_dist=True)
+            if val_wer is not None:
+                self.log("val/wer", val_wer, prog_bar=True, sync_dist=True)
+            if val_ssim is not None:
+                self.log("val/ssim", val_ssim, prog_bar=True, sync_dist=True)
 
         self.validation_step_outputs.clear()  # free memory
 
