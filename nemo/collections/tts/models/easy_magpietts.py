@@ -1872,6 +1872,10 @@ class EasyMagpieTTSModel(ModelPT):
 
     def validation_step(self, batch, batch_idx):
         # Extract inputs from batch and pass explicitly to process_batch
+        print(f"[Validation] global_rank: {self.global_rank}, "
+          f"local_rank: {self.local_rank}, "
+          f"world_size: {self.trainer.world_size}, "
+          f"batch_idx: {batch_idx}")
         if 'context_audio_codes' in batch:
             context_audio_codes = batch['context_audio_codes']
             context_audio_codes_lens = batch['context_audio_codes_lens']
