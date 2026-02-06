@@ -33,6 +33,7 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
+from nemo.collections.asr.parts.mixins.transcription import TranscribeConfig
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import (
     MagpieTTSLhotseDataset,
@@ -2004,7 +2005,13 @@ class EasyMagpieTTSModel(ModelPT):
                 with torch.no_grad():
                     # ASR transcription for CER/WER
                     pred_transcripts = self._eval_asr_model.transcribe(
-                        predicted_audio_paths, batch_size=len(predicted_audio_paths), use_lhotse=False
+                        predicted_audio_paths,
+                        batch_size=len(predicted_audio_paths),
+                        override_config=TranscribeConfig(
+                            use_lhotse=False,
+                            batch_size=len(predicted_audio_paths),
+                            num_workers=0
+                        )
                     )
                     pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
 
