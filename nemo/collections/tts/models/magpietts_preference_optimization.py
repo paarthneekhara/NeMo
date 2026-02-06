@@ -26,7 +26,11 @@ from omegaconf import DictConfig, open_dict
 
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
-from nemo.collections.tts.parts.utils.helpers import get_speaker_embeddings_from_filepaths, process_text_for_cer
+from nemo.collections.tts.parts.utils.helpers import (
+    get_speaker_embeddings_from_filepaths,
+    process_text_for_cer,
+    transcribe_with_whisper,
+)
 from nemo.utils import logging
 
 try:
@@ -1024,21 +1028,3 @@ class MagpieTTSModelOnlinePO(MagpieTTSModel):
             self.log(f"val_{key}", mean_metrics[key], prog_bar=True, sync_dist=True)
 
         self.validation_step_outputs.clear()
-
-
-def transcribe_with_whisper(
-    audio_filepath, language, whisper_processor, whisper_model, device, normalizer: Optional[Normalizer] = None
-):
-    speech_array, sampling_rate = librosa.load(audio_filepath, sr=16000)
-    forced_decoder_ids = (
-        whisper_processor.get_decoder_prompt_ids(language=language, task="transcribe") if language else None
-    )
-    inputs = whisper_processor(speech_array, sampling_rate=sampling_rate, return_tensors="pt").input_features
-    inputs = inputs.to(device)
-    with torch.no_grad():
-        predicted_ids = whisper_model.generate(inputs, forced_decoder_ids=forced_decoder_ids)
-    transcription = whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)
-    result = transcription[0]
-    if normalizer is not None:
-        result = normalizer.normalize(result)
-    return result

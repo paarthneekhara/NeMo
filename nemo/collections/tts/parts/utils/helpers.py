@@ -44,7 +44,7 @@
 
 import string
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import librosa
 import matplotlib.pylab as plt
@@ -970,6 +970,32 @@ def process_text_for_cer(input_text):
     single_space_text = single_space_text.replace("w w w", "www")
 
     return single_space_text
+
+
+def transcribe_with_whisper(
+    audio_filepath: str,
+    language: Optional[str],
+    whisper_processor: Any,
+    whisper_model: Any,
+    device: torch.device,
+    normalizer: Optional[Any] = None,
+) -> str:
+    """
+    Transcribe audio with Whisper. Optionally normalize the transcript if a normalizer is provided.
+    """
+    speech_array, sampling_rate = librosa.load(audio_filepath, sr=16000)
+    forced_decoder_ids = (
+        whisper_processor.get_decoder_prompt_ids(language=language, task="transcribe") if language else None
+    )
+    inputs = whisper_processor(speech_array, sampling_rate=sampling_rate, return_tensors="pt").input_features
+    inputs = inputs.to(device)
+    with torch.no_grad():
+        predicted_ids = whisper_model.generate(inputs, forced_decoder_ids=forced_decoder_ids)
+    transcription = whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)
+    result = transcription[0]
+    if normalizer is not None:
+        result = normalizer.normalize(result)
+    return result
 
 
 def get_speaker_embeddings_from_filepaths(filepaths, speaker_verification_model, device):

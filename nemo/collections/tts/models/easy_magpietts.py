@@ -53,6 +53,7 @@ from nemo.collections.tts.parts.utils.helpers import (
     get_mask_from_lengths,
     get_speaker_embeddings_from_filepaths,
     process_text_for_cer,
+    transcribe_with_whisper,
 )
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
@@ -530,7 +531,14 @@ class EasyMagpieTTSModel(ModelPT):
             return {}
         # Don't save the speaker verification and codec model in the state dict
         state_dict = super().state_dict(destination, prefix, keep_vars)
-        keys_substrings_to_exclude = ['_speaker_verification_model', '_codec_model', '_eval_asr_model', '_eval_speaker_verification_model']
+        keys_substrings_to_exclude = [
+            '_speaker_verification_model',
+            '_codec_model',
+            '_eval_asr_model',
+            '_eval_speaker_verification_model',
+            'whisper_model',
+            'whisper_processor',
+        ]
         for key in list(state_dict.keys()):
             if any([substring in key for substring in keys_substrings_to_exclude]):
                 del state_dict[key]
@@ -546,7 +554,14 @@ class EasyMagpieTTSModel(ModelPT):
         if strict == False:
             super().load_state_dict(state_dict, strict=False)
         for name, child in self.named_children():
-            if name in ['_speaker_verification_model', '_codec_model', '_eval_asr_model', '_eval_speaker_verification_model']:
+            if name in [
+                '_speaker_verification_model',
+                '_codec_model',
+                '_eval_asr_model',
+                '_eval_speaker_verification_model',
+                'whisper_model',
+                'whisper_processor',
+            ]:
                 continue
             if any(param.numel() > 0 for param in child.parameters()):
                 # If the module has parameters, we want to change the default mapping so that the state_dict gets
@@ -2004,16 +2019,28 @@ class EasyMagpieTTSModel(ModelPT):
             if predicted_audio_paths and context_audio_paths:
                 with torch.no_grad():
                     # ASR transcription for CER/WER
-                    pred_transcripts = self._eval_asr_model.transcribe(
-                        predicted_audio_paths,
-                        batch_size=len(predicted_audio_paths),
-                        override_config=TranscribeConfig(
-                            use_lhotse=False,
+                    if self.use_multilingual_asr:
+                        self.whisper_model.to(self.device)
+                        languages = batch.get('languages', None)
+                        if languages is None:
+                            languages = ['en'] * len(predicted_audio_paths)
+                        pred_transcripts = []
+                        for audio_path, lang in zip(predicted_audio_paths, languages):
+                            transcript = transcribe_with_whisper(
+                                audio_path, lang, self.whisper_processor, self.whisper_model, self.device, normalizer=None
+                            )
+                            pred_transcripts.append(process_text_for_cer(transcript))
+                    else:
+                        pred_transcripts = self._eval_asr_model.transcribe(
+                            predicted_audio_paths,
                             batch_size=len(predicted_audio_paths),
-                            num_workers=0
+                            override_config=TranscribeConfig(
+                                use_lhotse=False,
+                                batch_size=len(predicted_audio_paths),
+                                num_workers=0
+                            )
                         )
-                    )
-                    pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
+                        pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
 
                     # Speaker embeddings for SSIM
                     pred_embeddings = get_speaker_embeddings_from_filepaths(
@@ -2046,6 +2073,10 @@ class EasyMagpieTTSModel(ModelPT):
                 val_output['val_cer'] = torch.tensor(np.mean(batch_cer))
                 val_output['val_wer'] = torch.tensor(np.mean(batch_wer))
                 val_output['val_ssim'] = torch.tensor(np.mean(batch_ssim))
+                if self.use_multilingual_asr:
+                    val_output['val_languages'] = batch.get('languages', ['en'] * len(predicted_audio_paths))
+                    val_output['val_cer_list'] = batch_cer
+                    val_output['val_wer_list'] = batch_wer
 
         self.validation_step_outputs.append(val_output)
 
@@ -2085,6 +2116,20 @@ class EasyMagpieTTSModel(ModelPT):
                 self.log("val/wer", val_wer, prog_bar=True, sync_dist=True)
             if val_ssim is not None:
                 self.log("val/ssim", val_ssim, prog_bar=True, sync_dist=True)
+
+            if self.use_multilingual_asr:
+                lang_cer = {}
+                lang_wer = {}
+                for x in self.validation_step_outputs:
+                    if 'val_languages' not in x or 'val_cer_list' not in x or 'val_wer_list' not in x:
+                        continue
+                    for lang, cer, wer in zip(x['val_languages'], x['val_cer_list'], x['val_wer_list']):
+                        lang_cer.setdefault(lang, []).append(cer)
+                        lang_wer.setdefault(lang, []).append(wer)
+                for lang in lang_cer:
+                    self.log(f"val/cer_lang_{lang}", np.mean(lang_cer[lang]), prog_bar=True, sync_dist=True)
+                for lang in lang_wer:
+                    self.log(f"val/wer_lang_{lang}", np.mean(lang_wer[lang]), prog_bar=True, sync_dist=True)
 
         self.validation_step_outputs.clear()  # free memory
 
