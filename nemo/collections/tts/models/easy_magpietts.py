@@ -2004,7 +2004,7 @@ class EasyMagpieTTSModel(ModelPT):
                 with torch.no_grad():
                     # ASR transcription for CER/WER
                     pred_transcripts = self._eval_asr_model.transcribe(
-                        predicted_audio_paths, batch_size=len(predicted_audio_paths)
+                        predicted_audio_paths, batch_size=len(predicted_audio_paths), use_lhotse=False
                     )
                     pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
 
