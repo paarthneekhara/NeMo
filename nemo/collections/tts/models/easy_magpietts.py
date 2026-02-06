@@ -545,7 +545,7 @@ class EasyMagpieTTSModel(ModelPT):
         if strict == False:
             super().load_state_dict(state_dict, strict=False)
         for name, child in self.named_children():
-            if name in ['_speaker_verification_model', '_codec_model']:
+            if name in ['_speaker_verification_model', '_codec_model', '_eval_asr_model', '_eval_speaker_verification_model']:
                 continue
             if any(param.numel() > 0 for param in child.parameters()):
                 # If the module has parameters, we want to change the default mapping so that the state_dict gets
