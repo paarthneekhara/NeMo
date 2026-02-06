@@ -1941,7 +1941,13 @@ class EasyMagpieTTSModel(ModelPT):
 
         # Run inference and compute metrics if enabled
         if self.run_val_inference:
-            infer_output = self.infer_batch(batch, max_decoder_steps=220, temperature=0.7, topk=80)
+            infer_output = self.infer_batch(
+                batch,
+                max_decoder_steps=220,
+                temperature=0.7,
+                topk=80,
+                use_local_transformer_for_inference=self.local_transformer_type == LocalTransformerType.AR
+            )
 
             # Get audio output directory
             audio_dir = self.trainer.log_dir
