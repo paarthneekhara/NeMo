@@ -583,7 +583,8 @@ class MoGHead(nn.Module):
             )
 
         # Sample a mixture component using the Gumbel-Max trick
-        mixture_indices = (F.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
+        with fp32_precision():
+            mixture_indices = (F.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
 
         # Select the mean corresponding to the sampled component
         mu = batch_matmul(
@@ -1124,13 +1125,14 @@ class RVQEARTTSModel(nn.Module):
             self.audio_prompt_encoder = AutoModel.from_config(ape_cfg)
 
         if self.config.get("use_audio_prompt_frozen_projection", False):
-            U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
-            V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
-            smin, smax = 0.4, 2.5
-            s = (smin + (smax - smin) * torch.rand(self.hidden_size)) 
-            W = U @ torch.diag(s) @ V.T
-            self.register_buffer("audio_prompt_projection_W", W) # register as buffer to avoid weight update
-
+            with fp32_precision():
+                U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
+                V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
+                smin, smax = 0.4, 2.5
+                s = (smin + (smax - smin) * torch.rand(self.hidden_size)) 
+                W = U @ torch.diag(s) @ V.T
+                self.register_buffer("audio_prompt_projection_W", W) # register as buffer to avoid weight update
+    
         # Prediction Heads
         if not self.config.disable_eos_prediction:
             self.lm_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -1261,30 +1263,30 @@ class RVQEARTTSModel(nn.Module):
             mog_mus = mog_mus.float()
             mog_mu_res = mog_mu_res.float()
             mog_logs = mog_logs.float()
-
-            # Log probability of the true code under each Gaussian component
-            logp_code = (-0.5 * math.log(2 * math.pi) - mog_logs) * self.config.latent_size - 0.5 * self.mog_head.dist(
-                mog_mus, (cont_code_target - mog_mu_res) * torch.exp(-mog_logs)
-            )
-
-            # Compute posterior q(k|c)
-            q_kc = (
-                torch.softmax(
-                    logp_code,
-                    -1,
+            with fp32_precision():
+                # Log probability of the true code under each Gaussian component
+                logp_code = (-0.5 * math.log(2 * math.pi) - mog_logs) * self.config.latent_size - 0.5 * self.mog_head.dist(
+                    mog_mus, (cont_code_target - mog_mu_res) * torch.exp(-mog_logs)
                 )
-                * (1 - self.config.label_smoothing)
-                + self.config.label_smoothing / self.mog_head.num_predictions
-            ).detach()
-            log_q_kc = torch.log(q_kc + 1e-8).detach()
 
-            #  Continuous Loss (negative log-likelihood)
-            c_loss = (-(q_kc * logp_code).sum(-1) * reduced_target_mask).sum() / target_mask.sum().clamp_min(1)
+                # Compute posterior q(k|c)
+                q_kc = (
+                    torch.softmax(
+                        logp_code,
+                        -1,
+                    )
+                    * (1 - self.config.label_smoothing)
+                    + self.config.label_smoothing / self.mog_head.num_predictions
+                ).detach()
+                log_q_kc = torch.log(q_kc + 1e-8).detach()
 
-            # KL Divergence Loss
-            k_loss = (
-                (q_kc * (log_q_kc - F.log_softmax(mog_logits, -1))).sum(-1) * reduced_target_mask
-            ).sum() / target_mask.sum().clamp_min(1)
+                #  Continuous Loss (negative log-likelihood)
+                c_loss = (-(q_kc * logp_code).sum(-1) * reduced_target_mask).sum() / target_mask.sum().clamp_min(1)
+
+                # KL Divergence Loss
+                k_loss = (
+                    (q_kc * (log_q_kc - F.log_softmax(mog_logits, -1))).sum(-1) * reduced_target_mask
+                ).sum() / target_mask.sum().clamp_min(1)
 
         return lm_loss, c_loss, k_loss
 
@@ -1617,7 +1619,10 @@ class RVQEARTTSModel(nn.Module):
                         lm_logits.view(-1, lm_logits.size(-1)),
                     ).view_as(lm_logits)
                 )
-            lm_logits = F.log_softmax(lm_logits, -1)
+
+            with fp32_precision():
+                lm_logits = F.log_softmax(lm_logits, -1)
+
             if eos_threshold is not None:
                 eos_flag = lm_logits[..., -1] > eos_threshold
             else:

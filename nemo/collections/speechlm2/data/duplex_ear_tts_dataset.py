@@ -136,6 +136,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         audio_prompt_duration: float = 3.0,
         num_delay_speech_tokens: int = 0,
         add_system_prompt: bool = False,
+        ignore_data_system_prompt: bool = True,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -149,6 +150,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
         self.audio_prompt_duration = audio_prompt_duration
         self.num_delay_speech_tokens = num_delay_speech_tokens
         self.add_system_prompt = add_system_prompt
+        self.ignore_data_system_prompt = ignore_data_system_prompt
 
         # compute source and target samples_per_frame
         self.source_samples_per_frame = int(self.source_sample_rate * self.frame_length)
@@ -198,7 +200,7 @@ class DuplexEARTTSDataset(torch.utils.data.Dataset):
                 )
 
             if self.add_system_prompt:
-                system_prompts, system_prompts_lens, system_prompts_raw = collate_system_prompt(cuts, self.tokenizer)
+                system_prompts, system_prompts_lens, system_prompts_raw = collate_system_prompt(cuts, self.tokenizer, ignore_data_system_prompt=self.ignore_data_system_prompt)
             else:
                 system_prompts = None
                 system_prompts_lens = None
@@ -564,6 +566,7 @@ def add_speech_delay(
 def collate_system_prompt(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
+    ignore_data_system_prompt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
@@ -574,7 +577,7 @@ def collate_system_prompt(
     system_prompts_raw = []
     for c in cuts:
         # Check if system prompt exists in custom field
-        if c.custom and c.custom.get("system_prompt", None):
+        if c.custom and c.custom.get("system_prompt", None) and not ignore_data_system_prompt:
             prompt_text = c.custom["system_prompt"]
             tokens.append(
                 torch.as_tensor(

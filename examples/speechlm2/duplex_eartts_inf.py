@@ -239,32 +239,43 @@ def inference(cfg):
         ).eval()
     else:
         raise ValueError("For evaluation, you must provide `cfg.checkpoint_path`.")
+    
+    target_dtype = getattr(torch, cfg.get("inference_dtype", "float32"))
+    # Move and cast
+    model.to(dtype=target_dtype)
+
+    if cfg.get("reinit_audio_prompt_frozen_projection", False):
+        D = model.tts_model.hidden_size
+        Q, _ = torch.linalg.qr(torch.randn(D, D, device=model.tts_model.audio_prompt_projection_W.device, dtype=model.tts_model.audio_prompt_projection_W.dtype))
+        model.tts_model.audio_prompt_projection_W.copy_(Q)
 
     intelligibility = Intelligibility("stt_en_fastconformer_transducer_large", reuse_asr_hyps=False).reset()
 
     for batch_id, batch in enumerate(read_jsonl_batches(cfg.datasets_json_path, cfg.batch_size, max_batches=None)):
         inputs = collate_and_tokenize_custom(batch, model, extra_duration_thrshould=1.5, sample_rate=model.target_sample_rate, root_path=cfg.audio_dir)
-        if cfg.get("user_custom_speaker_reference", None):
-            wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
-            wav = torch.as_tensor(wav, dtype=torch.float32).unsqueeze(0)
-            inputs["context_audio"] = wav.expand(inputs["input_ids"].size(0), *wav.shape[1:])
-            inputs["context_audio_lengths"][:] = wav.size(-1)
-            inputs["context_audio"] = inputs["context_audio"].to(model.device)
-            inputs["context_audio_lengths"] = inputs["context_audio_lengths"].to(model.device).long()
+        with torch.amp.autocast('cuda', dtype=target_dtype):
+            if cfg.get("user_custom_speaker_reference", None):
+                wav, sr = librosa.load(cfg.model.inference_speaker_reference, sr=model.target_sample_rate, mono=True)
+                wav = torch.as_tensor(wav, dtype=target_dtype).unsqueeze(0)
+                inputs["context_audio"] = wav.expand(inputs["input_ids"].size(0), *wav.shape[1:])
+                inputs["context_audio_lengths"][:] = wav.size(-1)
+                inputs["context_audio"] = inputs["context_audio"].to(model.device)
+                inputs["context_audio_lengths"] = inputs["context_audio_lengths"].to(model.device).long()
 
-        model.set_init_inputs(
-            speaker_audio=inputs["context_audio"],
-            speaker_audio_lens=inputs["context_audio_lengths"],
-            system_prompt=cfg.get("inference_system_prompt", None)
-        )
-        init_inputs = model.get_init_inputs(B=inputs["input_ids"].size(0))
+            model.set_init_inputs(
+                speaker_audio=inputs["context_audio"],
+                speaker_audio_lens=inputs["context_audio_lengths"],
+                system_prompt=cfg.get("inference_system_prompt", None)
+            )
+            init_inputs = model.get_init_inputs(B=inputs["input_ids"].size(0))
 
-        audio, audio_len = model.offline_inference(
-            next_subword_ids=inputs["input_ids"],
-            formatter="custom",
-            init_inputs=init_inputs,
-        )
+            audio, audio_len = model.offline_inference(
+                next_subword_ids=inputs["input_ids"],
+                formatter="custom",
+                init_inputs=init_inputs,
+            )
 
+        audio = audio.float()
         # wav_dur = int(inputs["target_num_frames"][i] * model.target_samples_per_frame)
         # reset audio len to the actual size removing extra long audio padding
         audio_len = (torch.tensor(inputs["target_num_frames"]) * model.target_samples_per_frame).int()

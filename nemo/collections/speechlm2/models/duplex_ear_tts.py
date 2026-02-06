@@ -16,6 +16,7 @@ import os
 import time
 from collections import Counter
 from contextlib import contextmanager
+import hydra
 
 import librosa
 import torch
@@ -45,7 +46,7 @@ from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.asr_cer_wer import Intelligibility
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.secs import SECS
-from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
+from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen, freeze_and_subset
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import (
     load_checkpoint,
@@ -227,6 +228,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 )
 
             self.load_state_dict(checkpoint_state, strict=True)
+            logging.info(f"Model restored from the checkpoint: {checkpoint_path} !")
 
     @property
     def device(self):
@@ -1590,6 +1592,64 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             super().backward(*args, **kwargs)
 
     def configure_optimizers(self):
+        # Check if we should use the custom grouping
+        if self.cfg.get("exclude_norm_from_wd", True):
+            # Leverage the original NeMo function for freezing/logging
+            trainable_params_gen = freeze_and_subset(
+                self.named_parameters(),
+                exclude_patterns=self.cfg.get("freeze_patterns", []),
+                keep_patterns=self.cfg.get("prevent_freeze_patterns", []),
+            )
+            trainable_params_set = set(trainable_params_gen)
+
+            # Identify layers for Weight Decay exclusion
+            no_decay_keywords = ["bias", "norm", "layernorm"]
+            
+            decay_group = []
+            no_decay_group = []
+            no_decay_names = []
+            total_trainable_layers = 0
+
+            for name, param in self.named_parameters():
+                if param in trainable_params_set:
+                    total_trainable_layers += 1
+                    if any(nd in name.lower() for nd in no_decay_keywords):
+                        no_decay_group.append(param)
+                        no_decay_names.append(name)
+                    else:
+                        decay_group.append(param)
+
+            logging.info("=" * 70)
+            logging.info("OPTIMIZER STRATEGY: Mixed Precision Stability")
+            logging.info(f"Total Trainable Layers: {total_trainable_layers}")
+            logging.info("-" * 70)
+            logging.info(f"REGULARIZATION: Applying weight_decay={self.cfg.optimizer.get('weight_decay', 0.1)} to {len(decay_group)} weight layers.")
+            logging.info(f"STABILITY: Excluding {len(no_decay_names)} Normalization and Bias layers from weight decay.")
+            
+            # Audit trail for the excluded layers
+            for n in no_decay_names[:10]:
+                logging.info(f"  [WD=0.0] -> {n}")
+            if len(no_decay_names) > 10:
+                logging.info(f"  ... (+ {len(no_decay_names) - 10} additional normalization/bias layers)")
+            logging.info("=" * 70)
+
+            # 3. Parameter Grouping for AdamW
+            optim_groups = [
+                {"params": decay_group, "weight_decay": self.cfg.optimizer.get("weight_decay", 0.1)},
+                {"params": no_decay_group, "weight_decay": 0.0},
+            ]
+
+            # 4. Instantiate via Hydra
+            optimizer = hydra.utils.instantiate(self.cfg.optimizer, optim_groups, _convert_='all')
+            
+            ans = {"optimizer": optimizer}
+            if "lr_scheduler" in self.cfg:
+                lr_scheduler = hydra.utils.instantiate(self.cfg.lr_scheduler, optimizer)
+                ans["lr_scheduler"] = {"scheduler": lr_scheduler, "interval": "step", "frequency": 1}
+
+            return ans
+
+        # Fallback to the standard NeMo behavior if the flag is False
         return configure_optimizers(self)
 
     @property
