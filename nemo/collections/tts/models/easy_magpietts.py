@@ -510,12 +510,23 @@ class EasyMagpieTTSModel(ModelPT):
 
         # Validation inference with metrics (optional)
         self.run_val_inference = cfg.get('run_val_inference', False)
+        self.use_multilingual_asr = cfg.get('use_multilingual_asr', False)
         if self.run_val_inference:
             logging.info("Loading eval models for validation inference (ASR and speaker verification)...")
-            self._eval_asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(
-                model_name="nvidia/parakeet-ctc-0.6b"
-            )
-            self._eval_asr_model.freeze()
+            if self.use_multilingual_asr:
+                from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+                self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
+                self.whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3")
+                self.whisper_model.eval()
+                self._eval_asr_model = None
+            else:
+                self._eval_asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(
+                    model_name="nvidia/parakeet-ctc-0.6b"
+                )
+                self._eval_asr_model.freeze()
+                self.whisper_processor = None
+                self.whisper_model = None
             self._eval_speaker_verification_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
                 model_name='titanet_large'
             )
