@@ -2037,10 +2037,14 @@ class EasyMagpieTTSModel(ModelPT):
                             languages = ['en'] * len(predicted_audio_paths)
                         pred_transcripts = []
                         for audio_path, lang in zip(predicted_audio_paths, languages):
-                            transcript = transcribe_with_whisper(
-                                audio_path, lang, self.whisper_processor, self.whisper_model, self.device, normalizer=None
-                            )
-                            pred_transcripts.append(process_text_for_cer(transcript))
+                            try:
+                                transcript = transcribe_with_whisper(
+                                    audio_path, lang, self.whisper_processor, self.whisper_model, self.device, normalizer=None
+                                )
+                                pred_transcripts.append(process_text_for_cer(transcript))
+                            except Exception as e:
+                                logging.warning(f"Val ASR transcription failed for {audio_path}: {e}")
+                                pred_transcripts.append(None)
                     else:
                         pred_transcripts = self._eval_asr_model.transcribe(
                             predicted_audio_paths,
@@ -2054,40 +2058,47 @@ class EasyMagpieTTSModel(ModelPT):
                         pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
 
                     # Speaker embeddings for SSIM
-                    pred_embeddings = get_speaker_embeddings_from_filepaths(
-                        predicted_audio_paths, self._eval_speaker_verification_model, self.device
-                    )
-                    ctx_embeddings = get_speaker_embeddings_from_filepaths(
-                        context_audio_paths, self._eval_speaker_verification_model, self.device
-                    )
+                    try:
+                        pred_embeddings = get_speaker_embeddings_from_filepaths(
+                            predicted_audio_paths, self._eval_speaker_verification_model, self.device
+                        )
+                        ctx_embeddings = get_speaker_embeddings_from_filepaths(
+                            context_audio_paths, self._eval_speaker_verification_model, self.device
+                        )
+                    except Exception as e:
+                        logging.warning(f"Val speaker embeddings failed: {e}")
+                        pred_embeddings = ctx_embeddings = None
 
-                # Compute per-sample metrics and print for debugging
-                batch_cer, batch_wer, batch_ssim = [], [], []
-                for idx in range(len(predicted_audio_paths)):
-                    gt_transcript = process_text_for_cer(batch['raw_texts'][idx])
-                    cer = word_error_rate([pred_transcripts[idx]], [gt_transcript], use_cer=True)
-                    wer = word_error_rate([pred_transcripts[idx]], [gt_transcript], use_cer=False)
-                    pred_emb = pred_embeddings[idx].cpu().float().numpy()
-                    ctx_emb = ctx_embeddings[idx].cpu().float().numpy()
-                    ssim = np.dot(pred_emb, ctx_emb) / (np.linalg.norm(pred_emb) * np.linalg.norm(ctx_emb))
-                    batch_cer.append(cer)
-                    batch_wer.append(wer)
-                    batch_ssim.append(ssim)
+                    # Compute per-sample metrics for successful cases only
+                    batch_cer, batch_wer, batch_ssim = [], [], []
+                    for idx in range(len(predicted_audio_paths)):
+                        if pred_transcripts[idx] is None:
+                            continue
+                        gt_transcript = process_text_for_cer(batch['raw_texts'][idx])
+                        cer = word_error_rate([pred_transcripts[idx]], [gt_transcript], use_cer=True)
+                        wer = word_error_rate([pred_transcripts[idx]], [gt_transcript], use_cer=False)
+                        batch_cer.append(cer)
+                        batch_wer.append(wer)
+                        if pred_embeddings is not None and ctx_embeddings is not None:
+                            pred_emb = pred_embeddings[idx].cpu().float().numpy()
+                            ctx_emb = ctx_embeddings[idx].cpu().float().numpy()
+                            ssim = np.dot(pred_emb, ctx_emb) / (np.linalg.norm(pred_emb) * np.linalg.norm(ctx_emb))
+                            batch_ssim.append(ssim)
+                        logging.info(
+                            f"[Val] rank{self.global_rank}_batch{batch_idx}_idx{idx}: "
+                            f"CER={cer:.4f}, WER={wer:.4f} | GT: '{gt_transcript[:50]}...' | Pred: '{pred_transcripts[idx][:50]}...'"
+                        )
 
-                    # Print per-file metrics for debugging
-                    logging.info(
-                        f"[Val] rank{self.global_rank}_batch{batch_idx}_idx{idx}: "
-                        f"CER={cer:.4f}, WER={wer:.4f}, SSIM={ssim:.4f} | "
-                        f"GT: '{gt_transcript[:50]}...' | Pred: '{pred_transcripts[idx][:50]}...'"
-                    )
-
-                val_output['val_cer'] = torch.tensor(np.mean(batch_cer))
-                val_output['val_wer'] = torch.tensor(np.mean(batch_wer))
-                val_output['val_ssim'] = torch.tensor(np.mean(batch_ssim))
-                if self.use_multilingual_asr:
-                    val_output['val_languages'] = batch.get('languages', ['en'] * len(predicted_audio_paths))
-                    val_output['val_cer_list'] = batch_cer
-                    val_output['val_wer_list'] = batch_wer
+                    if batch_cer:
+                        val_output['val_cer'] = torch.tensor(np.mean(batch_cer))
+                        val_output['val_wer'] = torch.tensor(np.mean(batch_wer))
+                        if self.use_multilingual_asr:
+                            langs = batch.get('languages', ['en'] * len(predicted_audio_paths))
+                            val_output['val_languages'] = [langs[i] for i in range(len(pred_transcripts)) if pred_transcripts[i] is not None]
+                            val_output['val_cer_list'] = batch_cer
+                            val_output['val_wer_list'] = batch_wer
+                    if batch_ssim:
+                        val_output['val_ssim'] = torch.tensor(np.mean(batch_ssim))
 
         self.validation_step_outputs.append(val_output)
 
