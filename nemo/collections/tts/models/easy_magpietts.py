@@ -29,6 +29,7 @@ from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from omegaconf import DictConfig
 from torch import nn
 from torch.utils.data import get_worker_info
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 import nemo.collections.asr as nemo_asr
@@ -1175,8 +1176,8 @@ class EasyMagpieTTSModel(ModelPT):
         context_audio_codes, context_audio_codes_lens = self.stack_codes(
             context_audio_codes,
             context_audio_codes_lens,
-            self.audio_bos_id,
-            self.audio_eos_id,
+            self.context_audio_bos_id,
+            self.context_audio_eos_id,
             self.frame_stacking_factor,
             self.num_audio_codebooks,
         )
@@ -1988,6 +1989,13 @@ class EasyMagpieTTSModel(ModelPT):
             # Save predicted and context audio, collect paths for metrics
             predicted_audio_paths = []
             context_audio_paths = []
+
+            context_audio_codes_cleaned, context_audio_codes_lens_cleaned = self.remove_special_tokens(
+                codes=context_audio_codes,
+                codes_len=context_audio_codes_lens,
+            )
+            context_audio_cleaned, context_audio_lens_cleaned, _ = self.codes_to_audio(context_audio_codes_cleaned, context_audio_codes_lens_cleaned)
+
             for idx in range(infer_output.predicted_audio.size(0)):
                 audio_np = infer_output.predicted_audio[idx].float().detach().cpu().numpy()
                 audio_np = audio_np[: infer_output.predicted_audio_lens[idx]]
@@ -2018,10 +2026,7 @@ class EasyMagpieTTSModel(ModelPT):
                     predicted_audio_paths.append(audio_path)
 
                     # Save context audio for SSIM computation
-                    ctx_audio, ctx_audio_len, _ = self.codes_to_audio(
-                        context_audio_codes[idx : idx + 1], context_audio_codes_lens[idx : idx + 1]
-                    )
-                    ctx_audio_np = ctx_audio[0].float().detach().cpu().numpy()[: ctx_audio_len[0]]
+                    ctx_audio_np = context_audio_codes_cleaned[idx].float().detach().cpu().numpy()[: context_audio_lens_cleaned[idx]]
                     ctx_path = os.path.join(audio_dir, f'rank{self.global_rank}_batch{batch_idx}_idx{idx}_context.wav')
                     sf.write(ctx_path, ctx_audio_np, self.output_sample_rate)
                     context_audio_paths.append(ctx_path)
@@ -2090,15 +2095,15 @@ class EasyMagpieTTSModel(ModelPT):
                         )
 
                     if batch_cer:
-                        val_output['val_cer'] = torch.tensor(np.mean(batch_cer))
-                        val_output['val_wer'] = torch.tensor(np.mean(batch_wer))
+                        val_output['val_cer'] = torch.tensor(np.mean(batch_cer), device=self.device)
+                        val_output['val_wer'] = torch.tensor(np.mean(batch_wer), device=self.device)
                         if self.use_multilingual_asr:
                             langs = batch.get('languages', ['en'] * len(predicted_audio_paths))
                             val_output['val_languages'] = [langs[i] for i in range(len(pred_transcripts)) if pred_transcripts[i] is not None]
                             val_output['val_cer_list'] = batch_cer
                             val_output['val_wer_list'] = batch_wer
                     if batch_ssim:
-                        val_output['val_ssim'] = torch.tensor(np.mean(batch_ssim))
+                        val_output['val_ssim'] = torch.tensor(np.mean(batch_ssim), device=self.device)
 
         self.validation_step_outputs.append(val_output)
 
@@ -2149,9 +2154,9 @@ class EasyMagpieTTSModel(ModelPT):
                         lang_cer.setdefault(lang, []).append(cer)
                         lang_wer.setdefault(lang, []).append(wer)
                 for lang in lang_cer:
-                    self.log(f"val/cer_lang_{lang}", np.mean(lang_cer[lang]), prog_bar=True, sync_dist=True)
+                    self.log(f"val/cer_lang_{lang}", torch.tensor(np.mean(lang_cer[lang]), device=self.device), prog_bar=True, sync_dist=True)
                 for lang in lang_wer:
-                    self.log(f"val/wer_lang_{lang}", np.mean(lang_wer[lang]), prog_bar=True, sync_dist=True)
+                    self.log(f"val/wer_lang_{lang}", torch.tensor(np.mean(lang_wer[lang]), device=self.device), prog_bar=True, sync_dist=True)
 
         self.validation_step_outputs.clear()  # free memory
 
@@ -2261,10 +2266,68 @@ class EasyMagpieTTSModel(ModelPT):
         return data_loader
 
     def setup_validation_data(self, cfg):
+        self._validation_uses_lhotse = cfg.get("use_lhotse", False)
         self._validation_dl = self._setup_test_dataloader(cfg)
 
     def setup_test_data(self, cfg):
         self._test_dl = self._setup_test_dataloader(cfg)
+
+    def val_dataloader(self):
+        """
+        Override val_dataloader to lazily wrap with DistributedSampler for non-lhotse
+        validation. This is needed because use_distributed_sampler=False is set for lhotse
+        training, which also prevents Lightning from auto-wrapping the non-lhotse validation
+        dataloader. We do this lazily (here instead of in setup_validation_data) because
+        distributed is not yet initialized when setup_validation_data is called during __init__.
+        """
+        if self._validation_dl is None:
+            self._validation_dl = []
+
+        if getattr(self, '_validation_uses_lhotse', False):
+            print(f"[val_dataloader] rank={self.global_rank}: Using lhotse, skipping DistributedSampler wrap")
+            return self._validation_dl
+
+        if not torch.distributed.is_initialized():
+            print(f"[val_dataloader] rank={self.global_rank}: Distributed not initialized, skipping DistributedSampler wrap")
+            return self._validation_dl
+
+        if getattr(self, '_val_dl_wrapped_with_dist_sampler', False):
+            return self._validation_dl
+
+        # Wrap the validation dataloader(s) with DistributedSampler
+        dataloaders = self._validation_dl if isinstance(self._validation_dl, list) else [self._validation_dl]
+        wrapped = []
+        for i, dl in enumerate(dataloaders):
+            if dl is not None and not isinstance(dl.sampler, DistributedSampler):
+                print(f"[val_dataloader] rank={self.global_rank}: Wrapping val dataloader {i} with DistributedSampler "
+                      f"(dataset_len={len(dl.dataset)}, world_size={torch.distributed.get_world_size()}, "
+                      f"batch_size={dl.batch_size}, num_workers={dl.num_workers})")
+                sampler = DistributedSampler(dl.dataset, shuffle=False)
+                new_dl = torch.utils.data.DataLoader(
+                    dl.dataset,
+                    sampler=sampler,
+                    batch_size=dl.batch_size,
+                    num_workers=dl.num_workers,
+                    collate_fn=dl.collate_fn,
+                    pin_memory=dl.pin_memory,
+                    drop_last=dl.drop_last,
+                    worker_init_fn=dl.worker_init_fn,
+                    persistent_workers=dl.persistent_workers,
+                )
+                wrapped.append(new_dl)
+            else:
+                sampler_type = type(dl.sampler).__name__ if dl is not None else "N/A"
+                print(f"[val_dataloader] rank={self.global_rank}: Val dataloader {i} already has "
+                      f"sampler={sampler_type}, skipping wrap")
+                wrapped.append(dl)
+
+        if isinstance(self._validation_dl, list):
+            self._validation_dl = wrapped
+        else:
+            self._validation_dl = wrapped[0]
+
+        self._val_dl_wrapped_with_dist_sampler = True
+        return self._validation_dl
 
     def _sample_audio_codes(
         self,
