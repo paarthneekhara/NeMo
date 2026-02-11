@@ -425,34 +425,6 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 full_dropout_mask, torch.full_like(target_text_tokens, self.text_pad_id), target_text_tokens
             )
 
-        if self.training and self.cfg.get("text_eos_duplicate_prob", 0.0) > 0:
-            p = self.cfg.text_eos_duplicate_prob
-
-            # [B, T] mask of EOS positions
-            eos_mask = target_text_tokens == self.text_eos_id
-
-            # Flatten EOS positions: tensor of shape [N, 2] where each row = (batch_idx, time_idx)
-            eos_positions = eos_mask.nonzero(as_tuple=False)  # [N, 2]
-
-            if eos_positions.numel() > 0:
-                N = eos_positions.shape[0]
-
-                # One random decision per EOS occurrence
-                duplicate_decision = torch.rand(N, device=target_text_tokens.device) < p  # [N]
-
-                # Filter only EOS tokens that will be duplicated and are not at position t=0
-                valid = (eos_positions[:, 1] > 0) & duplicate_decision  # [N]
-
-                if valid.any():
-                    # Select only valid EOS positions
-                    valid_positions = eos_positions[valid]  # [M, 2]
-
-                    # Indices for the token BEFORE the EOS (t-1)
-                    b_idx = valid_positions[:, 0]
-                    t_idx = valid_positions[:, 1] - 1
-
-                    # Replace token before EOS with an EOS
-                    target_text_tokens[b_idx, t_idx] = self.text_eos_id
 
         # BOS dropout to make the model more robust
         if self.training and self.cfg.get("text_bos_dropout_prob", 0.0) > 0:
@@ -474,6 +446,45 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
                 torch.full_like(target_text_tokens, self.text_pad_id),
                 target_text_tokens,
             )
+
+        # BOS dropout to make the model more robust
+        if self.training and self.cfg.get("text_bos_dropout_prob", 0.0) > 0:
+            prob = self.cfg.text_bos_dropout_prob  # e.g., 0.5
+            
+            # Identify all BOS positions [B, T]
+            bos_mask = (target_text_tokens == self.text_bos_id)
+            
+            # Get indices of sequences that actually have a BOS token
+            # We need to know *where* the BOS tokens are to drop them.
+            # tensor of coordinates: [[batch_idx, seq_idx], ...]
+            bos_indices = torch.nonzero(bos_mask) 
+            num_bos = bos_indices.shape[0]
+
+            if num_bos > 0:
+                # Create a random dropout decision for each BOS instance
+                drop_decisions = torch.rand(num_bos, device=target_text_tokens.device) < prob
+
+                # Ensure at least one is dropped
+                if drop_decisions.sum() == 0:
+                    # Pick one random index from the available BOS locations to drop
+                    force_idx = torch.randint(0, num_bos, (1,), device=target_text_tokens.device)
+                    drop_decisions[force_idx] = True
+
+                # 5. Apply the dropout
+                # We need to map the decisions back to the full tensor
+                # Create a mask of the same shape as target_text_tokens
+                full_dropout_mask = torch.zeros_like(target_text_tokens, dtype=torch.bool)
+                
+                # Set True only at the specific (batch, seq) coordinates we chose to drop
+                # bos_indices[:, 0] are batch indices, bos_indices[:, 1] are seq indices
+                full_dropout_mask[bos_indices[:, 0], bos_indices[:, 1]] = drop_decisions
+
+                # 6. Replace dropped BOS with PAD
+                target_text_tokens = torch.where(
+                    full_dropout_mask,
+                    torch.full_like(target_text_tokens, self.text_pad_id),
+                    target_text_tokens,
+                )
 
         # shift text tokens
         subword_ids = F.pad(target_text_tokens[:, 1:], [0, 1])
