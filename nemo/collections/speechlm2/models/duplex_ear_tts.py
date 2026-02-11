@@ -574,6 +574,7 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
             subword_ids=inputs["subword_ids"],
             subword_mask=inputs["subword_mask"],
             non_prompt_mask=inputs["non_prompt_mask"],
+            system_prompts_raw=batch.get("system_prompts_raw", None),
         )
         loss_dict = {"lm_loss": tts_output.lm_loss, "c_loss": tts_output.c_loss, "k_loss": tts_output.k_loss}
         loss = sum(loss_dict.values())
