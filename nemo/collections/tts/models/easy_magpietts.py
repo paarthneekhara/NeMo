@@ -117,7 +117,6 @@ class ProcessBatchOutput:
     context_audio_codes: torch.Tensor
     context_audio_codes_lens: torch.Tensor
     selected_training_mode: Optional[str] = None
-    timing_stats: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -380,14 +379,6 @@ class EasyMagpieTTSModel(ModelPT):
         self.phoneme_loss_weight = cfg.get('phoneme_loss_weight', 1.0)
         self.parallel_codebook_loss_scale = cfg.get('parallel_codebook_loss_scale', 1.0)
         self.local_transformer_loss_scale = cfg.get('local_transformer_loss_scale', 1.0)
-        # Optional per-step timing diagnostics for training performance analysis.
-        self.timing_debug_enabled = cfg.get('timing_debug_enabled', False)
-        self.timing_print_interval = max(1, int(cfg.get('timing_print_interval', 50)))
-        self._timing_should_print_this_step = False
-        self._timing_backward_start_time = None
-        self._timing_step_start_time = None
-        self._timing_last_forward_total = None
-        self._timing_last_forward_breakdown = {}
         if cfg.get('phoneme_tokenizer', None) is not None:
             self.phoneme_tokenizer = instantiate_phoneme_tokenizer(cfg.phoneme_tokenizer)
             self.phoneme_stacking_factor = cfg.get('phoneme_stacking_factor', 1)
@@ -1723,19 +1714,6 @@ class EasyMagpieTTSModel(ModelPT):
 
         return x, orig_lens
 
-    def _sync_cuda_for_timing(self, reference_tensor: Optional[torch.Tensor] = None):
-        if not torch.cuda.is_available():
-            return
-        if reference_tensor is not None and reference_tensor.is_cuda:
-            torch.cuda.synchronize(device=reference_tensor.device)
-        elif torch.cuda.is_initialized():
-            torch.cuda.synchronize()
-
-    def _now_with_optional_sync(self, collect_timing: bool, reference_tensor: Optional[torch.Tensor] = None) -> float:
-        if collect_timing:
-            self._sync_cuda_for_timing(reference_tensor=reference_tensor)
-        return time.perf_counter()
-
     def process_batch(
         self,
         text: torch.Tensor,
@@ -1750,7 +1728,6 @@ class EasyMagpieTTSModel(ModelPT):
         phoneme_tokens_lens: Optional[torch.Tensor] = None,
         mode: str = "train",
         training_mode: Optional[TrainingMode] = None,
-        collect_timing: bool = False,
     ) -> ProcessBatchOutput:
         """
         Simplified batch processing using channel-based embedding architecture.
@@ -1783,9 +1760,6 @@ class EasyMagpieTTSModel(ModelPT):
         Returns:
             ProcessBatchOutput: Contains loss values and model predictions
         """
-        timing_stats = {} if collect_timing else None
-        t_process_batch_start = self._now_with_optional_sync(collect_timing=collect_timing, reference_tensor=text)
-
         # Select training mode
         selected_training_mode = training_mode
         if selected_training_mode is None:
@@ -1818,9 +1792,6 @@ class EasyMagpieTTSModel(ModelPT):
                 dropout_conditional_input=dropout_conditional_input,
             )
         )
-        if collect_timing:
-            t_after_context = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/prepare_context_tensors_sec"] = t_after_context - t_process_batch_start
 
         # 2. Compute delays for each channel based on mode
         # Text channel delay: always context_lens
@@ -1844,9 +1815,6 @@ class EasyMagpieTTSModel(ModelPT):
             delay=text_delay,
             dropout_text_input=dropout_text_input or dropout_conditional_input,
         )
-        if collect_timing:
-            t_after_text = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/prepare_text_channel_sec"] = t_after_text - t_after_context
 
         # 4. Prepare phoneme channel embeddings (if phoneme tokenizer is configured)
         phoneme_channel_embedding = None
@@ -1873,9 +1841,6 @@ class EasyMagpieTTSModel(ModelPT):
                 apply_corruption=apply_phoneme_corruption,
                 dropout_complete_phoneme_channel=dropout_complete_phoneme_channel,
             )
-        if collect_timing:
-            t_after_phoneme = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/prepare_phoneme_channel_sec"] = t_after_phoneme - t_after_text
 
         # 5. Prepare audio channel embeddings
         (
@@ -1888,9 +1853,6 @@ class EasyMagpieTTSModel(ModelPT):
             audio_codes_lens=audio_codes_lens,
             delay=audio_delay,
         )
-        if collect_timing:
-            t_after_audio = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/prepare_audio_channel_sec"] = t_after_audio - t_after_phoneme
 
         # 6. Sum the channel embeddings element-wise
         # First, align all channels to the same length (max of all channel lengths)
@@ -1960,9 +1922,6 @@ class EasyMagpieTTSModel(ModelPT):
         context_embedding_padded = torch.cat([context_embedding, context_padding], dim=1)
 
         full_embedding = context_embedding_padded + combined_channel_embedding
-        if collect_timing:
-            t_after_join = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/channel_merge_and_context_join_sec"] = t_after_join - t_after_audio
 
         # 8. Forward pass through transformer
         transformer_out = self.forward(
@@ -1970,9 +1929,6 @@ class EasyMagpieTTSModel(ModelPT):
             attention_mask=get_mask_from_lengths(combined_channel_lens),
         )
         transformer_hidden_states = transformer_out.last_hidden_state  # (B, T_total, E)
-        if collect_timing:
-            t_after_decoder = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/main_decoder_sec"] = t_after_decoder - t_after_join
 
         # 9. Extract prediction embeddings and compute losses
         # Audio predictions start at audio_delay
@@ -1989,9 +1945,6 @@ class EasyMagpieTTSModel(ModelPT):
         # Compute codebook loss
         codebook_loss, _ = self.compute_loss(logits, audio_codes_target, audio_codes_lens_target)
         loss = self.parallel_codebook_loss_scale * codebook_loss
-        if collect_timing:
-            t_after_main_loss = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/main_head_and_codebook_loss_sec"] = t_after_main_loss - t_after_decoder
 
         # Compute local transformer loss if applicable
         local_transformer_loss = None
@@ -2005,9 +1958,6 @@ class EasyMagpieTTSModel(ModelPT):
                 local_transformer_logits, audio_codes_target, audio_codes_lens_target
             )
             loss = loss + self.local_transformer_loss_scale * local_transformer_loss
-        if collect_timing:
-            t_after_local_transformer = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/local_transformer_sec"] = t_after_local_transformer - t_after_main_loss
 
         # Compute phoneme loss if applicable
         phoneme_loss = None
@@ -2033,10 +1983,6 @@ class EasyMagpieTTSModel(ModelPT):
                 phoneme_loss = torch.tensor(0.0, device=logits.device)
 
             loss = loss + self.phoneme_loss_weight * phoneme_loss
-        if collect_timing:
-            t_process_batch_end = self._now_with_optional_sync(collect_timing=True, reference_tensor=text)
-            timing_stats["forward/phoneme_head_and_loss_sec"] = t_process_batch_end - t_after_local_transformer
-            timing_stats["forward/process_batch_total_sec"] = t_process_batch_end - t_process_batch_start
 
         return ProcessBatchOutput(
             loss=loss,
@@ -2053,38 +1999,16 @@ class EasyMagpieTTSModel(ModelPT):
             context_audio_codes=context_audio_codes_processed,
             context_audio_codes_lens=context_audio_codes_lens_processed,
             selected_training_mode=selected_training_mode.name if selected_training_mode is not None else None,
-            timing_stats=timing_stats,
         )
 
     def training_step(self, batch, batch_idx):
-        should_collect_timing = (
-            self.timing_debug_enabled and self.global_rank == 0 and (self.global_step % self.timing_print_interval == 0)
-        )
-        self._timing_should_print_this_step = should_collect_timing
-        self._timing_last_forward_breakdown = {}
-        self._timing_last_forward_total = None
-        self._timing_backward_start_time = None
-        self._timing_step_start_time = None
-        if should_collect_timing:
-            self._timing_step_start_time = self._now_with_optional_sync(collect_timing=True)
-
         if 'context_audio_codes' in batch:
             context_audio_codes = batch['context_audio_codes']
             context_audio_codes_lens = batch['context_audio_codes_lens']
         else:
             context_audio = batch['context_audio']
             context_audio_lens = batch['context_audio_lens']
-            t_context_audio_to_codes_start = self._now_with_optional_sync(
-                collect_timing=should_collect_timing, reference_tensor=context_audio
-            )
             context_audio_codes, context_audio_codes_lens = self.audio_to_codes(context_audio, context_audio_lens)
-            if should_collect_timing:
-                t_context_audio_to_codes_end = self._now_with_optional_sync(
-                    collect_timing=True, reference_tensor=context_audio
-                )
-                self._timing_last_forward_breakdown["forward/context_audio_to_codes_sec"] = (
-                    t_context_audio_to_codes_end - t_context_audio_to_codes_start
-                )
 
         if 'audio_codes' in batch:
             audio_codes = batch['audio_codes']
@@ -2092,13 +2016,7 @@ class EasyMagpieTTSModel(ModelPT):
         else:
             audio = batch['audio']
             audio_lens = batch['audio_lens']
-            t_audio_to_codes_start = self._now_with_optional_sync(collect_timing=should_collect_timing, reference_tensor=audio)
             audio_codes, audio_codes_lens = self.audio_to_codes(audio, audio_lens)
-            if should_collect_timing:
-                t_audio_to_codes_end = self._now_with_optional_sync(collect_timing=True, reference_tensor=audio)
-                self._timing_last_forward_breakdown["forward/audio_to_codes_sec"] = (
-                    t_audio_to_codes_end - t_audio_to_codes_start
-                )
 
         batch_output = self.process_batch(
             text=batch['text'],
@@ -2112,12 +2030,7 @@ class EasyMagpieTTSModel(ModelPT):
             phoneme_tokens=batch.get('phoneme_tokens'),
             phoneme_tokens_lens=batch.get('phoneme_tokens_lens'),
             mode="train",
-            collect_timing=should_collect_timing,
         )
-        if should_collect_timing and batch_output.timing_stats is not None:
-            self._timing_last_forward_breakdown.update(batch_output.timing_stats)
-            self._timing_last_forward_total = self._timing_last_forward_breakdown.get("forward/process_batch_total_sec")
-
         loss = batch_output.loss
         codebook_loss = batch_output.codebook_loss
         self.log('train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
@@ -2174,38 +2087,7 @@ class EasyMagpieTTSModel(ModelPT):
 
         self.log_dict(batch_info_dict, on_step=True)
 
-        if should_collect_timing:
-            t_train_step_end = self._now_with_optional_sync(collect_timing=True)
-            self._timing_last_forward_breakdown["forward/training_step_total_until_return_sec"] = (
-                t_train_step_end - self._timing_step_start_time
-            )
-            timing_summary = ", ".join(
-                f"{k.split('/')[-1]}={v:.4f}s" for k, v in sorted(self._timing_last_forward_breakdown.items())
-            )
-            print(
-                f"[Timing][rank={self.global_rank}][global_step={self.global_step}][batch_idx={batch_idx}] "
-                f"forward: {timing_summary}"
-            )
-
         return loss
-
-    def on_before_backward(self, loss: torch.Tensor) -> None:
-        super().on_before_backward(loss)
-        if self._timing_should_print_this_step:
-            self._timing_backward_start_time = self._now_with_optional_sync(collect_timing=True, reference_tensor=loss)
-
-    def on_after_backward(self) -> None:
-        super().on_after_backward()
-        if self._timing_should_print_this_step and self._timing_backward_start_time is not None:
-            t_after_backward = self._now_with_optional_sync(collect_timing=True)
-            backward_sec = t_after_backward - self._timing_backward_start_time
-            forward_total_sec = self._timing_last_forward_breakdown.get("forward/training_step_total_until_return_sec", None)
-            total_sec = (forward_total_sec + backward_sec) if forward_total_sec is not None else None
-            total_sec_str = f", step_fwd_plus_bwd={total_sec:.4f}s" if total_sec is not None else ""
-            print(
-                f"[Timing][rank={self.global_rank}][global_step={self.global_step}] "
-                f"backward={backward_sec:.4f}s{total_sec_str}"
-            )
 
     def validation_step(self, batch, batch_idx):
         # Extract inputs from batch and pass explicitly to process_batch
