@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH -t 4:00:00              # wall time
+#SBATCH --ntasks-per-node=8        # tasks per node
+#SBATCH --exclusive                # exclusive node access
+#SBATCH --mem=0                    # all mem avail
+#SBATCH --mail-type=FAIL           # only send email on failure
+#SBATCH --overcommit               # Needed for pytorch
+#SBATCH -p batch
+#SBATCH -N 4                       # number of nodes
+#SBATCH -A 	convai_convaird_nemo-speech
+#SBATCH -J 	convai_convaird_nemo-speech-sample:cer_ssim_en_5_libritts
+
+source containers_magpie.sh
+export HYDRA_FULL_ERROR=1
+
+set -x
+
+CODE_DIR="/gitrepos/NeMo"
+BATCH_SIZE=64
+LOG_LEVEL="INFO"
+
+EXP_DIR="/lustre/fsw/llmservice_nemo_speechlm/users/pneekhara/gitrepos/Experiments2026/CER_SSIM_Annotation/en"
+mkdir -p $EXP_DIR
+
+read -r -d '' cmd <<EOF
+echo "*******STARTING CER/SSIM ANNOTATION: en/libritts/lhotse_shar_shuffle_shardSize256/cuts_with_ipa [audio-context]********" \
+&& export HF_HOME="/gitrepos/huggingface" \
+&& cd ${CODE_DIR} ; export PYTHONPATH="${CODE_DIR}:${PYTHONPATH}" \
+&& python -u ${CODE_DIR}/scripts/magpietts/annotate_lhotse_shards_with_cer_ssim.py \
+    --cuts-dir /data/speech_data/en/libritts/lhotse_shar_shuffle_shardSize256/cuts_with_ipa \
+    --target-audio-dir /data/speech_data/en/libritts/lhotse_shar_shuffle_shardSize256/target_audio \
+    --context-audio-dir /data/speech_data/en/libritts/lhotse_shar_shuffle_shardSize256/context_audio \
+    --output-dir /data/speech_data/en/libritts/lhotse_shar_shuffle_shardSize256/cuts_with_ipa_annotated \
+    --batch-size ${BATCH_SIZE} \
+    --log-level ${LOG_LEVEL} \
+    --language en
+EOF
+
+echo $cmd
+
+srun -o ${EXP_DIR}/slurm-cer-ssim-%j-%n.out -e ${EXP_DIR}/slurm-cer-ssim-%j-%n.err --no-container-mount-home --container-image="$CONTAINER" $MOUNTS bash -c "${cmd}"
+set +x

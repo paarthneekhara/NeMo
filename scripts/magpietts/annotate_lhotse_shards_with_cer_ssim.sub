@@ -20,7 +20,6 @@ TARGET_AUDIO_DIR="/data/speech_data/en/jhsdGtc20Amp20Keynote/lhotse_shar_shuffle
 CONTEXT_AUDIO_DIR="/data/speech_data/en/jhsdGtc20Amp20Keynote/lhotse_shar_shuffle_shardSize256/context_audio"
 OUTPUT_DIR="/data/speech_data/en/jhsdGtc20Amp20Keynote/lhotse_shar_shuffle_shardSize256/cuts_with_ipa_cer_ssimOpus"
 CODE_DIR="/gitrepos/NeMo"
-DEVICES=8
 BATCH_SIZE=16
 LOG_LEVEL="INFO"
 
@@ -36,8 +35,6 @@ echo "*******STARTING CER/SSIM ANNOTATION********" \
     --target-audio-dir ${TARGET_AUDIO_DIR} \
     --context-audio-dir ${CONTEXT_AUDIO_DIR} \
     --output-dir ${OUTPUT_DIR} \
-    --devices ${DEVICES} \
-    --num-nodes ${SLURM_JOB_NUM_NODES} \
     --batch-size ${BATCH_SIZE} \
     --log-level ${LOG_LEVEL}
 EOF

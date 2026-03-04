@@ -48,14 +48,15 @@ Example of input shards:
         recording.000001.tar
         ...
 
+Each srun task runs as an independent single-GPU process (no DDP). Rank and world size
+are auto-detected from SLURM environment variables (SLURM_PROCID, SLURM_NTASKS, SLURM_LOCALID).
+
 Example usage:
     python -u ${CODE_DIR}/scripts/magpietts/annotate_lhotse_shards_with_cer_ssim.py \
         --cuts-dir ${CUTS_DIR} \
         --target-audio-dir ${TARGET_AUDIO_DIR} \
         --context-audio-dir ${CONTEXT_AUDIO_DIR} \
         --output-dir ${OUTPUT_DIR} \
-        --devices ${DEVICES} \
-        --num-nodes ${NUM_NODES} \
         --batch-size ${BATCH_SIZE} \
         --log-level "INFO"
 
@@ -66,6 +67,15 @@ Expected output:
         cuts.000001.jsonl.gz
         ...
 """
+
+# Pin each srun task to its own GPU before any CUDA initialization happens.
+# Must run before importing torch, lightning, or NeMo, which may init the CUDA driver.
+import os as _os
+
+if "SLURM_LOCALID" in _os.environ:
+    _os.environ["CUDA_VISIBLE_DEVICES"] = _os.environ["SLURM_LOCALID"]
+elif "LOCAL_RANK" in _os.environ:
+    _os.environ["CUDA_VISIBLE_DEVICES"] = _os.environ["LOCAL_RANK"]
 
 import argparse
 import glob
@@ -78,6 +88,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import math
+import time
+
 import lightning.pytorch as pl
 import numpy as np
 import torch
@@ -85,7 +98,6 @@ from lhotse import CutSet
 from lhotse.dataset import IterableDatasetWrapper, SimpleCutSampler
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import BasePredictionWriter
-from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -114,11 +126,13 @@ def collate_audio_vectors(
 
 class AudioPairCERSSIMDataset(Dataset):
     """
-    Lhotse Dataset that loads target and context audio at 16 kHz,
+    Lhotse Dataset that loads target (and optionally context) audio at 16 kHz,
     along with ground truth text and language metadata for CER/SSIM computation.
+    When context audio is unavailable (text-context shards), SSIM will be hardcoded to 1.0.
     """
 
     SAMPLE_RATE = 16000
+    MAX_AUDIO_SAMPLES = 30 * 16000  # 30s at 16kHz (Whisper's native window)
 
     def __getitem__(self, cuts: CutSet) -> Optional[Dict[str, Any]]:
         target_audios_list = []
@@ -129,12 +143,11 @@ class AudioPairCERSSIMDataset(Dataset):
         languages_list = []
         target_cut_ids_list = []
         shard_indices_list = []
+        has_context_audio = True
 
         for cut in cuts:
             if not cut.has_custom("shard_origin"):
                 raise ValueError(f"Cut {cut.id} is missing required key 'shard_origin'.")
-            if not cut.has_custom("context_recording"):
-                raise ValueError(f"Cut {cut.id} is missing required key 'context_recording'.")
 
             origin_path = cut.custom["shard_origin"]
             match = re.search(r"cuts\.(\d+)\.jsonl\.gz$", origin_path)
@@ -145,14 +158,21 @@ class AudioPairCERSSIMDataset(Dataset):
             target_audio = torch.from_numpy(
                 cut.recording.resample(self.SAMPLE_RATE).load_audio().squeeze(0)
             )
-            context_audio = torch.from_numpy(
-                cut.context_recording.resample(self.SAMPLE_RATE).load_audio().squeeze(0)
-            )
-
+            if target_audio.shape[0] > self.MAX_AUDIO_SAMPLES:
+                target_audio = target_audio[: self.MAX_AUDIO_SAMPLES]
             target_audios_list.append(target_audio)
             target_lengths_list.append(target_audio.shape[0])
-            context_audios_list.append(context_audio)
-            context_lengths_list.append(context_audio.shape[0])
+
+            if cut.has_custom("context_recording"):
+                context_audio = torch.from_numpy(
+                    cut.context_recording.resample(self.SAMPLE_RATE).load_audio().squeeze(0)
+                )
+                if context_audio.shape[0] > self.MAX_AUDIO_SAMPLES:
+                    context_audio = context_audio[: self.MAX_AUDIO_SAMPLES]
+                context_audios_list.append(context_audio)
+                context_lengths_list.append(context_audio.shape[0])
+            else:
+                has_context_audio = False
 
             if cut.supervisions and len(cut.supervisions) > 0:
                 sup = cut.supervisions[0]
@@ -166,8 +186,8 @@ class AudioPairCERSSIMDataset(Dataset):
 
             if cut.has_custom("lang"):
                 language = cut.lang
-            elif cut.supervisions and cut.supervisions[0].has_custom("language"):
-                language = cut.supervisions[0].language
+            elif cut.supervisions and cut.supervisions[0].language is not None:
+                language = cut.supervisions[0].language.lower()
             else:
                 language = "en"
             languages_list.append(language)
@@ -179,18 +199,23 @@ class AudioPairCERSSIMDataset(Dataset):
             raise ValueError("AudioPairCERSSIMDataset.__getitem__ received an empty CutSet.")
 
         target_audio_padded = collate_audio_vectors(target_audios_list, target_lengths_list, padding_value=0.0)
-        context_audio_padded = collate_audio_vectors(context_audios_list, context_lengths_list, padding_value=0.0)
 
-        return {
+        batch = {
             "target_audios_16khz": target_audio_padded,
             "target_audio_lens_16khz": torch.LongTensor(target_lengths_list),
-            "context_audios_16khz": context_audio_padded,
-            "context_audio_lens_16khz": torch.LongTensor(context_lengths_list),
+            "has_context_audio": has_context_audio,
             "ground_truth_texts": ground_truth_texts_list,
             "languages": languages_list,
             "target_cut_id": target_cut_ids_list,
             "shard_idx_origin": shard_indices_list,
         }
+
+        if has_context_audio:
+            context_audio_padded = collate_audio_vectors(context_audios_list, context_lengths_list, padding_value=0.0)
+            batch["context_audios_16khz"] = context_audio_padded
+            batch["context_audio_lens_16khz"] = torch.LongTensor(context_lengths_list)
+
+        return batch
 
 
 class CERSSIMExtractor(pl.LightningModule):
@@ -203,19 +228,31 @@ class CERSSIMExtractor(pl.LightningModule):
         self,
         cuts_dir: str,
         target_audio_dir: str,
-        context_audio_dir: str,
         batch_size: int,
+        context_audio_dir: Optional[str] = None,
         whisper_model_name: str = "openai/whisper-large-v3",
         log_every_n_batches: int = 10,
+        override_language: Optional[str] = None,
+        shard_rank: int = 0,
+        shard_world_size: int = 1,
+        num_shards: Optional[int] = None,
     ):
         super().__init__()
         self.cuts_dir = Path(cuts_dir)
         self.target_audio_dir = Path(target_audio_dir)
-        self.context_audio_dir = Path(context_audio_dir)
+        self.context_audio_dir = Path(context_audio_dir) if context_audio_dir else None
         self.batch_size = batch_size
         self.whisper_model_name = whisper_model_name
         self.log_every_n_batches = log_every_n_batches
+        self.override_language = override_language
+        self.shard_rank = shard_rank
+        self.shard_world_size = shard_world_size
+        self.num_shards = num_shards
         self._batch_counter = 0
+        self._total_batches_estimate = 0
+        self._total_cuts_estimate = 0
+        self._processed_cuts = 0
+        self._start_time: Optional[float] = None
 
         logging.info(f"Loading Whisper model: {self.whisper_model_name}")
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
@@ -254,12 +291,8 @@ class CERSSIMExtractor(pl.LightningModule):
         if self._rank_dataloaders is not None:
             return self._rank_dataloaders
 
-        try:
-            current_global_rank = self.global_rank
-            world_size = self.trainer.world_size
-        except AttributeError:
-            current_global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        current_global_rank = self.shard_rank
+        world_size = self.shard_world_size
 
         logging.info(f"[Rank {current_global_rank}/{world_size}] Creating assigned subset of dataloaders...")
 
@@ -280,8 +313,15 @@ class CERSSIMExtractor(pl.LightningModule):
         if last_idx != num_total_shards - 1:
             raise ValueError(f"Expected last shard index to be {num_total_shards - 1}, but found {last_idx}")
 
+        if self.num_shards is not None and self.num_shards < num_total_shards:
+            logging.info(
+                f"[Rank {current_global_rank}/{world_size}] Limiting to first {self.num_shards} shards "
+                f"(0..{self.num_shards - 1}) out of {num_total_shards} found."
+            )
+            num_total_shards = self.num_shards
+
         logging.info(
-            f"[Rank {current_global_rank}/{world_size}] Verified {num_total_shards} total shards (0..{last_idx})."
+            f"[Rank {current_global_rank}/{world_size}] Using {num_total_shards} total shards (0..{num_total_shards - 1})."
         )
 
         is_distributed = world_size > 1
@@ -313,19 +353,28 @@ class CERSSIMExtractor(pl.LightningModule):
             return []
 
         dataloaders = []
+        total_cuts = 0
+        total_batches = 0
         for shard_idx in tqdm(
             assigned_shard_indices,
             desc=f"[Rank {current_global_rank}/{world_size}] Creating DataLoaders",
         ):
+            cuts_path = str(self.cuts_dir / f"cuts.{shard_idx:06d}.jsonl.gz")
             fields = {
-                "cuts": [str(self.cuts_dir / f"cuts.{shard_idx:06d}.jsonl.gz")],
+                "cuts": [cuts_path],
                 "recording": [str(self.target_audio_dir / f"recording.{shard_idx:06d}.tar")],
-                "context_recording": [str(self.context_audio_dir / f"recording.{shard_idx:06d}.tar")],
             }
+            if self.context_audio_dir is not None:
+                fields["context_recording"] = [str(self.context_audio_dir / f"recording.{shard_idx:06d}.tar")]
             if not all(Path(v[0]).is_file() for v in fields.values()):
                 raise FileNotFoundError(
                     f"[Rank {current_global_rank}/{world_size}] Missing files for shard {shard_idx}: {fields}"
                 )
+
+            with gzip.open(cuts_path, 'rt') as f:
+                num_cuts_in_shard = sum(1 for _ in f)
+            total_cuts += num_cuts_in_shard
+            total_batches += math.ceil(num_cuts_in_shard / self.batch_size)
 
             shard_cutset = CutSet.from_shar(fields=fields)
             sampler = SimpleCutSampler(
@@ -336,8 +385,11 @@ class CERSSIMExtractor(pl.LightningModule):
             dl = DataLoader(dataset=iterable_dataset, batch_size=None, num_workers=1, pin_memory=True)
             dataloaders.append(dl)
 
+        self._total_cuts_estimate = total_cuts
+        self._total_batches_estimate = total_batches
         logging.info(
-            f"[Rank {current_global_rank}/{world_size}] Created {len(dataloaders)} DataLoaders."
+            f"[Rank {current_global_rank}/{world_size}] Created {len(dataloaders)} DataLoaders. "
+            f"Total cuts: {total_cuts}, estimated batches: {total_batches}."
         )
         self._rank_dataloaders = dataloaders
         return self._rank_dataloaders
@@ -389,10 +441,13 @@ class CERSSIMExtractor(pl.LightningModule):
     def forward(self, batch: Dict[str, Any]) -> List[Dict[str, Any]]:
         target_audios = batch["target_audios_16khz"]
         target_lens = batch["target_audio_lens_16khz"]
-        context_audios = batch["context_audios_16khz"]
-        context_lens = batch["context_audio_lens_16khz"]
+        has_context_audio = batch["has_context_audio"]
+        context_audios = batch.get("context_audios_16khz", None)
+        context_lens = batch.get("context_audio_lens_16khz", None)
         gt_texts = batch["ground_truth_texts"]
         languages = batch["languages"]
+        if self.override_language:
+            languages = [self.override_language] * len(languages)
         cut_ids = batch["target_cut_id"]
         shard_indices = batch["shard_idx_origin"]
 
@@ -404,14 +459,14 @@ class CERSSIMExtractor(pl.LightningModule):
         try:
             pred_transcripts = self._transcribe_batch_with_whisper(audio_arrays, languages)
         except Exception as e:
-            logging.warning(f"[Rank {self.global_rank}] Batched Whisper failed, falling back to per-item: {e}")
+            logging.warning(f"[Rank {self.shard_rank}] Batched Whisper failed, falling back to per-item: {e}")
             pred_transcripts = []
             for i in range(batch_size):
                 try:
                     t = self._transcribe_batch_with_whisper([audio_arrays[i]], [languages[i]])
                     pred_transcripts.append(t[0])
                 except Exception as inner_e:
-                    logging.warning(f"[Rank {self.global_rank}] Whisper failed for cut {cut_ids[i]}: {inner_e}")
+                    logging.warning(f"[Rank {self.shard_rank}] Whisper failed for cut {cut_ids[i]}: {inner_e}")
                     pred_transcripts.append(None)
 
         # --- Normalize transcripts and compute CER ---
@@ -420,7 +475,7 @@ class CERSSIMExtractor(pl.LightningModule):
         asr_transcripts_for_cer = []
         for i in range(batch_size):
             if pred_transcripts[i] is None or gt_texts[i] == "":
-                cer_values.append(-1.0)
+                cer_values.append(1.0)
                 gt_transcripts_for_cer.append("")
                 asr_transcripts_for_cer.append("")
                 continue
@@ -442,36 +497,43 @@ class CERSSIMExtractor(pl.LightningModule):
             pred_norm = process_text_for_cer(pred_text)
             gt_norm = process_text_for_cer(gt_text)
 
+            if languages[i] in ("zh", "chinese"):
+                pred_norm = pred_norm.replace(" ", "")
+                gt_norm = gt_norm.replace(" ", "")
+
             asr_transcripts_for_cer.append(pred_norm)
             gt_transcripts_for_cer.append(gt_norm)
 
             if gt_norm == "":
-                cer_values.append(-1.0)
+                cer_values.append(1.0)
                 continue
             cer = min(word_error_rate([pred_norm], [gt_norm], use_cer=True), 1.0)
             cer_values.append(float(cer))
 
         # --- Speaker similarity ---
-        try:
-            target_embeddings = self._compute_speaker_embeddings(target_audios, target_lens)
-            context_embeddings = self._compute_speaker_embeddings(context_audios, context_lens)
-        except Exception as e:
-            logging.warning(f"[Rank {self.global_rank}] Speaker embedding extraction failed: {e}")
-            target_embeddings = None
-            context_embeddings = None
+        if has_context_audio and context_audios is not None:
+            try:
+                target_embeddings = self._compute_speaker_embeddings(target_audios, target_lens)
+                context_embeddings = self._compute_speaker_embeddings(context_audios, context_lens)
+            except Exception as e:
+                logging.warning(f"[Rank {self.shard_rank}] Speaker embedding extraction failed: {e}")
+                target_embeddings = None
+                context_embeddings = None
 
-        ssim_values = []
-        for i in range(batch_size):
-            if target_embeddings is None or context_embeddings is None:
-                ssim_values.append(-1.0)
-                continue
-            t_emb = target_embeddings[i].cpu().float().numpy()
-            c_emb = context_embeddings[i].cpu().float().numpy()
-            norm_product = np.linalg.norm(t_emb) * np.linalg.norm(c_emb)
-            if norm_product < 1e-8:
-                ssim_values.append(0.0)
-            else:
-                ssim_values.append(float(np.dot(t_emb, c_emb) / norm_product))
+            ssim_values = []
+            for i in range(batch_size):
+                if target_embeddings is None or context_embeddings is None:
+                    ssim_values.append(-1.0)
+                    continue
+                t_emb = target_embeddings[i].cpu().float().numpy()
+                c_emb = context_embeddings[i].cpu().float().numpy()
+                norm_product = np.linalg.norm(t_emb) * np.linalg.norm(c_emb)
+                if norm_product < 1e-8:
+                    ssim_values.append(0.0)
+                else:
+                    ssim_values.append(float(np.dot(t_emb, c_emb) / norm_product))
+        else:
+            ssim_values = [1.0] * batch_size
 
         # --- Assemble results ---
         results = []
@@ -486,13 +548,28 @@ class CERSSIMExtractor(pl.LightningModule):
                 "annotated_language": languages[i],
             })
 
-        # --- Periodic logging ---
+        # --- Progress tracking and periodic logging ---
         self._batch_counter += 1
+        self._processed_cuts += batch_size
+        if self._start_time is None:
+            self._start_time = time.time()
+
         if self._batch_counter % self.log_every_n_batches == 0:
+            elapsed = time.time() - self._start_time
+            cuts_per_sec = self._processed_cuts / elapsed if elapsed > 0 else 0
+            pct = (self._batch_counter / self._total_batches_estimate * 100) if self._total_batches_estimate > 0 else 0
+            remaining_batches = max(self._total_batches_estimate - self._batch_counter, 0)
+            secs_per_batch = elapsed / self._batch_counter if self._batch_counter > 0 else 0
+            eta_secs = remaining_batches * secs_per_batch
+            eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_secs))
+            elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+
             sample_idx = 0
             logging.info(
-                f"[Rank {self.global_rank}] Batch {self._batch_counter} | "
-                f"Shard {shard_indices[sample_idx]} | Cut {cut_ids[sample_idx]}\n"
+                f"[Rank {self.shard_rank}] Batch {self._batch_counter}/{self._total_batches_estimate} "
+                f"({pct:.1f}%) | Cuts {self._processed_cuts}/{self._total_cuts_estimate} | "
+                f"{cuts_per_sec:.1f} cuts/s | Elapsed {elapsed_str} | ETA {eta_str}\n"
+                f"  Shard {shard_indices[sample_idx]} | Cut {cut_ids[sample_idx]}\n"
                 f"  GT (normalized):  {gt_transcripts_for_cer[sample_idx]}\n"
                 f"  ASR (normalized): {asr_transcripts_for_cer[sample_idx]}\n"
                 f"  CER: {cer_values[sample_idx]:.4f} | SSIM: {ssim_values[sample_idx]:.4f}"
@@ -503,7 +580,30 @@ class CERSSIMExtractor(pl.LightningModule):
     def predict_step(
         self, batch: Dict[str, Any], batch_idx: int, dataloader_idx: int = 0
     ) -> List[Dict[str, Any]]:
-        return self.forward(batch)
+        try:
+            return self.forward(batch)
+        except Exception as e:
+            cut_ids = batch.get("target_cut_id", [])
+            shard_indices = batch.get("shard_idx_origin", [])
+            languages = batch.get("languages", [])
+            if self.override_language:
+                languages = [self.override_language] * len(cut_ids)
+            logging.error(
+                f"[Rank {self.shard_rank}] forward() failed for batch_idx {batch_idx} "
+                f"(cuts: {cut_ids}): {e}. Returning sentinel values."
+            )
+            results = []
+            for i in range(len(cut_ids)):
+                results.append({
+                    "target_cut_id": cut_ids[i],
+                    "shard_idx": shard_indices[i] if i < len(shard_indices) else -1,
+                    "annotated_cer": 1.0,
+                    "annotated_ssim": -1.0,
+                    "gt_transcript_for_cer": "",
+                    "asr_transcript_for_cer": "",
+                    "annotated_language": languages[i] if i < len(languages) else "unknown",
+                })
+            return results
 
 
 class CERSSIMPredictionWriter(BasePredictionWriter):
@@ -512,23 +612,18 @@ class CERSSIMPredictionWriter(BasePredictionWriter):
     files when a shard is fully processed.
     """
 
-    def __init__(self, cuts_dir: str, output_dir: str):
+    def __init__(self, cuts_dir: str, output_dir: str, shard_rank: int = 0, shard_world_size: int = 1):
         super().__init__(write_interval="batch")
         self.cuts_dir = Path(cuts_dir)
         self.output_dir = Path(output_dir)
-        self.rank: int = -1
-        self.world_size: int = -1
+        self.rank: int = shard_rank
+        self.world_size: int = shard_world_size
         # shard_idx -> {cut_id -> {"annotated_cer": float, "annotated_ssim": float, ...}}
         self.shard_results: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
         self.last_processed_shard_idx: int = -1
 
     def setup(self, trainer: Trainer, pl_module: pl.LightningModule, stage: Optional[str] = None) -> None:
-        self.rank = trainer.global_rank
-        self.world_size = trainer.world_size
-        if self.rank == 0:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-        if trainer.world_size > 1:
-            torch.distributed.barrier()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"[Rank {self.rank}/{self.world_size}] CERSSIMPredictionWriter setup complete.")
 
     def _write_shard(self, shard_idx: int) -> None:
@@ -561,6 +656,13 @@ class CERSSIMPredictionWriter(BasePredictionWriter):
                         sup["custom"]["gt_transcript_for_cer"] = metrics["gt_transcript_for_cer"]
                         sup["custom"]["asr_transcript_for_cer"] = metrics["asr_transcript_for_cer"]
                         sup["custom"]["annotated_language"] = metrics["annotated_language"]
+
+                        if metrics["annotated_language"] in ("zh", "chinese"):
+                            if sup.get("text"):
+                                sup["text"] = sup["text"].replace(" ", "")
+                            if sup.get("custom", {}).get("normalized_text"):
+                                sup["custom"]["normalized_text"] = sup["custom"]["normalized_text"].replace(" ", "")
+
                         annotated_count += 1
                     else:
                         logging.warning(
@@ -636,20 +738,28 @@ def main():
         "--target-audio-dir", type=str, required=True, help="Directory containing target_audio/recording.*.tar shards."
     )
     parser.add_argument(
-        "--context-audio-dir", type=str, required=True,
-        help="Directory containing context_audio/recording.*.tar shards.",
+        "--context-audio-dir", type=str, default=None,
+        help="Directory containing context_audio/recording.*.tar shards. "
+             "If not provided, SSIM is hardcoded to 1.0 (text-context mode).",
     )
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save annotated cuts.*.jsonl.gz.")
     parser.add_argument(
         "--whisper-model-name", type=str, default="openai/whisper-large-v3",
         help="HuggingFace Whisper model name for ASR.",
     )
-    parser.add_argument("--devices", type=int, default=-1, help="Number of GPUs per node (-1 for all).")
-    parser.add_argument("--num-nodes", type=int, default=1, help="Number of nodes for distributed processing.")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU.")
     parser.add_argument(
         "--log-every-n-batches", type=int, default=10,
         help="Log a sample (GT text, predicted text, CER, SSIM) every N batches per rank.",
+    )
+    parser.add_argument(
+        "--language", type=str, default=None,
+        help="Override language for Whisper transcription and text normalization "
+             "(e.g. 'it', 'de', 'es'). If not set, language is read from each cut.",
+    )
+    parser.add_argument(
+        "--num-shards", type=int, default=None,
+        help="Process only the first N shards (0..N-1). If not set, all shards are processed.",
     )
     parser.add_argument(
         "--log-level", type=str, default="INFO",
@@ -662,31 +772,49 @@ def main():
     log_format = '%(asctime)s - PID:%(process)d - %(levelname)s - %(message)s'
     logging.basicConfig(level=log_level_val, format=log_format)
 
+    # Detect rank/world_size from SLURM environment.
+    # CUDA_VISIBLE_DEVICES is already pinned at module top (before torch import)
+    # so each srun task runs as an independent single-GPU process with no DDP.
+    shard_rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+    shard_world_size = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1")))
+    local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+
+    logging.info(
+        f"Running as independent single-GPU process: shard_rank={shard_rank}, "
+        f"shard_world_size={shard_world_size}, local_rank={local_rank}, "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}"
+    )
+
     extractor = CERSSIMExtractor(
         cuts_dir=args.cuts_dir,
         target_audio_dir=args.target_audio_dir,
-        context_audio_dir=args.context_audio_dir,
         batch_size=args.batch_size,
+        context_audio_dir=args.context_audio_dir,
         whisper_model_name=args.whisper_model_name,
         log_every_n_batches=args.log_every_n_batches,
+        override_language=args.language,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
+        num_shards=args.num_shards,
     )
 
     pred_writer = CERSSIMPredictionWriter(
         cuts_dir=args.cuts_dir,
         output_dir=args.output_dir,
+        shard_rank=shard_rank,
+        shard_world_size=shard_world_size,
     )
 
-    strategy = DDPStrategy(find_unused_parameters=False) if torch.cuda.is_available() and args.devices != 1 else "auto"
     trainer = Trainer(
-        devices=args.devices if torch.cuda.is_available() else 1,
-        num_nodes=args.num_nodes,
+        devices=1,
+        num_nodes=1,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        strategy=strategy,
+        strategy="auto",
         callbacks=[pred_writer],
         use_distributed_sampler=False,
     )
 
-    logging.info(f"Starting CER/SSIM annotation with {trainer.world_size} ranks.")
+    logging.info(f"Starting CER/SSIM annotation. Shard rank {shard_rank}/{shard_world_size}.")
     trainer.predict(extractor, return_predictions=False)
     logging.info("CER/SSIM annotation finished.")
 
