@@ -14,6 +14,7 @@
 
 from nemo.collections.tts.models.aligner import AlignerModel
 from nemo.collections.tts.models.audio_codec import AudioCodecModel
+from nemo.collections.tts.models.base_magpietts import BaseMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_preference_optimization import EasyMagpieTTSModelOnlinePO
 from nemo.collections.tts.models.fastpitch import FastPitchModel
@@ -30,6 +31,7 @@ from nemo.collections.tts.models.ssl_tts import SSLDisentangler
 __all__ = [
     "AlignerModel",
     "AudioCodecModel",
+    "BaseMagpieTTSModel",
     "FastPitchModel",
     "FastPitchModel_SSL",
     "SSLDisentangler",
