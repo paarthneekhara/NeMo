@@ -66,7 +66,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
-from nemo.collections.tts.models.easy_magpietts import EasyModelInferenceParameters
+from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters
 from nemo.collections.tts.models.magpietts import ModelInferenceParameters
 from nemo.collections.tts.modules.magpietts_inference.evaluate_generated_audio import load_evalset_config
 from nemo.collections.tts.modules.magpietts_inference.evaluation import (
@@ -400,7 +400,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default='magpie',
         choices=['magpie', 'easy_magpie'],
         help='Model type: "magpie" for encoder-decoder MagpieTTSModel, '
-        '"easy_magpie" for decoder-only EasyMagpieTTSModel',
+        '"easy_magpie" for decoder-only EasyMagpieTTSInferenceModel',
     )
 
     # Model loading
@@ -515,7 +515,7 @@ def _add_magpie_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_easy_magpie_args(parser: argparse.ArgumentParser) -> None:
-    """Add arguments specific to decoder-only EasyMagpieTTSModel."""
+    """Add arguments specific to decoder-only EasyMagpieTTSInferenceModel."""
     group = parser.add_argument_group('EasyMagpieTTS-specific Parameters')
     group.add_argument(
         '--phoneme_input_type',
@@ -532,6 +532,12 @@ def _add_easy_magpie_args(parser: argparse.ArgumentParser) -> None:
         help='Sampling method for phoneme prediction',
     )
     group.add_argument('--dropout_text_input', action='store_true', help='Force dropout on text input')
+    group.add_argument(
+        '--phoneme_tokenizer_path',
+        type=str,
+        default=None,
+        help='Override path to the phoneme tokenizer file (overrides the path stored in the checkpoint config)',
+    )
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
@@ -640,6 +646,7 @@ def main(argv=None):
                 legacy_codebooks=args.legacy_codebooks,
                 legacy_text_conditioning=args.legacy_text_conditioning,
                 hparams_from_wandb=args.hparams_file_from_wandb,
+                phoneme_tokenizer_path=getattr(args, 'phoneme_tokenizer_path', None),
             )
 
             model, checkpoint_name = load_fn(model_config)
@@ -677,6 +684,7 @@ def main(argv=None):
                 codecmodel_path=args.codecmodel_path,
                 legacy_codebooks=args.legacy_codebooks,
                 legacy_text_conditioning=args.legacy_text_conditioning,
+                phoneme_tokenizer_path=getattr(args, 'phoneme_tokenizer_path', None),
             )
 
             model, checkpoint_name = load_fn(model_config)
