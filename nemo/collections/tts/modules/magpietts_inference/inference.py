@@ -129,7 +129,6 @@ class EasyMagpieInferenceConfig(BaseInferenceConfig):
     phoneme_input_type: str = "gt"
     phoneme_sampling_method: str = "argmax"
     dropout_text_input: bool = False
-    legacy_context_stacking: bool = False
 
     def build_identifier(self) -> str:
         parts = [
@@ -550,7 +549,6 @@ class EasyMagpieInferenceRunner(BaseInferenceRunner):
 
     def __init__(self, model, config: EasyMagpieInferenceConfig):
         super().__init__(model, config)
-        self.model.legacy_context_stacking = config.legacy_context_stacking
 
     def create_dataset(
         self,

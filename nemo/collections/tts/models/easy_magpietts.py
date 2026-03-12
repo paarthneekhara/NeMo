@@ -109,7 +109,7 @@ class EasyModelInferenceParameters:
         cfg_scale: Scale factor for classifier-free guidance.
     """
 
-    max_decoder_steps: int = 500
+    max_decoder_steps: int = 300
     temperature: float = 0.7
     topk: int = 80
     cfg_scale: float = 2.5

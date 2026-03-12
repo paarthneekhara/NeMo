@@ -26,7 +26,7 @@ if/else branching.
 
 Example usage:
     # MagpieTTS inference (encoder-decoder, default)
-    python examples/tts/tts_infer.py \\
+    python examples/tts/magpietts_inference.py \\
         --model_type magpie \\
         --nemo_files /path/to/model.nemo \\
         --datasets_json_path /path/to/evalset_config.json \\
@@ -34,7 +34,7 @@ Example usage:
         --codecmodel_path /path/to/codec.nemo
 
     # EasyMagpieTTS inference (decoder-only)
-    python examples/tts/tts_infer.py \\
+    python examples/tts/magpietts_inference.py \\
         --model_type easy_magpie \\
         --nemo_files /path/to/model.nemo \\
         --datasets_json_path /path/to/evalset_config.json \\
@@ -42,7 +42,7 @@ Example usage:
         --codecmodel_path /path/to/codec.nemo
 
     # With evaluation
-    python examples/tts/tts_infer.py \\
+    python examples/tts/magpietts_inference.py \\
         --model_type magpie \\
         --hparams_files /path/to/hparams.yaml \\
         --checkpoint_files /path/to/model.ckpt \\
@@ -159,11 +159,6 @@ def filter_datasets(dataset_meta_info: dict, datasets: Optional[List[str]]) -> L
             if dataset not in dataset_meta_info:
                 raise ValueError(f"Dataset {dataset} not found in dataset meta info")
         return datasets
-
-
-# ---------------------------------------------------------------------------
-# Core inference + evaluation orchestration (model-type agnostic)
-# ---------------------------------------------------------------------------
 
 
 def run_inference_and_evaluation(
@@ -355,15 +350,18 @@ def run_inference_and_evaluation(
     return None, None
 
 
-# ---------------------------------------------------------------------------
-# CLI argument parser
-# ---------------------------------------------------------------------------
+def _get_shared_inference_param_names() -> set:
+    """Return the field names shared by ModelInferenceParameters and EasyModelInferenceParameters."""
+    magpie_fields = {f.name for f in fields(ModelInferenceParameters)}
+    easy_fields = {f.name for f in fields(EasyModelInferenceParameters)}
+    return magpie_fields & easy_fields
 
 
 def _add_inference_param_fields(
     group: argparse._ArgumentGroup,
     param_cls: type,
     skip_fields: Optional[set] = None,
+    only_fields: Optional[set] = None,
 ) -> None:
     """Auto-generate argparse arguments from fields of a dataclass.
 
@@ -371,11 +369,14 @@ def _add_inference_param_fields(
         group: The argparse argument group to add arguments to.
         param_cls: The dataclass whose fields to add.
         skip_fields: Field names to skip (already added by another group).
+        only_fields: If provided, only add fields whose names are in this set.
     """
     if skip_fields is None:
         skip_fields = set()
     for f in fields(param_cls):
         if f.name in skip_fields:
+            continue
+        if only_fields is not None and f.name not in only_fields:
             continue
         extra_args: dict = {"type": f.type}
         if f.type == bool:
@@ -469,8 +470,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     infer_group.add_argument('--use_cfg', action='store_true', help='Enable classifier-free guidance')
     infer_group.add_argument('--use_local_transformer', action='store_true')
 
-    # Shared model inference parameters (max_decoder_steps, temperature, topk, cfg_scale)
-    _add_inference_param_fields(infer_group, EasyModelInferenceParameters)
+    # Model inference parameters shared by both MagpieTTS and EasyMagpieTTS
+    shared_param_names = _get_shared_inference_param_names()
+    _add_inference_param_fields(infer_group, ModelInferenceParameters, only_fields=shared_param_names)
 
     # Evaluation
     eval_group = parser.add_argument_group('Evaluation')
@@ -499,9 +501,8 @@ def _add_magpie_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group('MagpieTTS-specific Parameters')
 
     # MagpieTTS-specific model inference parameters (attention prior, EOS, etc.)
-    # Skip fields already added by the common inference group.
-    shared_field_names = {f.name for f in fields(EasyModelInferenceParameters)}
-    _add_inference_param_fields(group, ModelInferenceParameters, skip_fields=shared_field_names)
+    shared_param_names = _get_shared_inference_param_names()
+    _add_inference_param_fields(group, ModelInferenceParameters, skip_fields=shared_param_names)
 
     group.add_argument('--maskgit_n_steps', type=int, default=3)
     group.add_argument('--maskgit_noise_scale', type=float, default=0.0)
@@ -531,11 +532,6 @@ def _add_easy_magpie_args(parser: argparse.ArgumentParser) -> None:
         help='Sampling method for phoneme prediction',
     )
     group.add_argument('--dropout_text_input', action='store_true', help='Force dropout on text input')
-    group.add_argument(
-        '--legacy_context_stacking',
-        action='store_true',
-        help='Use audio_bos_id/audio_eos_id for context stacking',
-    )
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
@@ -549,11 +545,6 @@ def create_argument_parser() -> argparse.ArgumentParser:
     _add_magpie_args(parser)
     _add_easy_magpie_args(parser)
     return parser
-
-
-# ---------------------------------------------------------------------------
-# Config builders (one per model type)
-# ---------------------------------------------------------------------------
 
 
 def _build_inference_params_from_args(param_cls: type, args):
@@ -592,14 +583,7 @@ def _build_easy_magpie_config(args) -> EasyMagpieInferenceConfig:
         phoneme_input_type=args.phoneme_input_type,
         phoneme_sampling_method=args.phoneme_sampling_method,
         dropout_text_input=args.dropout_text_input,
-        legacy_context_stacking=args.legacy_context_stacking,
     )
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 
 def main(argv=None):
     """Entry point for TTS inference and evaluation."""

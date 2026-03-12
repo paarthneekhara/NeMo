@@ -734,19 +734,11 @@ class EasyMagpieTTSInferenceModel(BaseMagpieTTSModel):
             eos_id=self.context_audio_eos_id,
         )
 
-        # Use legacy audio_bos_id/audio_eos_id if flag is set
-        stack_bos_id = (
-            self.audio_bos_id if getattr(self, 'legacy_context_stacking', False) else self.context_audio_bos_id
-        )
-        stack_eos_id = (
-            self.audio_eos_id if getattr(self, 'legacy_context_stacking', False) else self.context_audio_eos_id
-        )
-
         context_audio_codes, context_audio_codes_lens = self.stack_codes(
             context_audio_codes,
             context_audio_codes_lens,
-            stack_bos_id,
-            stack_eos_id,
+            self.context_audio_bos_id,
+            self.context_audio_eos_id,
             self.frame_stacking_factor,
             self.num_audio_codebooks,
         )
