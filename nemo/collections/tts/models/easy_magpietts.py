@@ -2109,6 +2109,12 @@ class EasyMagpieTTSModel(ModelPT):
                 }
             )
 
+        if 'dropped_text' in batch:
+            batch_info_dict["train/dropped_text_pct"] = 100.0 * batch['dropped_text'].float().mean().item()
+            batch_info_dict["train/dropped_context_pct"] = 100.0 * batch['dropped_context'].float().mean().item()
+            both_dropped = (batch['dropped_text'] & batch['dropped_context']).float().mean().item()
+            batch_info_dict["train/dropped_both_pct"] = 100.0 * both_dropped
+
         self.log_dict(batch_info_dict, on_step=True)
 
         return loss
@@ -2511,6 +2517,8 @@ class EasyMagpieTTSModel(ModelPT):
             phoneme_tokenizer_config=self.cfg.get("phoneme_tokenizer", None),
             ignore_phoneme_languages=self.cfg.get("ignore_phoneme_languages", []),
             add_language_to_context_text=self.add_language_to_context_text,
+            cer_threshold=self.cfg.get("cer_threshold", None),
+            ssim_threshold=self.cfg.get("ssim_threshold", None),
         )
 
         data_loader = get_lhotse_dataloader_from_config(

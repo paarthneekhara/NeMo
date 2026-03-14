@@ -153,6 +153,8 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         phoneme_tokenizer_config: DictConfig = None,
         ignore_phoneme_languages: List[str] = None,
         add_language_to_context_text: bool = False,
+        cer_threshold: float = None,
+        ssim_threshold: float = None,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -179,6 +181,8 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.phoneme_tokenizer_config = phoneme_tokenizer_config
         self.ignore_phoneme_languages = ignore_phoneme_languages or []
         self.add_language_to_context_text = add_language_to_context_text
+        self.cer_threshold = cer_threshold
+        self.ssim_threshold = ssim_threshold
 
     def get_num_audio_samples_to_slice(self, duration, sample_rate):
         num_codec_frames = int(duration * sample_rate / self.codec_model_samples_per_frame)
@@ -236,6 +240,8 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         )  # raw text here is the string of normalized text or text stored in the supervision segment. Used to distinguish from text tokens.
         phoneme_token_list = []
         phoneme_token_len_list = []
+        dropped_text_list = []
+        dropped_context_list = []
 
         def _sample_context_duration_with_available_limit(available_duration_sec: float) -> float:
             effective_duration_max = min(self.context_duration_max, available_duration_sec)
@@ -253,6 +259,19 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             else:
                 language = cut.supervisions[0].language if cut.supervisions[0].has_custom("language") else "en"
             language_list.append(language)
+
+            drop_text = False
+            drop_context = False
+            if self.dataset_type == 'train':
+                custom = cut.supervisions[0].custom if cut.supervisions[0].has_custom("custom") else {}
+                if self.cer_threshold is not None and "annotated_cer" in custom:
+                    if custom["annotated_cer"] > self.cer_threshold:
+                        drop_text = True
+                if self.ssim_threshold is not None and "annotated_ssim" in custom:
+                    if custom["annotated_ssim"] < self.ssim_threshold:
+                        drop_context = True
+            dropped_text_list.append(drop_text)
+            dropped_context_list.append(drop_context)
 
             # target audio or target codes
             if self.load_cached_codes_if_available and cut.has_custom("target_codes"):
@@ -283,7 +302,18 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                 audio_len_list.append(audio_len)
 
             # context audio or context codes
-            if self.load_cached_codes_if_available and cut.has_custom("context_codes"):
+            if drop_context:
+                if self.load_cached_codes_if_available:
+                    context_audio_codes = torch.zeros([0, self.num_audio_codebooks], dtype=torch.int32)
+                    context_audio_codes_len = 0
+                    context_audio_codes_list.append(context_audio_codes)
+                    context_audio_codes_len_list.append(context_audio_codes_len)
+                else:
+                    context_audio = torch.zeros(self.codec_model_samples_per_frame, dtype=torch.float32)
+                    context_audio_len = context_audio.shape[0]
+                    context_audio_list.append(context_audio)
+                    context_audio_len_list.append(context_audio_len)
+            elif self.load_cached_codes_if_available and cut.has_custom("context_codes"):
                 # Note that we have segmented the audio according to offset and duration so that the audio codes should
                 # not specify start and duration again when calling TemporalArray.load(start, duration). Ensure start
                 # and duration are None to the load function.
@@ -424,36 +454,40 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             else:
                 text_str = cut.supervisions[0].text
             raw_text_list.append(text_str)
-            if cut.has_custom("tokenizer_names"):
-                # Pick a random tokenizer from the list of tokenizers
-                tokenizer_name = random.choice(cut.tokenizer_names)
+
+            if drop_text:
+                tokens = torch.tensor([self.eos_id], dtype=torch.int32)
             else:
-                tokenizer_name = "english_phoneme"  # Default to english phoneme tokenizer
-            tokens = self.text_tokenizer.encode(text=text_str, tokenizer_name=tokenizer_name)
-            tokens = tokens + [self.eos_id]  # Not adding BOS id
-            tokens = torch.tensor(tokens, dtype=torch.int32)
+                if cut.has_custom("tokenizer_names"):
+                    tokenizer_name = random.choice(cut.tokenizer_names)
+                else:
+                    tokenizer_name = "english_phoneme"
+                tokens = self.text_tokenizer.encode(text=text_str, tokenizer_name=tokenizer_name)
+                tokens = tokens + [self.eos_id]
+                tokens = torch.tensor(tokens, dtype=torch.int32)
             text_len = tokens.shape[0]
             token_list.append(tokens)
             token_len_list.append(text_len)
 
             if self.phoneme_tokenizer is not None:
-                # Use IPA text for IPABPETokenizer (required), otherwise use regular text_str
-                if isinstance(self.phoneme_tokenizer, IPABPETokenizer):
-                    if not cut.supervisions[0].has_custom("ipa"):
-                        raise ValueError(
-                            f"IPABPETokenizer requires 'ipa' field but it is not available in the cut. "
-                            f"Cut ID: {cut.id}, Text: {text_str}"
-                        )
-                    phoneme_text = cut.supervisions[0].ipa
-                    if language in self.ignore_phoneme_languages:
-                        # Ignore phoneme tokenization for this language
-                        phoneme_text = ""
+                if drop_text:
+                    phoneme_tokens = [self.phoneme_tokenizer.bos_token_id, self.phoneme_tokenizer.eos_token_id]
                 else:
-                    phoneme_text = text_str
-                phoneme_tokens = self.phoneme_tokenizer.encode(phoneme_text)
-                phoneme_tokens = (
-                    [self.phoneme_tokenizer.bos_token_id] + phoneme_tokens + [self.phoneme_tokenizer.eos_token_id]
-                )
+                    if isinstance(self.phoneme_tokenizer, IPABPETokenizer):
+                        if not cut.supervisions[0].has_custom("ipa"):
+                            raise ValueError(
+                                f"IPABPETokenizer requires 'ipa' field but it is not available in the cut. "
+                                f"Cut ID: {cut.id}, Text: {text_str}"
+                            )
+                        phoneme_text = cut.supervisions[0].ipa
+                        if language in self.ignore_phoneme_languages:
+                            phoneme_text = ""
+                    else:
+                        phoneme_text = text_str
+                    phoneme_tokens = self.phoneme_tokenizer.encode(phoneme_text)
+                    phoneme_tokens = (
+                        [self.phoneme_tokenizer.bos_token_id] + phoneme_tokens + [self.phoneme_tokenizer.eos_token_id]
+                    )
                 phoneme_tokens_len = len(phoneme_tokens)
                 phoneme_token_list.append(torch.tensor(phoneme_tokens, dtype=torch.int32))
                 phoneme_token_len_list.append(phoneme_tokens_len)
@@ -524,6 +558,10 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
 
         if len(reward_list) > 0:
             batch_dict['rewards'] = torch.FloatTensor(reward_list)
+
+        if self.cer_threshold is not None or self.ssim_threshold is not None:
+            batch_dict['dropped_text'] = torch.BoolTensor(dropped_text_list)
+            batch_dict['dropped_context'] = torch.BoolTensor(dropped_context_list)
 
         # Assert only ONE of context_audio or context_audio_codes in the batch
         assert ('audio' in batch_dict) ^ ('audio_codes' in batch_dict)
