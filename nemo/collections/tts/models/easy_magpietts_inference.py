@@ -1888,12 +1888,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             device = text.device
 
             # Generate until all items are finished or max steps reached
-            print("Generation started")
+            logging.info("Generation started")
             gen_step = 0
             while not state.finished.all() and len(state.all_predictions) < max_decoder_steps:
                 gen_step += 1
                 if gen_step % 10 == 0:
-                    print(f"Generation step {gen_step} ")
+                    logging.info(f"Generation step {gen_step}")
                 # Gather the correct text token for each batch item based on text_tokens_seen
                 # Items in context phase will have their token ignored by streaming_step
                 positions = state.text_tokens_seen.clamp(max=text.size(1) - 1)
