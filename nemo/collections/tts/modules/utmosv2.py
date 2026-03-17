@@ -86,9 +86,7 @@ class UTMOSv2Calculator:
         if num_workers is None:
             num_workers = batch_size
 
-        predict_kwargs = dict(
-            input_dir=input_dir, num_repetitions=1, num_workers=num_workers, batch_size=batch_size
-        )
+        predict_kwargs = dict(input_dir=input_dir, num_repetitions=1, num_workers=num_workers, batch_size=batch_size)
         if filenames is not None:
             predict_kwargs["val_list"] = list(filenames)
 

@@ -1233,7 +1233,10 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                         try:
                             filenames = [os.path.basename(p) for p in predicted_audio_paths]
                             batch_results = self._utmos_calculator.process_directory(
-                                audio_dir, batch_size=utmos_batch_size, num_workers=utmos_num_workers, filenames=filenames
+                                audio_dir,
+                                batch_size=utmos_batch_size,
+                                num_workers=utmos_num_workers,
+                                filenames=filenames,
                             )
                             utmos_scores = [float(item['predicted_mos']) for item in batch_results]
                         except Exception as e:

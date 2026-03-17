@@ -937,4 +937,3 @@ def get_speaker_embeddings_from_filepaths(filepaths, speaker_verification_model,
     )
 
     return speaker_embeddings
-
