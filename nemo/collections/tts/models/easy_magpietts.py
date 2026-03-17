@@ -35,9 +35,6 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import MagpieTTSLhotseDataset, setup_tokenizers
 from nemo.collections.tts.models.easy_magpietts_inference import (
     EasyMagpieTTSInferenceModel,
-    InferBatchOutput,
-    StreamingFinalizeOutput,
-    StreamingState,
     TrainingMode,
 )
 from nemo.collections.tts.modules.magpietts_modules import (
