@@ -29,7 +29,6 @@ from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.parts.mixins.transcription import TranscribeConfig
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.parts.utils.helpers import (
-    compute_utmos_scores_from_filepaths,
     get_mask_from_lengths,
     get_speaker_embeddings_from_filepaths,
     process_text_for_cer,
@@ -654,13 +653,12 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             return []
         utmos_batch_size = max(int(self.cfg.get('utmos_batch_size', len(predicted_audio_paths))), 1)
         utmos_num_workers = max(int(self.cfg.get('utmos_num_workers', 0)), 0)
-        return compute_utmos_scores_from_filepaths(
-            audio_filepaths=predicted_audio_paths,
-            utmos_calculator=self._utmos_calculator,
-            batch_size=utmos_batch_size,
-            num_workers=utmos_num_workers,
-            rank_tag=str(self.global_rank),
+        audio_dir = self._get_audio_dir()
+        filenames = [os.path.basename(p) for p in predicted_audio_paths]
+        batch_results = self._utmos_calculator.process_directory(
+            audio_dir, batch_size=utmos_batch_size, num_workers=utmos_num_workers, filenames=filenames
         )
+        return [float(item['predicted_mos']) for item in batch_results]
 
     def generate_and_reward(
         self,

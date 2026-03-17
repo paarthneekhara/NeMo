@@ -45,7 +45,6 @@
 import os
 import shutil
 import string
-import tempfile
 from collections import defaultdict
 from enum import Enum
 from typing import Any, List, Optional, Sequence, Tuple, Union
@@ -939,41 +938,3 @@ def get_speaker_embeddings_from_filepaths(filepaths, speaker_verification_model,
 
     return speaker_embeddings
 
-
-def compute_utmos_scores_from_filepaths(
-    audio_filepaths: Sequence[str],
-    utmos_calculator: Any,
-    batch_size: int = 8,
-    num_workers: int = 0,
-    rank_tag: str = "0",
-) -> List[float]:
-    """
-    Compute UTMOS scores in strict batched mode for a list of wav filepaths.
-
-    Expected UTMOS batch output schema (per item):
-      {'file_path': <path>, 'predicted_mos': <float>}
-    """
-    if len(audio_filepaths) == 0:
-        return []
-
-    batch_size = max(int(batch_size), 1)
-    num_workers = max(int(num_workers), 0)
-    scores = [0.0] * len(audio_filepaths)
-
-    with tempfile.TemporaryDirectory(prefix=f"utmos_rank{rank_tag}_") as tmp_dir:
-        file_to_idx = {}
-        for idx, src_path in enumerate(audio_filepaths):
-            tmp_name = f"{idx:06d}.wav"
-            tmp_path = os.path.join(tmp_dir, tmp_name)
-            os.symlink(src_path, tmp_path)
-            file_to_idx[tmp_name] = idx
-
-        batch_results = utmos_calculator.process_directory(tmp_dir, batch_size=batch_size, num_workers=num_workers)
-        if not isinstance(batch_results, list):
-            raise RuntimeError(f"Unexpected UTMOSv2 output type: {type(batch_results)}")
-
-        for item in batch_results:
-            idx = file_to_idx.get(os.path.basename(str(item['file_path'])))
-            scores[idx] = float(item['predicted_mos'])
-
-    return scores

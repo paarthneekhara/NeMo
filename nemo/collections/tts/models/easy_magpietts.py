@@ -42,7 +42,6 @@ from nemo.collections.tts.modules.magpietts_modules import (
     worker_init_fn,
 )
 from nemo.collections.tts.parts.utils.helpers import (
-    compute_utmos_scores_from_filepaths,
     get_mask_from_lengths,
     get_speaker_embeddings_from_filepaths,
     process_text_for_cer,
@@ -1232,13 +1231,11 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                         utmos_batch_size = max(int(self.cfg.get('utmos_batch_size', len(predicted_audio_paths))), 1)
                         utmos_num_workers = max(int(self.cfg.get('utmos_num_workers', 0)), 0)
                         try:
-                            utmos_scores = compute_utmos_scores_from_filepaths(
-                                audio_filepaths=predicted_audio_paths,
-                                utmos_calculator=self._utmos_calculator,
-                                batch_size=utmos_batch_size,
-                                num_workers=utmos_num_workers,
-                                rank_tag=str(self.global_rank),
+                            filenames = [os.path.basename(p) for p in predicted_audio_paths]
+                            batch_results = self._utmos_calculator.process_directory(
+                                audio_dir, batch_size=utmos_batch_size, num_workers=utmos_num_workers, filenames=filenames
                             )
+                            utmos_scores = [float(item['predicted_mos']) for item in batch_results]
                         except Exception as e:
                             raise RuntimeError(f"Val UTMOSv2 batched scoring failed: {e}") from e
 
