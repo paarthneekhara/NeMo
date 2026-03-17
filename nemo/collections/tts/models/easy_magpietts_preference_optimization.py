@@ -74,6 +74,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
     """
 
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
+        """Initialize the online PO model, including the frozen reference model, reward ASR/speaker
+        verification models, optional PESQ/UTMOSv2 scorers, and all PO hyper-parameters from ``cfg``.
+        """
         super().__init__(cfg, trainer)
 
         self.run_val_inference = True  # Always run validation inference in PO.
@@ -263,7 +266,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             lines.append(f"  {name:40s}  grad={gn:.6f}  w={wn:.4f}  Δw={wd:.8f}")
 
         summary = "\n".join(lines)
-        print(summary)
         logging.info(summary)
 
     def setup_optimizer_param_groups(self):
@@ -299,6 +301,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         self._optimizer_param_groups = [{"params": trainable_params}]
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
+        """Return the model state dict, excluding reference model and UTMOSv2 calculator weights."""
         state_dict = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
         keys_substrings_to_exclude = ['_reference_model', '_utmos_calculator']
         for key in list(state_dict.keys()):
@@ -307,6 +310,10 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         return state_dict
 
     def _get_cached_normalizer(self, lang_key: Optional[str]):
+        """Return a cached ``Normalizer`` for the given language, creating one on first access.
+
+        Returns ``None`` if pynini is not installed or normalizer creation fails.
+        """
         if not PYNINI_AVAILABLE:
             return None
         lang_key = lang_key if lang_key else "en"
@@ -322,6 +329,16 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
     def _get_per_token_logps(
         self, logits: torch.Tensor, labels: torch.Tensor, loss_mask: torch.Tensor
     ) -> torch.Tensor:
+        """Compute per-token log-probabilities in fp32, masked by ``loss_mask``.
+
+        Args:
+            logits: Unnormalized logits of shape ``[B, T, V]``.
+            labels: Ground-truth token ids of shape ``[B, T]``.
+            loss_mask: Binary mask of shape ``[B, T]`` indicating valid positions.
+
+        Returns:
+            Masked per-token log-probabilities of shape ``[B, T]``.
+        """
         # Force fp32 for log_softmax to avoid bf16 precision issues that sever the
         # gradient path through the GRPO "exp(logps - logps.detach())" trick.
         # Under bf16 autocast, the tiny gradient signal through this identity-like
@@ -352,6 +369,10 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             )
 
     def repeat_items_in_batch(self, batch: Dict, num_repeats: int) -> Dict:
+        """Repeat every item in ``batch`` ``num_repeats`` times along the batch dimension.
+
+        Tensors are repeated via ``repeat_interleave``; lists are element-wise duplicated.
+        """
         repeated_batch = {}
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
@@ -366,6 +387,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         return repeated_batch
 
     def _get_audio_dir(self) -> str:
+        """Return (and create if needed) the directory used to store intermediate waveforms during PO."""
         if self.logger is not None and hasattr(self.logger, "log_dir") and self.logger.log_dir is not None:
             log_dir = self.logger.log_dir
         elif self.trainer is not None and self.trainer.log_dir is not None:
@@ -383,6 +405,17 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         prefix: str,
         sample_rate: int,
     ) -> List[str]:
+        """Write each waveform in the batch to a WAV file and return the list of file paths.
+
+        Args:
+            waveforms: Audio tensor of shape ``[B, T]``.
+            waveform_lens: Per-item lengths of shape ``[B]``.
+            prefix: Filename prefix (e.g. ``'generated'``, ``'reference_context_audio'``).
+            sample_rate: Sampling rate written into the WAV header.
+
+        Returns:
+            List of absolute file paths, one per batch item.
+        """
         audio_dir = self._get_audio_dir()
         time_id = time.time_ns()
         paths = []
@@ -462,6 +495,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         audio_codes_lens: torch.Tensor,
         mode: str,
     ):
+        """Run ``model.process_batch`` with the supplied audio codes, resolving context audio
+        codes from the batch (either pre-computed or extracted on-the-fly from raw context audio).
+        """
         if 'context_audio_codes' in batch:
             context_audio_codes = batch['context_audio_codes']
             context_audio_codes_lens = batch['context_audio_codes_lens']
@@ -485,6 +521,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         )
 
     def _format_text_table(self, headers: List[str], rows: List[List[str]]) -> str:
+        """Format ``headers`` and ``rows`` into an aligned, pipe-delimited plain-text table string."""
         col_widths = [len(h) for h in headers]
         for row in rows:
             for col_idx, value in enumerate(row):
@@ -508,6 +545,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         mean_reward: float,
         std_reward: float,
     ) -> None:
+        """Log a per-generation metrics table (CER, WER, SSIM, UTMOS, reward, advantage) for one
+        prompt group. Only runs on rank-zero.
+        """
         if not getattr(self.trainer, "is_global_zero", True):
             return
 
@@ -533,7 +573,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         table = self._format_text_table(
             headers=["item", "cer", "wer", "ssim", "utmos", "reward", "advantage"], rows=rows
         )
-        print(
+        logging.info(
             f"[generate_and_reward] group={group_idx} valid={is_group_valid} "
             f"mean_reward={mean_reward:.4f} std_reward={std_reward:.4f}\n"
             f"prompt: {prompt_text}\n{table}\n"
@@ -542,6 +582,11 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
     def _compute_pred_transcripts(
         self, predicted_audio_paths: List[str], batch_repeated: Dict, reward_asr_model: str
     ) -> List[str]:
+        """Transcribe predicted audio files using either the NeMo ASR model or Whisper.
+
+        Returns a list of processed transcript strings (one per audio file), ready for CER/WER
+        computation.
+        """
         if reward_asr_model == 'nemo':
             pred_transcripts = self._eval_asr_model.transcribe(
                 predicted_audio_paths,
@@ -578,6 +623,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
     def _compute_speaker_embeddings_parallel(
         self, predicted_audio_paths: List[str], batch: Dict, num_generations_per_item: int
     ):
+        """Extract speaker embeddings for both predicted and reference audio and align their batch
+        dimensions so that cosine similarity can be computed element-wise.
+        """
         reference_audio_paths = self._get_reference_audio_paths(batch)
         pred_speaker_embeddings = get_speaker_embeddings_from_filepaths(
             predicted_audio_paths, self._eval_speaker_verification_model, self.device
@@ -596,6 +644,10 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         return pred_speaker_embeddings, gt_speaker_embeddings
 
     def _compute_utmos_scores_batched(self, predicted_audio_paths: List[str]) -> List[float]:
+        """Compute UTMOSv2 naturalness scores for the given audio files.
+
+        Returns a list of zeros if UTMOS is disabled.
+        """
         if not self.use_utmos:
             return [0.0] * len(predicted_audio_paths)
         if len(predicted_audio_paths) == 0:
@@ -617,6 +669,15 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         mode: str = 'train',
         use_local_transformer_for_inference: bool = False,
     ):
+        """Run autoregressive inference on the batch, compute multi-signal rewards
+        (CER, speaker similarity, PESQ, UTMOSv2), and return per-item advantages.
+
+        This is the core rollout-then-reward step of the online PO pipeline.
+
+        Returns:
+            Dict containing mean/std rewards, per-item metrics, predicted codes,
+            advantages, group validities, and timing information.
+        """
         batch_repeated = self.repeat_items_in_batch(batch, num_generations_per_item)
         reward_asr_model = self.cfg.get('reward_asr_model', 'nemo')
         use_pesq = self.cfg.get('use_pesq', False)
@@ -635,7 +696,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             phoneme_input_type = 'gt' if random.random() < gt_phoneme_input_prob else 'pred'
 
         generation_start_time = time.perf_counter()
-        print("Inference started")
+        logging.info("Inference started")
         output = self.infer_batch(
             batch=batch_repeated,
             max_decoder_steps=self.max_decoder_steps,
@@ -650,7 +711,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             use_teacher_forced=False,
             use_inference_mode=False,
         )
-        print("Inference ended")
+        logging.info("Inference ended")
         audio_generation_time_sec = time.perf_counter() - generation_start_time
 
         predicted_audio = output.predicted_audio
@@ -858,6 +919,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         }
 
     def process_batch_online_po(self, batch: Dict, n_generations_per_item: int, mode: str = 'train'):
+        """End-to-end online PO forward pass: generate rollouts, score rewards, and compute PO +
+        auxiliary losses *without* performing a backward pass (useful for validation).
+        """
         generated_codes_and_metrics, batch_repeated, predicted_codes, predicted_codes_lens = (
             self._prepare_online_po_inputs(
                 batch=batch,
@@ -885,6 +949,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         }
 
     def _slice_batch_range(self, batch: Dict, start_idx: int, end_idx: int) -> Dict:
+        """Slice ``batch`` along the batch dimension from ``start_idx`` to ``end_idx``, and trim
+        temporal tensors to the local maximum length to reduce memory during chunked processing.
+        """
         sliced_batch = {}
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
@@ -919,10 +986,17 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         return sliced_batch
 
     def _iter_group_ranges(self, num_groups: int, groups_per_subbatch: int):
+        """Yield ``(start, end)`` index pairs that partition ``num_groups`` into sub-batches."""
         for group_start in range(0, num_groups, groups_per_subbatch):
             yield group_start, min(group_start + groups_per_subbatch, num_groups)
 
     def _prepare_online_po_inputs(self, batch: Dict, n_generations_per_item: int, mode: str):
+        """Generate rollouts with rewards and prepare the inputs needed for teacher-forced PO.
+
+        Runs ``generate_and_reward`` in eval / no-grad mode, converts the predicted codes back
+        to the original codec format, and returns the metrics dict alongside the repeated batch,
+        predicted codes, and their lengths.
+        """
         use_local_transformer_for_inference = False
         use_local_transformer_prob = self.cfg.get('use_local_transformer_prob', 0.0)
         if use_local_transformer_prob > 0.0 and mode == 'train':
@@ -962,6 +1036,13 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         group_validities: torch.Tensor,
         rollout_phoneme_input_type: str,
     ):
+        """Compute the GRPO (or DR-GRPO) policy-optimization loss, KL divergence against the
+        reference model, per-token entropy, and the optional auxiliary phoneme loss.
+
+        Returns:
+            Dict with keys ``loss``, ``po_loss``, ``phoneme_aux_loss``, ``kl_loss``,
+            ``entropy``, and ``used_gt_phoneme_input``.
+        """
         logits = policy_output.local_transformer_logits
         if logits is None:
             logits = policy_output.logits
@@ -1072,6 +1153,15 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         n_generations_per_item: int,
         do_backward: bool,
     ):
+        """Run teacher-forced PO forward (and optionally backward) in memory-friendly chunks.
+
+        The batch is split into sub-batches of size ``batch_size_for_chunked_tf``. Each chunk's
+        loss is weighted proportionally and, when ``do_backward`` is ``True``, gradients are
+        accumulated via ``manual_backward``.
+
+        Returns:
+            Dict of accumulated (weighted-average) loss components across all chunks.
+        """
         total_items = len(batch_repeated['raw_texts'])
         if self.batch_size_for_chunked_tf is not None:
             chunk_size = self.batch_size_for_chunked_tf
@@ -1151,6 +1241,10 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         }
 
     def training_step(self, batch, batch_idx):
+        """Execute one full online PO training iteration: rollout generation, reward computation,
+        chunked teacher-forced forward/backward, gradient clipping, optimizer step, LR scheduling,
+        and logging of all training metrics and diagnostics.
+        """
         n_generations_per_item = self.cfg.get('n_generations_per_item', 6)
         optimizer = self.optimizers()
         if isinstance(optimizer, (list, tuple)):
