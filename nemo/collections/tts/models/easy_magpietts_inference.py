@@ -1332,9 +1332,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     phoneme_emb = phoneme_emb + gt_emb * phoneme_mask
                 else:
                     first_phoneme_step = needs_phoneme & (state.phoneme_steps == 0)
-                    has_last_phoneme = (
-                        needs_phoneme & (~first_phoneme_step) & (state.last_phoneme_tokens is not None)
-                    )
+                    has_last_phoneme = needs_phoneme & (~first_phoneme_step) & (state.last_phoneme_tokens is not None)
 
                     if first_phoneme_step.any():
                         phoneme_bos = torch.full(
@@ -1365,9 +1363,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             if state.gt_audio_embeddings is not None:
                 within_gt_len = state.audio_steps < state.gt_audio_lens  # (B,)
                 positions = state.audio_steps.clamp(max=state.gt_audio_embeddings.size(1) - 1)
-                gt_emb = state.gt_audio_embeddings[
-                    torch.arange(batch_size, device=device), positions, :
-                ].unsqueeze(
+                gt_emb = state.gt_audio_embeddings[torch.arange(batch_size, device=device), positions, :].unsqueeze(
                     1
                 )  # (B, 1, E)
                 audio_mask = (needs_audio & within_gt_len).view(batch_size, 1, 1).float()
@@ -1401,8 +1397,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             next_input_unconditional_zeros = torch.zeros_like(next_input_unconditional_context)
             context_mask = needs_context.view(batch_size, 1, 1).float()
             next_input_unconditional = (
-                context_mask * next_input_unconditional_context
-                + (1 - context_mask) * next_input_unconditional_zeros
+                context_mask * next_input_unconditional_context + (1 - context_mask) * next_input_unconditional_zeros
             )
 
             if needs_audio.any():
@@ -1459,9 +1454,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             state.last_phoneme_tokens = pred_phoneme_tokens
             state.all_phoneme_predictions.append(pred_phoneme_tokens)
 
-            phoneme_eos_detected = needs_phoneme & (
-                pred_phoneme_tokens == self.phoneme_tokenizer.eos_token_id
-            ).any(
+            phoneme_eos_detected = needs_phoneme & (pred_phoneme_tokens == self.phoneme_tokenizer.eos_token_id).any(
                 dim=1
             )  # (B,)
 
@@ -1690,9 +1683,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 )
 
             # Create padded output tensor and slice each item's valid predictions
-            predicted_codes = torch.zeros(
-                batch_size, num_codebooks, max_len, dtype=all_codes.dtype, device=device
-            )
+            predicted_codes = torch.zeros(batch_size, num_codebooks, max_len, dtype=all_codes.dtype, device=device)
             for i in range(batch_size):
                 start = start_indices[i].item()
                 end = end_indices[i].item()
