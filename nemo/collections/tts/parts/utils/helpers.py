@@ -965,13 +965,7 @@ def compute_utmos_scores_from_filepaths(
         for idx, src_path in enumerate(audio_filepaths):
             tmp_name = f"{idx:06d}.wav"
             tmp_path = os.path.join(tmp_dir, tmp_name)
-            try:
-                os.symlink(src_path, tmp_path)
-            except OSError:
-                try:
-                    os.link(src_path, tmp_path)
-                except OSError:
-                    shutil.copy2(src_path, tmp_path)
+            os.symlink(src_path, tmp_path)
             file_to_idx[tmp_name] = idx
 
         batch_results = utmos_calculator.process_directory(tmp_dir, batch_size=batch_size, num_workers=num_workers)
@@ -979,18 +973,7 @@ def compute_utmos_scores_from_filepaths(
             raise RuntimeError(f"Unexpected UTMOSv2 output type: {type(batch_results)}")
 
         for item in batch_results:
-            if not isinstance(item, dict):
-                raise RuntimeError(f"Unexpected UTMOSv2 batch item type: {type(item)}")
-            if 'file_path' not in item or 'predicted_mos' not in item:
-                raise RuntimeError(
-                    "Unexpected UTMOSv2 batch item schema. Expected keys: 'file_path' and 'predicted_mos'. "
-                    f"Got keys: {list(item.keys())}"
-                )
             idx = file_to_idx.get(os.path.basename(str(item['file_path'])))
-            if idx is None:
-                raise RuntimeError(
-                    f"UTMOSv2 returned unknown file path '{item['file_path']}' that does not map to this batch."
-                )
             scores[idx] = float(item['predicted_mos'])
 
     return scores
