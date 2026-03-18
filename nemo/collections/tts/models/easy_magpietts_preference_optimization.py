@@ -30,8 +30,8 @@ from nemo.collections.asr.parts.mixins.transcription import TranscribeConfig
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.parts.utils.helpers import (
     get_mask_from_lengths,
-    print_grad_weight_summary,
     get_speaker_embeddings_from_filepaths,
+    print_grad_weight_summary,
     process_text_for_cer,
     transcribe_with_whisper_from_filepaths,
 )

@@ -848,7 +848,9 @@ def print_grad_weight_summary(metrics: Dict[str, float], step: int, is_global_ze
         f"Δw={metrics.get('weight_delta/global', 0.0):.8f}"
     ]
 
-    module_names = sorted(k.split('/')[1] for k in metrics if k.startswith('weight_norm/') and k != 'weight_norm/global')
+    module_names = sorted(
+        k.split('/')[1] for k in metrics if k.startswith('weight_norm/') and k != 'weight_norm/global'
+    )
     for name in module_names:
         gn = metrics.get(f'grad_norm/{name}', 0.0)
         wn = metrics.get(f'weight_norm/{name}', 0.0)
