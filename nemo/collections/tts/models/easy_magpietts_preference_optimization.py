@@ -30,19 +30,12 @@ from nemo.collections.asr.parts.mixins.transcription import TranscribeConfig
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.parts.utils.helpers import (
     get_mask_from_lengths,
+    print_grad_weight_summary,
     get_speaker_embeddings_from_filepaths,
     process_text_for_cer,
     transcribe_with_whisper_from_filepaths,
 )
 from nemo.utils import logging
-
-try:
-    import torchaudio
-    from torchaudio.pipelines import SQUIM_OBJECTIVE
-
-    HAVE_TORCHAUDIO = True
-except ImportError:
-    HAVE_TORCHAUDIO = False
 
 try:
     from nemo_text_processing.text_normalization.normalize import Normalizer
@@ -66,7 +59,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
 
     Training flow:
     1. Sample multiple generations per prompt.
-    2. Compute rewards (CER/SSIM/PESQ/UTMOSv2).
+    2. Compute rewards (CER/SSIM/UTMOSv2).
     3. Compute group-normalized advantages.
     4. Run teacher-forced policy forward on generated codes and optimize GRPO objective.
     5. Add auxiliary phoneme loss from the same forward pass with GT phoneme tokens.
@@ -74,7 +67,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
 
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
         """Initialize the online PO model, including the frozen reference model, reward ASR/speaker
-        verification models, optional PESQ/UTMOSv2 scorers, and all PO hyper-parameters from ``cfg``.
+        verification models, optional UTMOSv2 scorer, and all PO hyper-parameters from ``cfg``.
         """
         super().__init__(cfg, trainer)
 
@@ -123,11 +116,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         )
         self._eval_speaker_verification_model.freeze()
 
-        use_pesq = self.cfg.get('use_pesq', False)
-        if use_pesq:
-            assert HAVE_TORCHAUDIO, "torchaudio is required for PESQ reward."
-            self.squim_objective_model = SQUIM_OBJECTIVE.get_model()
-
         self.use_utmos = self.cfg.get('use_utmos', False)
         if self.use_utmos:
             assert HAVE_UTMOSV2, (
@@ -172,7 +160,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             '_reference_model',
             'whisper_model',
             'whisper_processor',
-            'squim_objective_model',
             '_utmos_calculator',
         }
         groups: Dict[str, List[torch.nn.Parameter]] = {}
@@ -242,30 +229,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             for p in params:
                 snapshot[id(p)] = p.data.clone()
         return snapshot
-
-    def _print_grad_weight_summary(self, metrics: Dict[str, float], step: int) -> None:
-        """Print a compact per-module summary of grad_norm / weight_norm / weight_delta."""
-        if not getattr(self.trainer, "is_global_zero", True):
-            return
-
-        lines = [
-            f"\n[grad/weight] step={step}  "
-            f"grad={metrics.get('grad_norm/global', 0.0):.6f}  "
-            f"w={metrics.get('weight_norm/global', 0.0):.4f}  "
-            f"Δw={metrics.get('weight_delta/global', 0.0):.8f}"
-        ]
-
-        module_names = sorted(
-            k.split('/')[1] for k in metrics if k.startswith('weight_norm/') and k != 'weight_norm/global'
-        )
-        for name in module_names:
-            gn = metrics.get(f'grad_norm/{name}', 0.0)
-            wn = metrics.get(f'weight_norm/{name}', 0.0)
-            wd = metrics.get(f'weight_delta/{name}', 0.0)
-            lines.append(f"  {name:40s}  grad={gn:.6f}  w={wn:.4f}  Δw={wd:.8f}")
-
-        summary = "\n".join(lines)
-        logging.info(summary)
 
     def setup_optimizer_param_groups(self):
         """
@@ -668,7 +631,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         use_local_transformer_for_inference: bool = False,
     ):
         """Run autoregressive inference on the batch, compute multi-signal rewards
-        (CER, speaker similarity, PESQ, UTMOSv2), and return per-item advantages.
+        (CER, speaker similarity, UTMOSv2), and return per-item advantages.
 
         This is the core rollout-then-reward step of the online PO pipeline.
 
@@ -678,7 +641,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         """
         batch_repeated = self.repeat_items_in_batch(batch, num_generations_per_item)
         reward_asr_model = self.cfg.get('reward_asr_model', 'nemo')
-        use_pesq = self.cfg.get('use_pesq', False)
 
         use_cfg = False
         cfg_scale = 1.0
@@ -743,7 +705,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         batch_metrics = []
         cer_reward_weight = self.cfg.get('cer_reward_weight', 0.5)
         ssim_reward_weight = self.cfg.get('ssim_reward_weight', 0.5)
-        pesq_reward_weight = self.cfg.get('pesq_reward_weight', 0.0)
         utmos_reward_weight = self.cfg.get('utmos_reward_weight', 0.0)
         min_valid_codes_len = self.cfg.get('min_valid_codes_len', 4)
         max_valid_codes_len = self.cfg.get(
@@ -768,16 +729,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             else:
                 spk_similarity = 0.0
 
-            if use_pesq:
-                sample_audio, sr = torchaudio.load(predicted_audio_paths[idx])
-                sample_audio = sample_audio.to(self.device)
-                if sr != 16000:
-                    sample_audio = torchaudio.functional.resample(sample_audio, sr, 16000)
-                _, pesq_hyp, _ = self.squim_objective_model(sample_audio)
-                pesq_hyp = float(pesq_hyp.item())
-            else:
-                pesq_hyp = 0.0
-
             utmos_score = utmos_scores[idx]
 
             item_metrics = {
@@ -788,7 +739,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
                 'pred_transcript': pred_transcript,
                 'gt_transcript': gt_transcript,
                 'codes_len': int(predicted_codes_lens[idx].item()),
-                'pesq': float(pesq_hyp),
                 'utmos': float(utmos_score),
             }
 
@@ -810,8 +760,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             else:
                 spk_similarity_reward = 0.5 - 0.5 * (mean_ssim_dataset - item_ssim) / max(mean_ssim_dataset, 1e-8)
 
-            pesq_reward = item_metrics['pesq'] / 4.5 if use_pesq else 0.0
-
             # UTMOSv2 reward: piecewise linear shaping centered on mean_utmos_dataset,
             # analogous to the CER and SSIM reward shaping.
             if self.use_utmos:
@@ -828,7 +776,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             reward = (
                 cer_reward * cer_reward_weight
                 + spk_similarity_reward * ssim_reward_weight
-                + pesq_reward * pesq_reward_weight
                 + utmos_reward * utmos_reward_weight
             )
             if (item_metrics['codes_len'] >= max_valid_codes_len) or (
@@ -840,7 +787,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
 
             item_metrics['cer_reward'] = float(cer_reward)
             item_metrics['spk_similarity_reward'] = float(spk_similarity_reward)
-            item_metrics['pesq_reward'] = float(pesq_reward)
             item_metrics['utmos_reward'] = float(utmos_reward)
             item_metrics['reward'] = float(reward)
             batch_metrics.append(item_metrics)
@@ -1315,7 +1261,11 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             self.log(f'train_{metric_name}', metric_value, prog_bar=False, sync_dist=True)
 
         # Compact summary to stdout / log file.
-        self._print_grad_weight_summary(grad_weight_metrics, step=self.global_step)
+        print_grad_weight_summary(
+            metrics=grad_weight_metrics,
+            step=self.global_step,
+            is_global_zero=getattr(self.trainer, "is_global_zero", True),
+        )
 
         # Timing metrics.
         timings = generated_codes_and_metrics.get('timings', {})
