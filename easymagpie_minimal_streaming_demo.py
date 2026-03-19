@@ -7,6 +7,8 @@ import sys
 import threading
 import time
 import types
+import tempfile
+import wave
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -265,6 +267,23 @@ def _to_int16_pcm(wav: np.ndarray) -> np.ndarray:
     return (wav * 32767.0).astype(np.int16)
 
 
+def _write_wav_int16(path: str, sample_rate: int, pcm: np.ndarray) -> None:
+    pcm_i16 = np.asarray(pcm, dtype=np.int16).reshape(-1)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_i16.tobytes())
+
+
+def _write_wav_bytes_int16(path: str, sample_rate: int, pcm_bytes: bytes) -> None:
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+
 def _decode_new_audio_chunk(
     model: EasyMagpieTTSInferenceModel,
     decode_codec_helper: CodecHelper,
@@ -372,6 +391,28 @@ def make_app(
         llm_word_idx = 0
         llm_done = False
 
+        run_tag = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = tempfile.mkdtemp(prefix=f"easymagpie_stream_{run_tag}_")
+        logging.info(f"Saving streamed chunks to: {run_dir}")
+        emitted_chunk_count = 0
+        cumulative_pcm_bytes = bytearray()
+
+        def _save_and_package_chunk(chunk: np.ndarray) -> Optional[Tuple[int, np.ndarray]]:
+            nonlocal emitted_chunk_count, cumulative_pcm_bytes
+            chunk_i16 = np.asarray(chunk, dtype=np.int16).reshape(-1)
+            if chunk_i16.size == 0:
+                return None
+
+            chunk_wav_path = os.path.join(run_dir, f"chunk_{emitted_chunk_count:06d}.wav")
+            _write_wav_int16(path=chunk_wav_path, sample_rate=sr, pcm=chunk_i16)
+
+            cumulative_pcm_bytes.extend(chunk_i16.tobytes())
+            cumulative_wav_path = os.path.join(run_dir, f"cumulative_{emitted_chunk_count:06d}.wav")
+            _write_wav_bytes_int16(path=cumulative_wav_path, sample_rate=sr, pcm_bytes=bytes(cumulative_pcm_bytes))
+
+            emitted_chunk_count += 1
+            return sr, chunk_i16
+
         shared = DecodeSharedState()
         worker = threading.Thread(target=decode_worker, args=(model, decode_codec_helper, shared), daemon=True)
         worker.start()
@@ -410,10 +451,13 @@ def make_app(
                     # Keep UI responsive while waiting for next LLM word.
                     emitted = False
                     with shared.lock:
-                        while shared.decoded_chunks:
+                        pending_chunks = list(shared.decoded_chunks)
+                        shared.decoded_chunks.clear()
+                    for chunk in pending_chunks:
+                        payload = _save_and_package_chunk(chunk)
+                        if payload is not None:
                             emitted = True
-                            chunk = shared.decoded_chunks.popleft()
-                            yield partial_text, (sr, chunk)
+                            yield partial_text, payload
                     if not emitted:
                         time.sleep(MAIN_LOOP_IDLE_SLEEP_SEC)
                     continue
@@ -445,18 +489,24 @@ def make_app(
                         shared.generated_audio_frames = int(shared.accumulated_audio_codes.size(-1))
 
                 with shared.lock:
-                    while shared.decoded_chunks:
-                        chunk = shared.decoded_chunks.popleft()
-                        yield partial_text, (sr, chunk)
+                    pending_chunks = list(shared.decoded_chunks)
+                    shared.decoded_chunks.clear()
+                for chunk in pending_chunks:
+                    payload = _save_and_package_chunk(chunk)
+                    if payload is not None:
+                        yield partial_text, payload
 
             with shared.lock:
                 shared.stop = True
             worker.join()
 
             with shared.lock:
-                while shared.decoded_chunks:
-                    chunk = shared.decoded_chunks.popleft()
-                    yield partial_text, (sr, chunk)
+                pending_chunks = list(shared.decoded_chunks)
+                shared.decoded_chunks.clear()
+            for chunk in pending_chunks:
+                payload = _save_and_package_chunk(chunk)
+                if payload is not None:
+                    yield partial_text, payload
 
         with state_lock:
             current_state["state"] = state
