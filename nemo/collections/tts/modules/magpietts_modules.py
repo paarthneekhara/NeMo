@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -28,6 +30,17 @@ from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.core.classes.module import NeuralModule
 from nemo.utils import logging
 from nemo.utils.enum import PrettyStrEnum
+
+
+class _LocalTransformerOutputWrapper(torch.nn.Module):
+    """Wrapper that returns only tensor output for compiler backends."""
+
+    def __init__(self, local_transformer: torch.nn.Module):
+        super().__init__()
+        self.local_transformer = local_transformer
+
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
+        return self.local_transformer(x, x_mask)['output']
 
 
 class LocalTransformerType(PrettyStrEnum):
@@ -252,7 +265,11 @@ class CharAwareSubwordEncoder(NeuralModule):
 
         # Get average embedding over the chars
         mean_emb = ((x / char_mask.unsqueeze(-1).sum(1, keepdim=True)) * char_mask.unsqueeze(-1)).sum(1)
-        subword_emb = torch.zeros((subword_mask.size(0), subword_mask.size(1), mean_emb.size(-1)), device=device)
+        subword_emb = torch.zeros(
+            (subword_mask.size(0), subword_mask.size(1), mean_emb.size(-1)),
+            device=device,
+            dtype=mean_emb.dtype,
+        )
         subword_emb[subword_mask.unsqueeze(-1).expand(-1, -1, mean_emb.size(-1))] = mean_emb.view(-1)
 
         return subword_emb
@@ -465,6 +482,59 @@ class LocalTransformerHelper:
         self.audio_eos_id = audio_eos_id
         self.mask_token_id = mask_token_id
         self.codebook_size = codebook_size
+        self.last_ar_timing_ms: Dict[str, float] = {}
+        self.lt_backend = os.getenv("EASYMAGPIE_LT_BACKEND", "torch").strip().lower()
+        self._lt_trt_unavailable = False
+        self._lt_trt_logged = False
+        self._lt_trt_module = _LocalTransformerOutputWrapper(self.local_transformer)
+        self._lt_trt_cache: Dict[tuple, torch.nn.Module] = {}
+
+    def _run_local_transformer(
+        self,
+        local_transformer_input: torch.Tensor,
+        local_transformer_mask: torch.Tensor,
+        use_kv_cache: bool = False,
+    ) -> torch.Tensor:
+        """Run local transformer using TensorRT backend when enabled."""
+        if self.lt_backend != "trt" or use_kv_cache or self._lt_trt_unavailable:
+            return self.local_transformer(local_transformer_input, local_transformer_mask)['output']
+
+        compile_key = (
+            int(local_transformer_input.size(0)),
+            int(local_transformer_input.size(1)),
+            str(local_transformer_input.dtype),
+            str(local_transformer_input.device),
+        )
+        trt_module = self._lt_trt_cache.get(compile_key)
+        if trt_module is None:
+            try:
+                import torch_tensorrt
+
+                trt_module = torch_tensorrt.compile(
+                    self._lt_trt_module,
+                    ir="dynamo",
+                    inputs=[
+                        torch_tensorrt.Input(shape=tuple(local_transformer_input.shape), dtype=local_transformer_input.dtype),
+                        torch_tensorrt.Input(shape=tuple(local_transformer_mask.shape), dtype=local_transformer_mask.dtype),
+                    ],
+                    enabled_precisions={local_transformer_input.dtype},
+                    truncate_long_and_double=True,
+                )
+                self._lt_trt_cache[compile_key] = trt_module
+                if not self._lt_trt_logged:
+                    logging.info("Using TRT backend for local transformer.")
+                    self._lt_trt_logged = True
+            except Exception as exc:  # noqa: BLE001
+                self._lt_trt_unavailable = True
+                logging.warning(f"Failed to build local transformer TRT backend; fallback to torch. Error: {exc}")
+                return self.local_transformer(local_transformer_input, local_transformer_mask)['output']
+
+        try:
+            return trt_module(local_transformer_input, local_transformer_mask)
+        except Exception as exc:  # noqa: BLE001
+            self._lt_trt_unavailable = True
+            logging.warning(f"Local transformer TRT runtime failed; fallback to torch. Error: {exc}")
+            return self.local_transformer(local_transformer_input, local_transformer_mask)['output']
 
     def create_random_mask(self, codes):
         """Creates a mask where True indicates positions that should be replaced with MASK_TOKEN."""
@@ -525,9 +595,12 @@ class LocalTransformerHelper:
         local_transformer_input = torch.stack(local_transformer_input, dim=1)
         local_transformer_input = self.local_transformer_in_projection(local_transformer_input)
         _mask = torch.ones(
-            local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device
+            local_transformer_input.size(0),
+            local_transformer_input.size(1),
+            device=local_transformer_input.device,
+            dtype=local_transformer_input.dtype,
         )
-        local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output']
+        local_transformer_output = self._run_local_transformer(local_transformer_input, _mask, use_kv_cache=False)
         if not targets_offset_by_one:
             local_transformer_output = local_transformer_output[:, :-1, :]
         else:
@@ -580,64 +653,171 @@ class LocalTransformerHelper:
         Returns:
             Sampled audio codes (B, num_codebooks, frame_stacking_factor).
         """
+        timing_enabled = os.getenv("EASYMAGPIE_STREAMING_TIMING", "1") == "1"
+        sync_cuda_for_timing = os.getenv("EASYMAGPIE_STREAMING_TIMING_SYNC_CUDA", "1") == "1"
+        timing_synchronized = timing_enabled and sync_cuda_for_timing and dec_output.device.type == "cuda"
+
+        def _sync_for_timing():
+            if timing_synchronized:
+                torch.cuda.synchronize(dec_output.device)
+
+        def _now_ms() -> float:
+            _sync_for_timing()
+            return time.perf_counter() * 1000.0
+
+        call_start_ms = _now_ms() if timing_enabled else 0.0
+        timing_ms: Dict[str, float] = {
+            "lt_call_total": 0.0,
+            "lt_reset_cache": 0.0,
+            "lt_init_proj": 0.0,
+            "lt_loop_total": 0.0,
+            "lt_loop_fwd": 0.0,
+            "lt_loop_out_proj": 0.0,
+            "lt_loop_cfg_blend": 0.0,
+            "lt_loop_sanitize": 0.0,
+            "lt_loop_forbidden_mask": 0.0,
+            "lt_loop_clear_forbidden": 0.0,
+            "lt_loop_topk": 0.0,
+            "lt_loop_sample": 0.0,
+            "lt_loop_cfg_copyback": 0.0,
+            "lt_loop_embed_next": 0.0,
+            "lt_loop_concat_next": 0.0,
+        }
+
+        reset_start_ms = _now_ms() if timing_enabled else 0.0
         self.local_transformer.reset_cache(use_cache=use_kv_cache)
+        reset_end_ms = _now_ms() if timing_enabled else 0.0
+
         dec_output = dec_output.unsqueeze(1)  # (B, 1, E)
+        init_start_ms = _now_ms() if timing_enabled else 0.0
         local_transformer_input = self.local_transformer_in_projection(dec_output)
+        # Keep LT input dtype aligned with LT parameters (LayerNorm is strict).
+        lt_param = next(self.local_transformer.parameters(), None)
+        if lt_param is not None and local_transformer_input.dtype != lt_param.dtype:
+            local_transformer_input = local_transformer_input.to(dtype=lt_param.dtype)
+        init_end_ms = _now_ms() if timing_enabled else 0.0
+
         all_preds = []
+        loop_start_ms = _now_ms() if timing_enabled else 0.0
         for codebook_num in range(self.num_audio_codebooks * self.frame_stacking_factor):
             _mask = torch.ones(
-                local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device
+                local_transformer_input.size(0),
+                local_transformer_input.size(1),
+                device=local_transformer_input.device,
+                dtype=local_transformer_input.dtype,
             )
-            local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output']
+            fwd_start_ms = _now_ms() if timing_enabled else 0.0
+            local_transformer_output = self._run_local_transformer(
+                local_transformer_input,
+                _mask,
+                use_kv_cache=use_kv_cache,
+            )
+            fwd_end_ms = _now_ms() if timing_enabled else 0.0
 
+            proj_start_ms = _now_ms() if timing_enabled else 0.0
             lt_out_for_proj = self.local_transformer_audio_out_projection(local_transformer_output[:, -1, :])
             codebook_logits = self.local_transformer_out_projections[codebook_num](lt_out_for_proj)
+            proj_end_ms = _now_ms() if timing_enabled else 0.0
 
             if use_cfg:
+                cfg_start_ms = _now_ms() if timing_enabled else 0.0
                 actual_batch_size = codebook_logits.size(0) // 2
                 conditional_logits = codebook_logits[:actual_batch_size]
                 unconditional_logits = codebook_logits[actual_batch_size:]
                 cfg_logits = cfg_scale * conditional_logits + (1.0 - cfg_scale) * unconditional_logits
                 codebook_logits[:actual_batch_size] = cfg_logits
+                cfg_end_ms = _now_ms() if timing_enabled else 0.0
+            else:
+                cfg_start_ms = 0.0
+                cfg_end_ms = 0.0
 
             if sanitize_logits:
+                sanitize_start_ms = _now_ms() if timing_enabled else 0.0
                 codebook_logits = torch.nan_to_num(codebook_logits, nan=0.0, posinf=100.0, neginf=-100.0)
                 codebook_logits = codebook_logits.clamp(min=-100.0, max=100.0)
+                sanitize_end_ms = _now_ms() if timing_enabled else 0.0
+            else:
+                sanitize_start_ms = 0.0
+                sanitize_end_ms = 0.0
 
+            forbid_start_ms = _now_ms() if timing_enabled else 0.0
             for item_idx in unfinished_items:
                 codebook_logits[item_idx, self.audio_eos_id] = float('-inf')
             for item_idx in finished_items:
                 codebook_logits[item_idx, :] = float('-inf')
                 codebook_logits[item_idx, self.audio_eos_id] = 0.0
+            forbid_end_ms = _now_ms() if timing_enabled else 0.0
 
+            clear_start_ms = _now_ms() if timing_enabled else 0.0
             codebook_logits = clear_forbidden_logits(
                 codebook_logits.unsqueeze(1), self.codebook_size, forbid_audio_eos=forbid_audio_eos
             ).squeeze(1)
+            clear_end_ms = _now_ms() if timing_enabled else 0.0
 
+            topk_start_ms = _now_ms() if timing_enabled else 0.0
             codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0]
             indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(-1)
             codebook_logits_rescored = codebook_logits.clone()
             codebook_logits_rescored[indices_to_remove] = float('-inf')
+            topk_end_ms = _now_ms() if timing_enabled else 0.0
 
+            sample_start_ms = _now_ms() if timing_enabled else 0.0
             if temperature <= 0.0:
                 codebook_preds = codebook_logits_rescored.argmax(dim=-1, keepdim=True)
             else:
                 codebook_probs = torch.softmax(codebook_logits_rescored / temperature, dim=-1)
                 codebook_preds = torch.multinomial(codebook_probs, 1)
+            sample_end_ms = _now_ms() if timing_enabled else 0.0
 
             if use_cfg:
+                cfg_copy_start_ms = _now_ms() if timing_enabled else 0.0
                 codebook_preds[actual_batch_size:] = codebook_preds[:actual_batch_size]
+                cfg_copy_end_ms = _now_ms() if timing_enabled else 0.0
+            else:
+                cfg_copy_start_ms = 0.0
+                cfg_copy_end_ms = 0.0
             all_preds.append(codebook_preds)
 
+            embed_start_ms = _now_ms() if timing_enabled else 0.0
             next_local_transformer_input = self.audio_embeddings[codebook_num](codebook_preds.squeeze(-1)).unsqueeze(1)
             next_local_transformer_input = self.audio_in_projection(next_local_transformer_input)
             next_local_transformer_input = self.local_transformer_in_projection(next_local_transformer_input)
+            if lt_param is not None and next_local_transformer_input.dtype != lt_param.dtype:
+                next_local_transformer_input = next_local_transformer_input.to(dtype=lt_param.dtype)
+            embed_end_ms = _now_ms() if timing_enabled else 0.0
+
+            concat_start_ms = _now_ms() if timing_enabled else 0.0
             local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
+            concat_end_ms = _now_ms() if timing_enabled else 0.0
+
+            if timing_enabled:
+                timing_ms["lt_loop_fwd"] += fwd_end_ms - fwd_start_ms
+                timing_ms["lt_loop_out_proj"] += proj_end_ms - proj_start_ms
+                timing_ms["lt_loop_cfg_blend"] += cfg_end_ms - cfg_start_ms
+                timing_ms["lt_loop_sanitize"] += sanitize_end_ms - sanitize_start_ms
+                timing_ms["lt_loop_forbidden_mask"] += forbid_end_ms - forbid_start_ms
+                timing_ms["lt_loop_clear_forbidden"] += clear_end_ms - clear_start_ms
+                timing_ms["lt_loop_topk"] += topk_end_ms - topk_start_ms
+                timing_ms["lt_loop_sample"] += sample_end_ms - sample_start_ms
+                timing_ms["lt_loop_cfg_copyback"] += cfg_copy_end_ms - cfg_copy_start_ms
+                timing_ms["lt_loop_embed_next"] += embed_end_ms - embed_start_ms
+                timing_ms["lt_loop_concat_next"] += concat_end_ms - concat_start_ms
+
+        loop_end_ms = _now_ms() if timing_enabled else 0.0
 
         all_preds = torch.cat(all_preds, dim=1)  # (B, num_codebooks * frame_stacking_factor)
         all_preds = all_preds.reshape(-1, self.frame_stacking_factor, self.num_audio_codebooks).permute(0, 2, 1)
         if use_cfg:
             all_preds = all_preds[:actual_batch_size]
+
+        if timing_enabled:
+            timing_ms["lt_reset_cache"] = reset_end_ms - reset_start_ms
+            timing_ms["lt_init_proj"] = init_end_ms - init_start_ms
+            timing_ms["lt_loop_total"] = loop_end_ms - loop_start_ms
+            timing_ms["lt_call_total"] = _now_ms() - call_start_ms
+            self.last_ar_timing_ms = timing_ms
+        else:
+            self.last_ar_timing_ms = {}
 
         return all_preds
 
@@ -722,8 +902,13 @@ class LocalTransformerHelper:
                 next_local_transformer_input = self.local_transformer_in_projection(next_local_transformer_input)
                 local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
 
-            _mask = torch.ones(B, codebook_seq_len + 1, device=device)
-            local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output']
+            _mask = torch.ones(
+                B,
+                codebook_seq_len + 1,
+                device=device,
+                dtype=local_transformer_input.dtype,
+            )
+            local_transformer_output = self._run_local_transformer(local_transformer_input, _mask, use_kv_cache=False)
 
             logits = []
             for codebook_num in range(codebook_seq_len):

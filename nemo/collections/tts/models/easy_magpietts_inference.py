@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import time
 from dataclasses import dataclass, fields
 from functools import partial
@@ -144,6 +145,7 @@ class StreamingState:
     gt_phoneme_lens: Optional[torch.Tensor] = None  # (B,) lengths after stacking
     gt_audio_embeddings: Optional[torch.Tensor] = None  # (B, T', E) pre-computed GT audio embeddings
     gt_audio_lens: Optional[torch.Tensor] = None  # (B,) lengths after stacking
+    last_step_timing_ms: Optional[Dict[str, float]] = None  # per-step breakdown populated by streaming_step internals
 
 
 @dataclass
@@ -452,6 +454,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
+        self._last_audio_sample_timing_ms: Dict[str, float] = {}
         if self.local_transformer_type != LocalTransformerType.NO_LT:
             local_transformer_hidden_dim = cfg.get('local_transformer_hidden_dim', 256)
             if local_transformer_hidden_dim != cfg.hidden_dim:
@@ -975,8 +978,43 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             audio_codes_next: Sampled codes with temperature/topk (B, num_codebooks)
             all_codes_next_argmax: Argmax sampled codes for EOS detection (B, num_codebooks)
         """
+        timing_enabled = os.getenv("EASYMAGPIE_STREAMING_TIMING", "1") == "1"
+        sync_cuda_for_timing = os.getenv("EASYMAGPIE_STREAMING_TIMING_SYNC_CUDA", "1") == "1"
+        timing_synchronized = timing_enabled and sync_cuda_for_timing and all_code_logits_t.device.type == "cuda"
+
+        def _sync_for_timing():
+            if timing_synchronized:
+                torch.cuda.synchronize(all_code_logits_t.device)
+
+        def _now_ms() -> float:
+            _sync_for_timing()
+            return time.perf_counter() * 1000.0
+
+        sample_start_ms = _now_ms() if timing_enabled else 0.0
+        sample_timing_ms: Dict[str, float] = {
+            "audio_sample_total": 0.0,
+            "audio_sample_lt_ar": 0.0,
+            "audio_sample_lt_flatten": 0.0,
+            "audio_sample_lt_reset_cache": 0.0,
+            "audio_sample_lt_init_proj": 0.0,
+            "audio_sample_lt_loop_total": 0.0,
+            "audio_sample_lt_loop_fwd": 0.0,
+            "audio_sample_lt_loop_out_proj": 0.0,
+            "audio_sample_lt_loop_cfg_blend": 0.0,
+            "audio_sample_lt_loop_sanitize": 0.0,
+            "audio_sample_lt_loop_forbidden_mask": 0.0,
+            "audio_sample_lt_loop_clear_forbidden": 0.0,
+            "audio_sample_lt_loop_topk": 0.0,
+            "audio_sample_lt_loop_sample": 0.0,
+            "audio_sample_lt_loop_cfg_copyback": 0.0,
+            "audio_sample_lt_loop_embed_next": 0.0,
+            "audio_sample_lt_loop_concat_next": 0.0,
+            "audio_sample_parallel": 0.0,
+            "audio_sample_argmax": 0.0,
+        }
         if use_local_transformer_for_inference:
             if self.local_transformer_type == LocalTransformerType.AR:
+                lt_start_ms = _now_ms() if timing_enabled else 0.0
                 audio_codes_next = self._lt_helper.sample_autoregressive(
                     dec_output=last_hidden[:, -1, :],
                     temperature=temperature,
@@ -986,9 +1024,44 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     use_kv_cache=False,
                     sanitize_logits=True,
                 )
+                lt_end_ms = _now_ms() if timing_enabled else 0.0
                 # Base class returns (B, C, S); flatten to (B, C*S) for downstream code
+                flatten_start_ms = _now_ms() if timing_enabled else 0.0
                 audio_codes_next = audio_codes_next.permute(0, 2, 1)
                 audio_codes_next = audio_codes_next.reshape(audio_codes_next.size(0), -1)
+                flatten_end_ms = _now_ms() if timing_enabled else 0.0
+                if timing_enabled:
+                    sample_timing_ms["audio_sample_lt_ar"] = lt_end_ms - lt_start_ms
+                    sample_timing_ms["audio_sample_lt_flatten"] = flatten_end_ms - flatten_start_ms
+                    lt_detail = getattr(self._lt_helper, "last_ar_timing_ms", {})
+                    sample_timing_ms["audio_sample_lt_reset_cache"] = float(lt_detail.get("lt_reset_cache", 0.0))
+                    sample_timing_ms["audio_sample_lt_init_proj"] = float(lt_detail.get("lt_init_proj", 0.0))
+                    sample_timing_ms["audio_sample_lt_loop_total"] = float(lt_detail.get("lt_loop_total", 0.0))
+                    sample_timing_ms["audio_sample_lt_loop_fwd"] = float(lt_detail.get("lt_loop_fwd", 0.0))
+                    sample_timing_ms["audio_sample_lt_loop_out_proj"] = float(lt_detail.get("lt_loop_out_proj", 0.0))
+                    sample_timing_ms["audio_sample_lt_loop_cfg_blend"] = float(
+                        lt_detail.get("lt_loop_cfg_blend", 0.0)
+                    )
+                    sample_timing_ms["audio_sample_lt_loop_sanitize"] = float(
+                        lt_detail.get("lt_loop_sanitize", 0.0)
+                    )
+                    sample_timing_ms["audio_sample_lt_loop_forbidden_mask"] = float(
+                        lt_detail.get("lt_loop_forbidden_mask", 0.0)
+                    )
+                    sample_timing_ms["audio_sample_lt_loop_clear_forbidden"] = float(
+                        lt_detail.get("lt_loop_clear_forbidden", 0.0)
+                    )
+                    sample_timing_ms["audio_sample_lt_loop_topk"] = float(lt_detail.get("lt_loop_topk", 0.0))
+                    sample_timing_ms["audio_sample_lt_loop_sample"] = float(lt_detail.get("lt_loop_sample", 0.0))
+                    sample_timing_ms["audio_sample_lt_loop_cfg_copyback"] = float(
+                        lt_detail.get("lt_loop_cfg_copyback", 0.0)
+                    )
+                    sample_timing_ms["audio_sample_lt_loop_embed_next"] = float(
+                        lt_detail.get("lt_loop_embed_next", 0.0)
+                    )
+                    sample_timing_ms["audio_sample_lt_loop_concat_next"] = float(
+                        lt_detail.get("lt_loop_concat_next", 0.0)
+                    )
             else:
                 raise ValueError(
                     f"Local transformer inference requested but local transformer type is {self.local_transformer_type}"
@@ -997,12 +1070,24 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             all_codes_next_argmax = audio_codes_next
         else:
             # Parallel sampling from all codebook logits
+            parallel_start_ms = _now_ms() if timing_enabled else 0.0
             audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk)
+            parallel_end_ms = _now_ms() if timing_enabled else 0.0
             # Argmax sampling for reliable EOS detection
             if temperature <= 0.0:
                 all_codes_next_argmax = audio_codes_next  # already argmax
             else:
+                argmax_start_ms = _now_ms() if timing_enabled else 0.0
                 all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01)
+                argmax_end_ms = _now_ms() if timing_enabled else 0.0
+                if timing_enabled:
+                    sample_timing_ms["audio_sample_argmax"] = argmax_end_ms - argmax_start_ms
+            if timing_enabled:
+                sample_timing_ms["audio_sample_parallel"] = parallel_end_ms - parallel_start_ms
+
+        if timing_enabled:
+            sample_timing_ms["audio_sample_total"] = _now_ms() - sample_start_ms
+        self._last_audio_sample_timing_ms = sample_timing_ms
 
         return audio_codes_next, all_codes_next_argmax
 
@@ -1233,11 +1318,25 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         grad_ctx = torch.inference_mode if use_inference_mode else torch.no_grad
         with grad_ctx():
             device = state.config.device
+            timing_enabled = os.getenv("EASYMAGPIE_STREAMING_TIMING", "1") == "1"
+            sync_cuda_for_timing = os.getenv("EASYMAGPIE_STREAMING_TIMING_SYNC_CUDA", "1") == "1"
+            timing_synchronized = timing_enabled and sync_cuda_for_timing and device.type == "cuda"
+
+            def _sync_for_timing():
+                if timing_synchronized:
+                    torch.cuda.synchronize(device)
+
+            def _now_ms() -> float:
+                _sync_for_timing()
+                return time.perf_counter() * 1000.0
+
+            step_start_ms = _now_ms() if timing_enabled else 0.0
 
             # Phase 1: Prepare input embedding and determine per-item phase masks
             next_input, needs_context, needs_phoneme, needs_audio = self._prepare_streaming_input(
                 state, text_tokens, force_dropout_text
             )
+            after_prepare_ms = _now_ms() if timing_enabled else 0.0
 
             # Phase 2: Transformer forward pass
             cache_position = torch.tensor([state.cache_seq_len], device=device)
@@ -1248,6 +1347,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 past_key_values=state.past_key_values,
                 cache_position=cache_position,
             )
+            after_forward_ms = _now_ms() if timing_enabled else 0.0
 
             state.last_hidden = transformer_out.last_hidden_state
             state.past_key_values = transformer_out.past_key_values
@@ -1257,6 +1357,75 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             audio_codes_next, pred_phoneme_tokens = self._process_predictions(
                 state, needs_context, needs_phoneme, needs_audio
             )
+            after_process_ms = _now_ms() if timing_enabled else 0.0
+
+            if timing_enabled:
+                prepare_ms = after_prepare_ms - step_start_ms
+                forward_ms = after_forward_ms - after_prepare_ms
+                process_ms = after_process_ms - after_forward_ms
+                total_ms = after_process_ms - step_start_ms
+                process_detail = state.last_step_timing_ms or {}
+
+                # Chunk duration budget based on codec frame duration and current frame stacking.
+                # Example: 25 FPS codec and stacking_factor=2 => 80 ms generated per step.
+                codec_fps = 25.0
+                if self.codec_model_samples_per_frame > 0 and self.sample_rate > 0:
+                    codec_fps = float(self.sample_rate) / float(self.codec_model_samples_per_frame)
+                chunk_ms_budget = 1000.0 * float(self.frame_stacking_factor) / codec_fps
+                decode_headroom_target_ms = chunk_ms_budget / 2.0
+
+                if total_ms <= decode_headroom_target_ms:
+                    realtime_status = "excellent"
+                elif total_ms <= chunk_ms_budget:
+                    realtime_status = "realtime_ok"
+                else:
+                    realtime_status = "slower_than_realtime"
+
+                logging.info(
+                    "streaming_step timing | total=%.2fms (prepare=%.2f, forward=%.2f, process=%.2f) | "
+                    "budget=%.2fms target=%.2fms | status=%s | needs_audio=%d needs_phoneme=%d needs_context=%d | "
+                    "audio_steps=%d cache_seq_len=%d sync_cuda=%s | "
+                    "proc_ms(counter/phoneme/audio_pred/post/eos/append/gt_finish)=%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f | "
+                    "audio_pred_ms(logits/cfg/sample_total/lt_ar/lt_flatten/parallel/argmax)=%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f | "
+                    "lt_ms(reset/init/loop/fwd/out_proj/topk/sample/embed/concat/clear_forbidden)=%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f/%.2f",
+                    total_ms,
+                    prepare_ms,
+                    forward_ms,
+                    process_ms,
+                    chunk_ms_budget,
+                    decode_headroom_target_ms,
+                    realtime_status,
+                    int(needs_audio.sum().item()),
+                    int(needs_phoneme.sum().item()),
+                    int(needs_context.sum().item()),
+                    len(state.all_predictions),
+                    int(state.cache_seq_len),
+                    str(timing_synchronized),
+                    float(process_detail.get("proc_counter", 0.0)),
+                    float(process_detail.get("proc_phoneme", 0.0)),
+                    float(process_detail.get("proc_audio_pred_call", 0.0)),
+                    float(process_detail.get("proc_audio_post", 0.0)),
+                    float(process_detail.get("proc_audio_eos", 0.0)),
+                    float(process_detail.get("proc_audio_append", 0.0)),
+                    float(process_detail.get("proc_gt_finish", 0.0)),
+                    float(process_detail.get("audio_logits_proj", 0.0)),
+                    float(process_detail.get("audio_cfg_blend", 0.0)),
+                    float(process_detail.get("audio_sample_total", 0.0)),
+                    float(process_detail.get("audio_sample_lt_ar", 0.0)),
+                    float(process_detail.get("audio_sample_lt_flatten", 0.0)),
+                    float(process_detail.get("audio_sample_parallel", 0.0)),
+                    float(process_detail.get("audio_sample_argmax", 0.0)),
+                    float(process_detail.get("audio_sample_lt_reset_cache", 0.0)),
+                    float(process_detail.get("audio_sample_lt_init_proj", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_total", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_fwd", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_out_proj", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_topk", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_sample", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_embed_next", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_concat_next", 0.0)),
+                    float(process_detail.get("audio_sample_lt_loop_clear_forbidden", 0.0)),
+                )
 
             return state, audio_codes_next, pred_phoneme_tokens
 
@@ -1281,6 +1450,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         batch_size = state.config.batch_size
         streaming_speech_delay = state.config.training_mode.streaming_speech_delay
         streaming_phonemes_delay = state.config.training_mode.streaming_phonemes_delay
+        input_dtype = self.decoder.get_input_embeddings().weight.dtype
 
         # Determine phases per batch item
         needs_context = state.context_position < state.full_context_lens  # (B,) bool
@@ -1290,7 +1460,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         )
         needs_audio = (~needs_context) & (state.text_tokens_seen >= streaming_speech_delay) & (~state.finished)
 
-        next_input = torch.zeros(batch_size, 1, self.cfg.embedding_dim, device=device)
+        next_input = torch.zeros(batch_size, 1, self.cfg.embedding_dim, device=device, dtype=input_dtype)
 
         # --- Context phase items: use next context embedding ---
         if needs_context.any():
@@ -1301,7 +1471,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             ].unsqueeze(
                 1
             )  # (B, 1, E)
-            context_mask = needs_context.view(batch_size, 1, 1).float()
+            context_mask = needs_context.view(batch_size, 1, 1).to(dtype=input_dtype)
             next_input = next_input + ctx_emb * context_mask
 
         # --- Non-context phase items: handle text embedding ---
@@ -1312,13 +1482,14 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             if self.use_bpe_char_tokenizer:
                 text_mask = torch.ones_like(text_tokens_2d, dtype=torch.bool)
                 cas_embedding = self.cas_encoder(text_tokens_2d, subword_mask=text_mask)  # (B, 1, E)
+                cas_embedding = cas_embedding.to(dtype=text_embedded.dtype)
                 text_embedded = text_embedded + cas_embedding
 
             if force_dropout_text:
                 text_embedded = text_embedded * 0
 
             is_eos_token = (text_tokens == self.eos_id) & needs_text  # (B,) bool
-            text_add_mask = needs_text.view(batch_size, 1, 1).float()
+            text_add_mask = needs_text.view(batch_size, 1, 1).to(dtype=input_dtype)
             next_input = next_input + text_embedded * text_add_mask
             state.text_finished = state.text_finished | is_eos_token
 
@@ -1328,7 +1499,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         # --- Phoneme embedding for phoneme and audio phase items ---
         if self.phoneme_tokenizer is not None:
             if needs_phoneme.any():
-                phoneme_emb = torch.zeros(batch_size, 1, self.cfg.embedding_dim, device=device)
+                phoneme_emb = torch.zeros(batch_size, 1, self.cfg.embedding_dim, device=device, dtype=input_dtype)
 
                 if state.config.phoneme_input_type == 'gt' and state.gt_phoneme_embeddings is not None:
                     within_gt_len = state.phoneme_steps < state.gt_phoneme_lens  # (B,)
@@ -1338,7 +1509,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     ].unsqueeze(
                         1
                     )  # (B, 1, E)
-                    phoneme_mask = (needs_phoneme & within_gt_len).view(batch_size, 1, 1).float()
+                    phoneme_mask = (needs_phoneme & within_gt_len).view(batch_size, 1, 1).to(dtype=input_dtype)
                     phoneme_emb = phoneme_emb + gt_emb * phoneme_mask
                 else:
                     first_phoneme_step = needs_phoneme & (state.phoneme_steps == 0)
@@ -1351,14 +1522,14 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                             device=device,
                         ).long()
                         phoneme_bos_emb = self.embed_phoneme_tokens(phoneme_bos)  # (B, 1, E)
-                        first_mask = first_phoneme_step.view(batch_size, 1, 1).float()
+                        first_mask = first_phoneme_step.view(batch_size, 1, 1).to(dtype=input_dtype)
                         phoneme_emb = phoneme_emb + phoneme_bos_emb * first_mask
 
                     if has_last_phoneme.any() and state.last_phoneme_tokens is not None:
                         last_phoneme_emb = self.embed_phoneme_tokens(
                             state.last_phoneme_tokens.unsqueeze(2)
                         )  # (B, 1, E)
-                        last_mask = has_last_phoneme.view(batch_size, 1, 1).float()
+                        last_mask = has_last_phoneme.view(batch_size, 1, 1).to(dtype=input_dtype)
                         phoneme_emb = phoneme_emb + last_phoneme_emb * last_mask
 
                     state.phoneme_stream_ended = state.phoneme_stream_ended | state.phoneme_eos_detected
@@ -1368,7 +1539,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         # --- Audio embedding for audio phase items ---
         audio_emb = None
         if needs_audio.any():
-            audio_emb = torch.zeros(batch_size, 1, self.cfg.embedding_dim, device=device)
+            audio_emb = torch.zeros(batch_size, 1, self.cfg.embedding_dim, device=device, dtype=input_dtype)
 
             if state.gt_audio_embeddings is not None:
                 within_gt_len = state.audio_steps < state.gt_audio_lens  # (B,)
@@ -1376,7 +1547,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 gt_emb = state.gt_audio_embeddings[torch.arange(batch_size, device=device), positions, :].unsqueeze(
                     1
                 )  # (B, 1, E)
-                audio_mask = (needs_audio & within_gt_len).view(batch_size, 1, 1).float()
+                audio_mask = (needs_audio & within_gt_len).view(batch_size, 1, 1).to(dtype=input_dtype)
                 audio_emb = audio_emb + gt_emb * audio_mask
             else:
                 first_audio_step = needs_audio & (state.audio_steps == 0)
@@ -1389,12 +1560,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                         device=device,
                     ).long()
                     audio_bos_emb = self.embed_audio_tokens(audio_bos)  # (B, 1, E)
-                    first_mask = first_audio_step.view(batch_size, 1, 1).float()
+                    first_mask = first_audio_step.view(batch_size, 1, 1).to(dtype=input_dtype)
                     audio_emb = audio_emb + audio_bos_emb * first_mask
 
                 if has_last_audio.any() and state.last_audio_codes is not None:
                     last_audio_emb = self.embed_audio_tokens(state.last_audio_codes.unsqueeze(2))  # (B, 1, E)
-                    last_mask = has_last_audio.view(batch_size, 1, 1).float()
+                    last_mask = has_last_audio.view(batch_size, 1, 1).to(dtype=input_dtype)
                     audio_emb = audio_emb + last_audio_emb * last_mask
 
             next_input = next_input + audio_emb
@@ -1404,14 +1575,15 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             next_input_unconditional_context = state.config.dummy_context_embedding_unconditional.expand(
                 batch_size, 1, -1
             )
+            next_input_unconditional_context = next_input_unconditional_context.to(dtype=input_dtype)
             next_input_unconditional_zeros = torch.zeros_like(next_input_unconditional_context)
-            context_mask = needs_context.view(batch_size, 1, 1).float()
+            context_mask = needs_context.view(batch_size, 1, 1).to(dtype=input_dtype)
             next_input_unconditional = (
                 context_mask * next_input_unconditional_context + (1 - context_mask) * next_input_unconditional_zeros
             )
 
             if needs_audio.any():
-                audio_mask = needs_audio.view(batch_size, 1, 1).float()
+                audio_mask = needs_audio.view(batch_size, 1, 1).to(dtype=input_dtype)
                 next_input_unconditional = next_input_unconditional * (1 - audio_mask) + audio_emb * audio_mask
 
             next_input = torch.cat([next_input, next_input_unconditional], dim=0)
@@ -1439,12 +1611,33 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         """
         batch_size = state.config.batch_size
         device = state.config.device
+        timing_enabled = os.getenv("EASYMAGPIE_STREAMING_TIMING", "1") == "1"
+        sync_cuda_for_timing = os.getenv("EASYMAGPIE_STREAMING_TIMING_SYNC_CUDA", "1") == "1"
+        timing_synchronized = timing_enabled and sync_cuda_for_timing and device.type == "cuda"
+
+        def _sync_for_timing():
+            if timing_synchronized:
+                torch.cuda.synchronize(device)
+
+        def _now_ms() -> float:
+            _sync_for_timing()
+            return time.perf_counter() * 1000.0
+
+        process_start_ms = _now_ms() if timing_enabled else 0.0
+        counter_end_ms = process_start_ms
+        phoneme_end_ms = process_start_ms
+        audio_pred_end_ms = process_start_ms
+        audio_post_end_ms = process_start_ms
+        audio_eos_end_ms = process_start_ms
+        audio_append_end_ms = process_start_ms
 
         # Update counters
         state.context_position = state.context_position + needs_context.long()
         state.text_tokens_seen = state.text_tokens_seen + (~needs_context).long()
         state.phoneme_steps = state.phoneme_steps + needs_phoneme.long()
         state.audio_steps = state.audio_steps + needs_audio.long()
+        if timing_enabled:
+            counter_end_ms = _now_ms()
 
         pred_phoneme_tokens = None
         audio_codes_next = None
@@ -1478,6 +1671,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     torch.full_like(state.phoneme_prediction_end_idx, current_phoneme_step_idx),
                     state.phoneme_prediction_end_idx,
                 )
+        if timing_enabled:
+            phoneme_end_ms = _now_ms()
 
         # --- Audio predictions ---
         if needs_audio.any():
@@ -1491,6 +1686,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 )
 
             audio_codes_next_stacked, all_codes_next_argmax = self._predict_audio_codes(state)  # (B, C*S)
+            if timing_enabled:
+                audio_pred_end_ms = _now_ms()
 
             S = self.frame_stacking_factor
             C = self.num_audio_codebooks
@@ -1501,6 +1698,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             else:
                 update_mask = needs_audio.view(batch_size, 1).expand_as(audio_codes_next_stacked)
                 state.last_audio_codes = torch.where(update_mask, audio_codes_next_stacked, state.last_audio_codes)
+            if timing_enabled:
+                audio_post_end_ms = _now_ms()
 
             # EOS detection (skip in teacher-forced mode)
             if state.gt_audio_embeddings is None:
@@ -1526,14 +1725,65 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     state.audio_prediction_end_idx = torch.where(
                         newly_ended_audio, end_frame_idx, state.audio_prediction_end_idx
                     )
+            if timing_enabled:
+                audio_eos_end_ms = _now_ms()
 
             state.all_predictions.append(audio_codes_unstacked)
             audio_codes_next = audio_codes_unstacked
+            if timing_enabled:
+                audio_append_end_ms = _now_ms()
 
         # Force-finish items when GT audio is exhausted (teacher forcing)
         if state.gt_audio_embeddings is not None and state.gt_audio_lens is not None:
             gt_exhausted = needs_audio & (state.audio_steps >= state.gt_audio_lens)
             state.finished = state.finished | gt_exhausted
+
+        if timing_enabled:
+            process_end_ms = _now_ms()
+            audio_predict_timing = getattr(state, "last_audio_predict_timing_ms", {})
+            state.last_step_timing_ms = {
+                "proc_total": process_end_ms - process_start_ms,
+                "proc_counter": counter_end_ms - process_start_ms,
+                "proc_phoneme": phoneme_end_ms - counter_end_ms,
+                "proc_audio_pred_call": audio_pred_end_ms - phoneme_end_ms if needs_audio.any() else 0.0,
+                "proc_audio_post": audio_post_end_ms - audio_pred_end_ms if needs_audio.any() else 0.0,
+                "proc_audio_eos": audio_eos_end_ms - audio_post_end_ms if needs_audio.any() else 0.0,
+                "proc_audio_append": audio_append_end_ms - audio_eos_end_ms if needs_audio.any() else 0.0,
+                "proc_gt_finish": process_end_ms - audio_append_end_ms if needs_audio.any() else process_end_ms - phoneme_end_ms,
+                "audio_logits_proj": float(audio_predict_timing.get("audio_logits_proj", 0.0)),
+                "audio_cfg_blend": float(audio_predict_timing.get("audio_cfg_blend", 0.0)),
+                "audio_sample_total": float(audio_predict_timing.get("audio_sample_total", 0.0)),
+                "audio_sample_lt_ar": float(audio_predict_timing.get("audio_sample_lt_ar", 0.0)),
+                "audio_sample_lt_flatten": float(audio_predict_timing.get("audio_sample_lt_flatten", 0.0)),
+                "audio_sample_lt_reset_cache": float(audio_predict_timing.get("audio_sample_lt_reset_cache", 0.0)),
+                "audio_sample_lt_init_proj": float(audio_predict_timing.get("audio_sample_lt_init_proj", 0.0)),
+                "audio_sample_lt_loop_total": float(audio_predict_timing.get("audio_sample_lt_loop_total", 0.0)),
+                "audio_sample_lt_loop_fwd": float(audio_predict_timing.get("audio_sample_lt_loop_fwd", 0.0)),
+                "audio_sample_lt_loop_out_proj": float(audio_predict_timing.get("audio_sample_lt_loop_out_proj", 0.0)),
+                "audio_sample_lt_loop_cfg_blend": float(audio_predict_timing.get("audio_sample_lt_loop_cfg_blend", 0.0)),
+                "audio_sample_lt_loop_sanitize": float(audio_predict_timing.get("audio_sample_lt_loop_sanitize", 0.0)),
+                "audio_sample_lt_loop_forbidden_mask": float(
+                    audio_predict_timing.get("audio_sample_lt_loop_forbidden_mask", 0.0)
+                ),
+                "audio_sample_lt_loop_clear_forbidden": float(
+                    audio_predict_timing.get("audio_sample_lt_loop_clear_forbidden", 0.0)
+                ),
+                "audio_sample_lt_loop_topk": float(audio_predict_timing.get("audio_sample_lt_loop_topk", 0.0)),
+                "audio_sample_lt_loop_sample": float(audio_predict_timing.get("audio_sample_lt_loop_sample", 0.0)),
+                "audio_sample_lt_loop_cfg_copyback": float(
+                    audio_predict_timing.get("audio_sample_lt_loop_cfg_copyback", 0.0)
+                ),
+                "audio_sample_lt_loop_embed_next": float(
+                    audio_predict_timing.get("audio_sample_lt_loop_embed_next", 0.0)
+                ),
+                "audio_sample_lt_loop_concat_next": float(
+                    audio_predict_timing.get("audio_sample_lt_loop_concat_next", 0.0)
+                ),
+                "audio_sample_parallel": float(audio_predict_timing.get("audio_sample_parallel", 0.0)),
+                "audio_sample_argmax": float(audio_predict_timing.get("audio_sample_argmax", 0.0)),
+            }
+        else:
+            state.last_step_timing_ms = None
 
         return audio_codes_next, pred_phoneme_tokens
 
@@ -1580,10 +1830,24 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         """Predict audio codes from the last hidden state."""
         actual_batch_size = state.config.batch_size
         last_hidden = state.last_hidden
+        timing_enabled = os.getenv("EASYMAGPIE_STREAMING_TIMING", "1") == "1"
+        sync_cuda_for_timing = os.getenv("EASYMAGPIE_STREAMING_TIMING_SYNC_CUDA", "1") == "1"
+        timing_synchronized = timing_enabled and sync_cuda_for_timing and last_hidden.device.type == "cuda"
+
+        def _sync_for_timing():
+            if timing_synchronized:
+                torch.cuda.synchronize(last_hidden.device)
+
+        def _now_ms() -> float:
+            _sync_for_timing()
+            return time.perf_counter() * 1000.0
+
+        predict_start_ms = _now_ms() if timing_enabled else 0.0
 
         # Compute audio logits
         last_hidden_audio = self.audio_out_projection(last_hidden[:, -1, :])
         all_code_logits_t = self.final_proj(last_hidden_audio)
+        logits_end_ms = _now_ms() if timing_enabled else 0.0
 
         # Apply CFG if enabled
         if state.config.use_cfg:
@@ -1592,6 +1856,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             all_code_logits_t = (
                 state.config.cfg_scale * conditional_logits + (1.0 - state.config.cfg_scale) * unconditional_logits
             )
+        cfg_end_ms = _now_ms() if timing_enabled else 0.0
 
         # Sample audio codes
         audio_codes_next, all_codes_next_argmax = self._sample_audio_codes(
@@ -1603,6 +1868,41 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             use_cfg=state.config.use_cfg,
             cfg_scale=state.config.cfg_scale,
         )
+        sample_end_ms = _now_ms() if timing_enabled else 0.0
+
+        if timing_enabled:
+            sample_timing = getattr(self, "_last_audio_sample_timing_ms", {})
+            state.last_audio_predict_timing_ms = {
+                "audio_logits_proj": logits_end_ms - predict_start_ms,
+                "audio_cfg_blend": cfg_end_ms - logits_end_ms,
+                "audio_sample_total": sample_end_ms - cfg_end_ms,
+                "audio_sample_lt_ar": float(sample_timing.get("audio_sample_lt_ar", 0.0)),
+                "audio_sample_lt_flatten": float(sample_timing.get("audio_sample_lt_flatten", 0.0)),
+                "audio_sample_lt_reset_cache": float(sample_timing.get("audio_sample_lt_reset_cache", 0.0)),
+                "audio_sample_lt_init_proj": float(sample_timing.get("audio_sample_lt_init_proj", 0.0)),
+                "audio_sample_lt_loop_total": float(sample_timing.get("audio_sample_lt_loop_total", 0.0)),
+                "audio_sample_lt_loop_fwd": float(sample_timing.get("audio_sample_lt_loop_fwd", 0.0)),
+                "audio_sample_lt_loop_out_proj": float(sample_timing.get("audio_sample_lt_loop_out_proj", 0.0)),
+                "audio_sample_lt_loop_cfg_blend": float(sample_timing.get("audio_sample_lt_loop_cfg_blend", 0.0)),
+                "audio_sample_lt_loop_sanitize": float(sample_timing.get("audio_sample_lt_loop_sanitize", 0.0)),
+                "audio_sample_lt_loop_forbidden_mask": float(
+                    sample_timing.get("audio_sample_lt_loop_forbidden_mask", 0.0)
+                ),
+                "audio_sample_lt_loop_clear_forbidden": float(
+                    sample_timing.get("audio_sample_lt_loop_clear_forbidden", 0.0)
+                ),
+                "audio_sample_lt_loop_topk": float(sample_timing.get("audio_sample_lt_loop_topk", 0.0)),
+                "audio_sample_lt_loop_sample": float(sample_timing.get("audio_sample_lt_loop_sample", 0.0)),
+                "audio_sample_lt_loop_cfg_copyback": float(
+                    sample_timing.get("audio_sample_lt_loop_cfg_copyback", 0.0)
+                ),
+                "audio_sample_lt_loop_embed_next": float(sample_timing.get("audio_sample_lt_loop_embed_next", 0.0)),
+                "audio_sample_lt_loop_concat_next": float(sample_timing.get("audio_sample_lt_loop_concat_next", 0.0)),
+                "audio_sample_parallel": float(sample_timing.get("audio_sample_parallel", 0.0)),
+                "audio_sample_argmax": float(sample_timing.get("audio_sample_argmax", 0.0)),
+            }
+        else:
+            state.last_audio_predict_timing_ms = {}
 
         return audio_codes_next, all_codes_next_argmax
 
