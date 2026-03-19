@@ -484,14 +484,6 @@ class LocalTransformerHelper:
         self.codebook_size = codebook_size
         self.last_ar_timing_ms: Dict[str, float] = {}
         self.lt_backend = os.getenv("EASYMAGPIE_LT_BACKEND", "torch").strip().lower()
-        self.lt_trt_engine_cache_dir = os.getenv("EASYMAGPIE_TRT_CACHE_DIR", "/datap/misc/EasyMagpieTRTCache").strip()
-        self.lt_trt_engine_cache_size = int(
-            os.getenv("EASYMAGPIE_TRT_CACHE_SIZE_BYTES", str(20 * 1024 * 1024 * 1024)).strip()
-        )
-        self.lt_trt_timing_cache_path = os.getenv(
-            "EASYMAGPIE_TRT_TIMING_CACHE_PATH",
-            os.path.join(self.lt_trt_engine_cache_dir, "timing_cache.bin"),
-        ).strip()
         self._lt_trt_logged = False
         self._lt_trt_module = _LocalTransformerOutputWrapper(self.local_transformer)
         self._lt_trt_cache: Dict[tuple, torch.nn.Module] = {}
@@ -509,6 +501,7 @@ class LocalTransformerHelper:
         compile_key = (
             int(local_transformer_input.size(0)),
             int(local_transformer_input.size(1)),
+            int(local_transformer_input.size(2)),
             str(local_transformer_input.dtype),
             str(local_transformer_input.device),
         )
@@ -516,9 +509,6 @@ class LocalTransformerHelper:
         if trt_module is None:
             import torch_tensorrt
 
-            if self.lt_trt_engine_cache_dir:
-                os.makedirs(self.lt_trt_engine_cache_dir, exist_ok=True)
-            cache_entries_before = len(os.listdir(self.lt_trt_engine_cache_dir))
             trt_module = torch_tensorrt.compile(
                 self._lt_trt_module,
                 ir="dynamo",
@@ -528,26 +518,11 @@ class LocalTransformerHelper:
                 ],
                 enabled_precisions={local_transformer_input.dtype},
                 truncate_long_and_double=True,
-                cache_built_engines=True,
-                reuse_cached_engines=True,
-                engine_cache_dir=self.lt_trt_engine_cache_dir,
-                engine_cache_size=self.lt_trt_engine_cache_size,
-                timing_cache_path=self.lt_trt_timing_cache_path,
             )
             self._lt_trt_cache[compile_key] = trt_module
             if not self._lt_trt_logged:
-                logging.info(
-                    "Using TRT backend for local transformer. "
-                    f"Engine cache dir: {self.lt_trt_engine_cache_dir}, "
-                    f"engine_cache_size_bytes: {self.lt_trt_engine_cache_size}, "
-                    f"timing_cache_path: {self.lt_trt_timing_cache_path}"
-                )
+                logging.info("Using TRT backend for local transformer.")
                 self._lt_trt_logged = True
-            cache_entries_after = len(os.listdir(self.lt_trt_engine_cache_dir))
-            logging.info(
-                f"TRT cache entries in {self.lt_trt_engine_cache_dir}: "
-                f"before={cache_entries_before}, after={cache_entries_after}"
-            )
 
         return trt_module(local_transformer_input, local_transformer_mask)
 
