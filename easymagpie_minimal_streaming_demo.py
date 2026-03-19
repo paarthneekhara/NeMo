@@ -61,13 +61,16 @@ WORDS_PER_SECOND = 100.0
 DECODE_EVERY_AUDIO_FRAMES = 20
 DECODE_POLL_INTERVAL_SEC = 0.01
 MAIN_LOOP_IDLE_SLEEP_SEC = 0.002
+WARMUP_ENABLED = True
+WARMUP_TEXT = "This is a startup warmup run for local transformer and generation path."
+WARMUP_MAX_DECODER_STEPS = 80
 
 # Keep generation and decoding on separate GPUs when available.
 GENERATION_GPU_INDEX = 0
 DECODE_GPU_INDEX = 1
 # Precision mode for generation compute: "bf16" (AMP), "fp16" (AMP), or "fp32".
 MODEL_PRECISION = "bf16"
-# Local transformer backend: "torch" or "trt" (falls back to torch if TRT unavailable).
+# Local transformer backend: "torch" or "trt".
 LOCAL_TRANSFORMER_BACKEND = "trt"
 
 DEFAULT_QUESTION = "What is the main idea behind this demo?"
@@ -257,6 +260,79 @@ def create_base_streaming_state(
 def clone_streaming_state(state):
     # For this demo, deepcopy is sufficient and keeps logic minimal.
     return deepcopy(state)
+
+
+def run_startup_warmup(
+    model: EasyMagpieTTSInferenceModel,
+    base_state,
+    generation_device: torch.device,
+    autocast_dtype: Optional[torch.dtype],
+) -> None:
+    if not WARMUP_ENABLED:
+        print("[WARMUP] Disabled (WARMUP_ENABLED=False).", flush=True)
+        return
+
+    print("[WARMUP] Starting warmup run before launching UI...", flush=True)
+    t0 = time.perf_counter()
+
+    state = clone_streaming_state(base_state)
+    main_tokenizer_name = list(model.cfg.text_tokenizers.keys())[0]
+    token_ids = model.tokenizer.encode(WARMUP_TEXT, tokenizer_name=main_tokenizer_name)
+    token_ids.append(model.eos_id)
+
+    device = next(model.parameters()).device
+    pending_token_ids: Deque[int] = deque(token_ids)
+    emitted_audio_frames = 0
+    steps = 0
+
+    print(
+        f"[WARMUP] text_tokens={len(token_ids)}, max_steps={WARMUP_MAX_DECODER_STEPS}, "
+        f"amp_dtype={autocast_dtype}, generation_device={generation_device}",
+        flush=True,
+    )
+    with torch.inference_mode():
+        while not bool(state.finished.all()) and steps < WARMUP_MAX_DECODER_STEPS:
+            if pending_token_ids:
+                tok = pending_token_ids.popleft()
+                text_tokens = torch.tensor([tok], dtype=torch.long, device=device)
+            else:
+                text_tokens = None
+
+            step_t0 = time.perf_counter()
+            if autocast_dtype is None:
+                state, audio_codes, _phoneme_tokens = model.streaming_step(
+                    state=state,
+                    text_tokens=text_tokens,
+                    use_inference_mode=True,
+                )
+            else:
+                with autocast_context(generation_device, autocast_dtype):
+                    state, audio_codes, _phoneme_tokens = model.streaming_step(
+                        state=state,
+                        text_tokens=text_tokens,
+                        use_inference_mode=True,
+                    )
+            step_ms = (time.perf_counter() - step_t0) * 1000.0
+            steps += 1
+
+            if audio_codes is not None:
+                emitted_audio_frames += int(audio_codes.size(-1))
+
+            if steps == 1 or steps % 10 == 0 or len(pending_token_ids) == 0:
+                print(
+                    f"[WARMUP] step={steps:03d} step_ms={step_ms:7.2f} "
+                    f"pending_text_tokens={len(pending_token_ids):03d} "
+                    f"emitted_audio_frames={emitted_audio_frames:04d} "
+                    f"finished={bool(state.finished.all())}",
+                    flush=True,
+                )
+
+    elapsed = time.perf_counter() - t0
+    print(
+        f"[WARMUP] Completed in {elapsed:.2f}s (steps={steps}, "
+        f"emitted_audio_frames={emitted_audio_frames}, finished={bool(state.finished.all())}).",
+        flush=True,
+    )
 
 
 def _to_int16_pcm(wav: np.ndarray) -> np.ndarray:
@@ -544,6 +620,12 @@ def main():
     base_state = create_base_streaming_state(
         model=model,
         context_text=context_text,
+        generation_device=generation_device,
+        autocast_dtype=autocast_dtype,
+    )
+    run_startup_warmup(
+        model=model,
+        base_state=base_state,
         generation_device=generation_device,
         autocast_dtype=autocast_dtype,
     )

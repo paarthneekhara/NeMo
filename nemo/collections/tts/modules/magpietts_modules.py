@@ -484,7 +484,14 @@ class LocalTransformerHelper:
         self.codebook_size = codebook_size
         self.last_ar_timing_ms: Dict[str, float] = {}
         self.lt_backend = os.getenv("EASYMAGPIE_LT_BACKEND", "torch").strip().lower()
-        self._lt_trt_unavailable = False
+        self.lt_trt_engine_cache_dir = os.getenv("EASYMAGPIE_TRT_CACHE_DIR", "/datap/misc/EasyMagpieTRTCache").strip()
+        self.lt_trt_engine_cache_size = int(
+            os.getenv("EASYMAGPIE_TRT_CACHE_SIZE_BYTES", str(20 * 1024 * 1024 * 1024)).strip()
+        )
+        self.lt_trt_timing_cache_path = os.getenv(
+            "EASYMAGPIE_TRT_TIMING_CACHE_PATH",
+            os.path.join(self.lt_trt_engine_cache_dir, "timing_cache.bin"),
+        ).strip()
         self._lt_trt_logged = False
         self._lt_trt_module = _LocalTransformerOutputWrapper(self.local_transformer)
         self._lt_trt_cache: Dict[tuple, torch.nn.Module] = {}
@@ -495,8 +502,8 @@ class LocalTransformerHelper:
         local_transformer_mask: torch.Tensor,
         use_kv_cache: bool = False,
     ) -> torch.Tensor:
-        """Run local transformer using TensorRT backend when enabled."""
-        if self.lt_backend != "trt" or use_kv_cache or self._lt_trt_unavailable:
+        """Run local transformer using selected backend."""
+        if self.lt_backend != "trt" or use_kv_cache:
             return self.local_transformer(local_transformer_input, local_transformer_mask)['output']
 
         compile_key = (
@@ -507,34 +514,42 @@ class LocalTransformerHelper:
         )
         trt_module = self._lt_trt_cache.get(compile_key)
         if trt_module is None:
-            try:
-                import torch_tensorrt
+            import torch_tensorrt
 
-                trt_module = torch_tensorrt.compile(
-                    self._lt_trt_module,
-                    ir="dynamo",
-                    inputs=[
-                        torch_tensorrt.Input(shape=tuple(local_transformer_input.shape), dtype=local_transformer_input.dtype),
-                        torch_tensorrt.Input(shape=tuple(local_transformer_mask.shape), dtype=local_transformer_mask.dtype),
-                    ],
-                    enabled_precisions={local_transformer_input.dtype},
-                    truncate_long_and_double=True,
+            if self.lt_trt_engine_cache_dir:
+                os.makedirs(self.lt_trt_engine_cache_dir, exist_ok=True)
+            cache_entries_before = len(os.listdir(self.lt_trt_engine_cache_dir))
+            trt_module = torch_tensorrt.compile(
+                self._lt_trt_module,
+                ir="dynamo",
+                inputs=[
+                    torch_tensorrt.Input(shape=tuple(local_transformer_input.shape), dtype=local_transformer_input.dtype),
+                    torch_tensorrt.Input(shape=tuple(local_transformer_mask.shape), dtype=local_transformer_mask.dtype),
+                ],
+                enabled_precisions={local_transformer_input.dtype},
+                truncate_long_and_double=True,
+                cache_built_engines=True,
+                reuse_cached_engines=True,
+                engine_cache_dir=self.lt_trt_engine_cache_dir,
+                engine_cache_size=self.lt_trt_engine_cache_size,
+                timing_cache_path=self.lt_trt_timing_cache_path,
+            )
+            self._lt_trt_cache[compile_key] = trt_module
+            if not self._lt_trt_logged:
+                logging.info(
+                    "Using TRT backend for local transformer. "
+                    f"Engine cache dir: {self.lt_trt_engine_cache_dir}, "
+                    f"engine_cache_size_bytes: {self.lt_trt_engine_cache_size}, "
+                    f"timing_cache_path: {self.lt_trt_timing_cache_path}"
                 )
-                self._lt_trt_cache[compile_key] = trt_module
-                if not self._lt_trt_logged:
-                    logging.info("Using TRT backend for local transformer.")
-                    self._lt_trt_logged = True
-            except Exception as exc:  # noqa: BLE001
-                self._lt_trt_unavailable = True
-                logging.warning(f"Failed to build local transformer TRT backend; fallback to torch. Error: {exc}")
-                return self.local_transformer(local_transformer_input, local_transformer_mask)['output']
+                self._lt_trt_logged = True
+            cache_entries_after = len(os.listdir(self.lt_trt_engine_cache_dir))
+            logging.info(
+                f"TRT cache entries in {self.lt_trt_engine_cache_dir}: "
+                f"before={cache_entries_before}, after={cache_entries_after}"
+            )
 
-        try:
-            return trt_module(local_transformer_input, local_transformer_mask)
-        except Exception as exc:  # noqa: BLE001
-            self._lt_trt_unavailable = True
-            logging.warning(f"Local transformer TRT runtime failed; fallback to torch. Error: {exc}")
-            return self.local_transformer(local_transformer_input, local_transformer_mask)['output']
+        return trt_module(local_transformer_input, local_transformer_mask)
 
     def create_random_mask(self, codes):
         """Creates a mask where True indicates positions that should be replaced with MASK_TOKEN."""
