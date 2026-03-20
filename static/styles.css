@@ -1,0 +1,94 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: sans-serif;
+  background: #0f1115;
+  color: #e8ecf2;
+}
+
+main {
+  max-width: 900px;
+  margin: 30px auto;
+  padding: 20px;
+}
+
+h1 {
+  margin-top: 0;
+  font-size: 1.4rem;
+}
+
+.hint {
+  opacity: 0.85;
+}
+
+label {
+  display: block;
+  margin: 12px 0 6px;
+  font-weight: 600;
+}
+
+textarea,
+pre {
+  width: 100%;
+  border: 1px solid #2d3440;
+  border-radius: 8px;
+  background: #171b22;
+  color: #e8ecf2;
+  padding: 10px;
+}
+
+input[type="number"],
+select,
+input[type="file"] {
+  width: 100%;
+  border: 1px solid #2d3440;
+  border-radius: 8px;
+  background: #171b22;
+  color: #e8ecf2;
+  padding: 8px 10px;
+}
+
+#streamViz {
+  width: 100%;
+  border: 1px solid #2d3440;
+  border-radius: 8px;
+  background: #121720;
+  display: block;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.controls {
+  margin-top: 12px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.inlineRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+button {
+  border: 1px solid #3c4658;
+  border-radius: 8px;
+  background: #243042;
+  color: #e8ecf2;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

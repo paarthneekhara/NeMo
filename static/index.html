@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EasyMagpie WS Demo</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main>
+      <h1>EasyMagpie WebSocket Streaming Demo</h1>
+      <p class="hint">Frontend simulates dummy LLM text chunks and streams to backend.</p>
+
+      <h3>Inference knobs</h3>
+      <div class="grid2">
+        <label for="cfgScale">CFG scale
+          <input id="cfgScale" type="number" step="0.1" min="0" value="2.5" />
+        </label>
+        <label for="temperature">Temperature
+          <input id="temperature" type="number" step="0.05" min="0.01" value="0.5" />
+        </label>
+        <label for="topk">Top-K
+          <input id="topk" type="number" step="1" min="1" value="80" />
+        </label>
+        <label class="inlineRow">
+          <input id="useCfg" type="checkbox" checked />
+          Use CFG
+        </label>
+      </div>
+
+      <h3>Context setup (apply with reset)</h3>
+      <div class="grid2">
+        <label for="contextSelect">Context text
+          <select id="contextSelect"></select>
+        </label>
+        <label class="inlineRow">
+          <input id="useContextAudio" type="checkbox" />
+          Use uploaded reference speaker audio
+        </label>
+      </div>
+      <label for="contextAudioFile">Upload reference speaker audio</label>
+      <div class="controls">
+        <input id="contextAudioFile" type="file" accept=".wav,.mp3,.flac,.ogg,.m4a,.aac,audio/*" />
+        <button id="uploadAudioBtn" disabled>Upload Audio</button>
+      </div>
+      <pre id="contextStatus">No uploaded reference audio.</pre>
+
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" rows="4">Sure. This is a streaming speech synthesis demo where text arrives gradually, tokens are consumed incrementally, and generated codec frames are decoded in the background for low-latency playback.</textarea>
+
+      <label for="tokensPerSecond">Dummy text LLM tokens-per-second</label>
+      <input id="tokensPerSecond" type="number" min="1" step="1" value="25" />
+
+      <div class="controls">
+        <button id="connectBtn">Connect</button>
+        <button id="runBtn" disabled>Run Stream</button>
+        <button id="resetBtn" disabled>Reset Backend State</button>
+        <button id="replayBtn" disabled>Replay Last Audio</button>
+      </div>
+
+      <label for="streamViz">Audio stream monitor</label>
+      <canvas id="streamViz" width="860" height="90"></canvas>
+      <pre id="audioStats">chunks_rx=0 chunks_played=0 queued_sec=0.00</pre>
+
+      <label for="partialText">Partial text (echo from backend)</label>
+      <textarea id="partialText" rows="6" readonly></textarea>
+
+      <label for="status">Status</label>
+      <pre id="status">Disconnected</pre>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+  </html>

@@ -2,12 +2,12 @@
 
 import csv
 import contextlib
+import io
 import os
 import sys
 import threading
 import time
 import types
-import tempfile
 import wave
 from collections import deque
 from copy import deepcopy
@@ -47,11 +47,14 @@ DEFAULT_CONTEXT_TEXT_INDEX = 0
 CONTEXT_AUDIO_PATH: Optional[str] = None
 CONTEXT_AUDIO_DURATION_SEC = 5.0
 LANGUAGE = "en"
+# Directory where streamed chunk wav files are saved.
+# If relative, it is resolved from the current working directory.
+STREAM_SAVE_DIR = "/datap/misc/EasyMagpieAssets/easymagpie_stream_outputs"
 
 USE_CFG = True
 CFG_SCALE = 2.5
 USE_LOCAL_TRANSFORMER = True
-TEMPERATURE = 0.7
+TEMPERATURE = 0.5
 TOPK = 80
 MAX_DECODER_STEPS = 330
 PHONEME_INPUT_TYPE = "pred"
@@ -61,6 +64,7 @@ WORDS_PER_SECOND = 100.0
 DECODE_EVERY_AUDIO_FRAMES = 20
 DECODE_POLL_INTERVAL_SEC = 0.01
 MAIN_LOOP_IDLE_SLEEP_SEC = 0.002
+STREAM_MIN_CHUNK_SEC = 0.12
 WARMUP_ENABLED = True
 WARMUP_TEXT = "This is a startup warmup run for local transformer and generation path."
 WARMUP_MAX_DECODER_STEPS = 80
@@ -71,7 +75,7 @@ DECODE_GPU_INDEX = 1
 # Precision mode for generation compute: "bf16" (AMP), "fp16" (AMP), or "fp32".
 MODEL_PRECISION = "bf16"
 # Local transformer backend: "torch" or "trt".
-LOCAL_TRANSFORMER_BACKEND = "trt"
+LOCAL_TRANSFORMER_BACKEND = "torch"
 
 DEFAULT_QUESTION = "What is the main idea behind this demo?"
 DUMMY_RESPONSE_TEMPLATE = (
@@ -360,6 +364,17 @@ def _write_wav_bytes_int16(path: str, sample_rate: int, pcm_bytes: bytes) -> Non
         wf.writeframes(pcm_bytes)
 
 
+def _wav_bytes_from_int16(sample_rate: int, pcm: np.ndarray) -> bytes:
+    pcm_i16 = np.asarray(pcm, dtype=np.int16).reshape(-1)
+    with io.BytesIO() as bio:
+        with wave.open(bio, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_i16.tobytes())
+        return bio.getvalue()
+
+
 def _decode_new_audio_chunk(
     model: EasyMagpieTTSInferenceModel,
     decode_codec_helper: CodecHelper,
@@ -468,26 +483,40 @@ def make_app(
         llm_done = False
 
         run_tag = time.strftime("%Y%m%d_%H%M%S")
-        run_dir = tempfile.mkdtemp(prefix=f"easymagpie_stream_{run_tag}_")
+        run_dir = os.path.join(os.path.abspath(STREAM_SAVE_DIR), f"easymagpie_stream_{run_tag}")
+        os.makedirs(run_dir, exist_ok=True)
         logging.info(f"Saving streamed chunks to: {run_dir}")
         emitted_chunk_count = 0
         cumulative_pcm_bytes = bytearray()
+        pending_emit_i16 = np.zeros((0,), dtype=np.int16)
+        min_emit_samples = max(1, int(sr * STREAM_MIN_CHUNK_SEC))
 
-        def _save_and_package_chunk(chunk: np.ndarray) -> Optional[Tuple[int, np.ndarray]]:
-            nonlocal emitted_chunk_count, cumulative_pcm_bytes
+        def _save_and_package_chunk(chunk: np.ndarray, force_emit: bool = False) -> Optional[bytes]:
+            nonlocal emitted_chunk_count, cumulative_pcm_bytes, pending_emit_i16
             chunk_i16 = np.asarray(chunk, dtype=np.int16).reshape(-1)
             if chunk_i16.size == 0:
+                if not force_emit:
+                    return None
+            if pending_emit_i16.size == 0:
+                pending_emit_i16 = chunk_i16
+            elif chunk_i16.size > 0:
+                pending_emit_i16 = np.concatenate([pending_emit_i16, chunk_i16])
+
+            if pending_emit_i16.size < min_emit_samples and not force_emit:
                 return None
 
-            chunk_wav_path = os.path.join(run_dir, f"chunk_{emitted_chunk_count:06d}.wav")
-            _write_wav_int16(path=chunk_wav_path, sample_rate=sr, pcm=chunk_i16)
+            emit_i16 = pending_emit_i16
+            pending_emit_i16 = np.zeros((0,), dtype=np.int16)
 
-            cumulative_pcm_bytes.extend(chunk_i16.tobytes())
+            chunk_wav_path = os.path.join(run_dir, f"chunk_{emitted_chunk_count:06d}.wav")
+            _write_wav_int16(path=chunk_wav_path, sample_rate=sr, pcm=emit_i16)
+
+            cumulative_pcm_bytes.extend(emit_i16.tobytes())
             cumulative_wav_path = os.path.join(run_dir, f"cumulative_{emitted_chunk_count:06d}.wav")
             _write_wav_bytes_int16(path=cumulative_wav_path, sample_rate=sr, pcm_bytes=bytes(cumulative_pcm_bytes))
 
             emitted_chunk_count += 1
-            return sr, chunk_i16
+            return _wav_bytes_from_int16(sample_rate=sr, pcm=emit_i16)
 
         shared = DecodeSharedState()
         worker = threading.Thread(target=decode_worker, args=(model, decode_codec_helper, shared), daemon=True)
@@ -584,6 +613,10 @@ def make_app(
                 if payload is not None:
                     yield partial_text, payload
 
+            payload = _save_and_package_chunk(np.zeros((0,), dtype=np.int16), force_emit=True)
+            if payload is not None:
+                yield partial_text, payload
+
         with state_lock:
             current_state["state"] = state
 
@@ -595,7 +628,7 @@ def make_app(
             reset_btn = gr.Button("Reset to Base State")
         status = gr.Textbox(label="Status", value="Ready", interactive=False)
         partial = gr.Textbox(label="Streaming LLM Text", lines=4)
-        audio = gr.Audio(label="Streaming Audio", streaming=True, autoplay=True)
+        audio = gr.Audio(label="Streaming Audio", streaming=True, autoplay=True, format="wav")
 
         run_btn.click(fn=run_demo, inputs=[question], outputs=[partial, audio])
         reset_btn.click(fn=reset_to_base, inputs=None, outputs=[status])
