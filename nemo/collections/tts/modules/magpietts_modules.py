@@ -258,11 +258,6 @@ class CharAwareSubwordEncoder(NeuralModule):
         return subword_emb
 
 
-# ---------------------------------------------------------------------------
-# Audio code utility functions
-# ---------------------------------------------------------------------------
-
-
 def worker_init_fn(worker_id):
     """Per-worker init for DataLoader workers.
 
@@ -411,11 +406,6 @@ class CodecHelper:
                 codes = self.codec_converter.convert_new_to_original(audio_tokens=codes, audio_lens=codes_len)
             audio, audio_len = self.codec_model.decode(tokens=codes, tokens_len=codes_len)
             return audio, audio_len, codes
-
-
-# ---------------------------------------------------------------------------
-# LocalTransformerHelper
-# ---------------------------------------------------------------------------
 
 
 class LocalTransformerHelper:

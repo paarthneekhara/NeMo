@@ -15,9 +15,7 @@ import copy
 import json
 import os
 import random
-from typing import Optional
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch

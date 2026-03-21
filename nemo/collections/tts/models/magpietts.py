@@ -48,7 +48,6 @@ from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerHelper,
     LocalTransformerType,
     SpecialAudioToken,
-    add_eos_token,
     add_special_tokens,
     clear_forbidden_logits,
     pad_audio_codes,
@@ -779,12 +778,24 @@ class MagpieTTSModel(ModelPT):
         self.inference_parameters = ModelInferenceParameters.from_dict(cfg.get("inference_parameters", {}))
 
     def _get_state_dict_keys_to_exclude(self):
+        """
+        We remove _speaker_verification_model and _codec_model
+        from the checkpoint and optimizer param groups. The codec model is saved in a separate checkpoint.
+        _speaker_verification_model is only included in older checkpoints with the older single_encoder_sv_tts
+        model_type that is no longer supported and can likely be removed in a future version.
+        If the model has a baked context embedding, the context_encoder weights are also excluded
+        since they are no longer needed for inference.
+        """
         keys = ['_speaker_verification_model', '_codec_model']
         if self.has_baked_context_embedding:
             keys.append('context_encoder')
         return keys
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
+        """
+        Only used for saving checkpoints.
+        We exclude the keys in the state_dict that are in the list returned by _get_state_dict_keys_to_exclude.
+        """
         if hasattr(self, '_no_state_dict') and self._no_state_dict:
             return {}
         state_dict = super().state_dict(destination, prefix, keep_vars)
@@ -795,7 +806,9 @@ class MagpieTTSModel(ModelPT):
         return state_dict
 
     def setup_optimizer_param_groups(self):
-        """Exclude frozen eval/inference-only models from the optimizer."""
+        """Exclude frozen eval/inference-only models from the optimizer.
+        Saves memory by excluding the keys in the state_dict that are in the list returned by _get_state_dict_keys_to_exclude.
+        """
         modules_to_exclude = set(self._get_state_dict_keys_to_exclude())
 
         excluded_param_ids = set()
@@ -4196,11 +4209,10 @@ class MagpieTTSModel(ModelPT):
             current_starting_point = batch_text_lens[_idx] - current_chunk_len[_idx]
             prior_weights = self.chunked_inference_config.prior_weights_init
             _attn_prior[_idx, :, :current_starting_point] = prior_epsilon * prior_epsilon
-            _attn_prior[_idx, :, current_starting_point] = prior_weights[0]
-            _attn_prior[_idx, :, current_starting_point + 1] = prior_weights[1]
-            _attn_prior[_idx, :, current_starting_point + 2] = prior_weights[2]
-            _attn_prior[_idx, :, current_starting_point + 3] = prior_weights[3]
-            _attn_prior[_idx, :, current_starting_point + 4] = prior_weights[4]
+            for offset, weight in enumerate(prior_weights[:5]):
+                idx = current_starting_point + offset
+                if idx < max_text_len:
+                    _attn_prior[_idx, :, idx] = weight
 
         return _attn_prior
 

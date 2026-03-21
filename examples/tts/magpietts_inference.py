@@ -58,12 +58,14 @@ import argparse
 import copy
 import json
 import os
+import random
 import shutil
 from dataclasses import fields
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters
@@ -425,6 +427,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help='Model type: "magpie" for encoder-decoder MagpieTTSModel, '
         '"easy_magpie" for decoder-only EasyMagpieTTSInferenceModel',
     )
+    parser.add_argument(
+        '--deterministic',
+        action='store_true',
+        help='Attempts to make results deterministic to the best that can be done. Used for testing',
+    )
 
     # Model loading
     model_group = parser.add_argument_group('Model Loading')
@@ -517,6 +524,17 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     target_group = parser.add_argument_group('Quality Targets')
     target_group.add_argument('--cer_target', type=float, default=None)
     target_group.add_argument('--ssim_target', type=float, default=None)
+
+
+def seed_all(seed: int):
+    """
+    Attempts to make script deterministic
+    """
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
 
 
 def _add_magpie_args(parser: argparse.ArgumentParser) -> None:
@@ -619,6 +637,8 @@ def main(argv=None):
     """Entry point for TTS inference and evaluation."""
     parser = create_argument_parser()
     args = parser.parse_args(argv)
+    if args.deterministic:
+        seed_all(seed=9)
 
     dataset_meta_info = load_evalset_config(args.datasets_json_path)
     datasets = filter_datasets(dataset_meta_info, args.datasets)

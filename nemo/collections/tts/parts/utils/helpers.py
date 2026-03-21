@@ -42,12 +42,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import os
-import shutil
 import string
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import librosa
 import matplotlib.pylab as plt
@@ -810,55 +808,18 @@ def g2p_backward_compatible_support(g2p_target: str) -> str:
 
 
 def process_text_for_cer(input_text):
-    """
-    Normalizes text for CER/WER calculation.
-    """
-    # Convert text to lowercase
-    lower_case_text = input_text.lower()
-
-    # Remove commas from text
-    no_comma_text = lower_case_text.replace(",", "")
-    # Replace "-" with spaces
-    no_dash_text = no_comma_text.replace("-", " ")
-    no_dash_text = no_dash_text.replace("'", "")
-    no_dash_text = no_dash_text.replace(";", "")
-    no_dash_text = no_dash_text.replace(".", "")
-
-    # Replace double spaces with single space
-    single_space_text = " ".join(no_dash_text.split())
-
-    single_space_text = single_space_text.translate(str.maketrans('', '', string.punctuation))
-
-    # Handle some common errors in ASR transcripts
-    single_space_text = single_space_text.replace("h t t p", "http")
-    single_space_text = single_space_text.replace("w w w", "www")
-
-    return single_space_text
-
-
-def print_grad_weight_summary(metrics: Dict[str, float], step: int, is_global_zero: bool = True) -> None:
-    """Print a compact per-module summary of grad_norm / weight_norm / weight_delta."""
-    if not is_global_zero:
-        return
-
-    lines = [
-        f"\n[grad/weight] step={step}  "
-        f"grad={metrics.get('grad_norm/global', 0.0):.6f}  "
-        f"w={metrics.get('weight_norm/global', 0.0):.4f}  "
-        f"Δw={metrics.get('weight_delta/global', 0.0):.8f}"
-    ]
-
-    module_names = sorted(
-        k.split('/')[1] for k in metrics if k.startswith('weight_norm/') and k != 'weight_norm/global'
-    )
-    for name in module_names:
-        gn = metrics.get(f'grad_norm/{name}', 0.0)
-        wn = metrics.get(f'weight_norm/{name}', 0.0)
-        wd = metrics.get(f'weight_delta/{name}', 0.0)
-        lines.append(f"  {name:40s}  grad={gn:.6f}  w={wn:.4f}  Δw={wd:.8f}")
-
-    summary = "\n".join(lines)
-    logging.info(summary)
+    """Normalizes text for CER/WER calculation."""
+    text = input_text.lower()
+    for char in [",", "'", ";", "."]:
+        text = text.replace(char, "")
+    text = text.replace("-", " ")
+    text = " ".join(text.split())
+    # Strip any remaining punctuation characters
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    # Fix common ASR transcript artifacts
+    text = text.replace("h t t p", "http")
+    text = text.replace("w w w", "www")
+    return text
 
 
 def transcribe_with_whisper(
@@ -927,7 +888,8 @@ def transcribe_with_whisper_from_filepaths(
             speech_arrays = [librosa.load(audio_filepaths[idx], sr=16000)[0] for idx in batch_indices]
             inputs = whisper_processor(
                 speech_arrays, sampling_rate=16000, return_tensors="pt", padding=True
-            ).input_features.to(device)
+            ).input_features
+            inputs = inputs.to(device=device, dtype=whisper_model.dtype)
             with torch.no_grad():
                 predicted_ids = whisper_model.generate(inputs, forced_decoder_ids=forced_decoder_ids)
             batch_transcripts = whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)
