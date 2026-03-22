@@ -379,7 +379,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             List of absolute file paths, one per batch item.
         """
         audio_dir = self._get_audio_dir()
-        time_id = time.time_ns()
         paths = []
         for idx in range(waveforms.size(0)):
             wav = waveforms[idx].float().detach().cpu().numpy()
