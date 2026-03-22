@@ -23,6 +23,7 @@ from typing import List, Optional, Union
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerBase
 
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.common.tokenizers.text_to_speech.ipa_lexicon import (
     get_grapheme_character_set,
     get_ipa_punctuation_list,
@@ -1174,7 +1175,7 @@ class JapanesePhonemeTokenizer(BaseTokenizer):
         return [self._token2id[p] for p in ps]
 
 
-class IPABPETokenizer:
+class IPABPETokenizer(TokenizerSpec):
     """Simple IPA BPE tokenizer wrapper around HuggingFace tokenizers.
 
     Args:
@@ -1200,7 +1201,8 @@ class IPABPETokenizer:
         self.tokens["<sp_bos>"] = self.bos_token_id
         self.tokens["<sp_eos>"] = self.eos_token_id
         self.tokens["<sp_unk>"] = self.unk_token_id
-        self.pad = self.tokens.get("<pad>", None)
+        self._inv_vocab = {idx: token for token, idx in self.tokens.items()}
+        self.pad_token_id = self.tokens.get("<pad>", None)
 
     def encode(self, text: str) -> List[int]:
         """Encode IPA text to token IDs."""
@@ -1210,9 +1212,45 @@ class IPABPETokenizer:
         """Decode token IDs back to IPA text."""
         return self._tokenizer.decode(tokens)
 
+    def text_to_tokens(self, text: str) -> List[str]:
+        """Convert text into token pieces."""
+        return self._tokenizer.encode(text).tokens
+
+    def tokens_to_text(self, tokens: List[str]) -> str:
+        """Convert token pieces back into text."""
+        return self.ids_to_text(self.tokens_to_ids(tokens))
+
+    def tokens_to_ids(self, tokens: List[str]) -> List[int]:
+        """Convert token pieces into IDs."""
+        return [self.tokens.get(token, self.unk_token_id) for token in tokens]
+
+    def ids_to_tokens(self, ids: List[int]) -> List[str]:
+        """Convert IDs into token pieces."""
+        return [self._inv_vocab.get(idx, "<sp_unk>") for idx in ids]
+
+    def text_to_ids(self, text: str) -> List[int]:
+        """Convert text directly into IDs."""
+        return self.encode(text)
+
+    def ids_to_text(self, ids: List[int]) -> str:
+        """Convert IDs back into text."""
+        return self.decode(ids)
+    
+    @property
+    def bos(self):
+        return self.bos_token_id
+
+    @property
+    def eos(self):
+        return self.eos_token_id
+    
+    @property
+    def pad(self):
+        return self.pad_token_id
+
 
 # TODO @xueyang: subclassing from `nemo/collections/common/tokenizers/tokenizer_spec.py::TokenizerSpec`, and/or
-#  adjust to reuse `nemo/collections/common/tokenizers/aggregate_tokenizer.py::AggregateTokenizer`
+# adjust to reuse `nemo/collections/common/tokenizers/aggregate_tokenizer.py::AggregateTokenizer`
 class AggregatedTTSTokenizer:
     """A simple aggregated tokenizer. Aggregates multiple tokenizers into one by combining (simply concatenating)
     their tokens into one vocabulary.
