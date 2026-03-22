@@ -372,6 +372,9 @@ def load_easy_magpie_model(config: ModelLoadConfig, device: str = "cuda") -> Tup
             model_cfg.codecmodel_path = config.codecmodel_path
             model_cfg.train_ds = None
             model_cfg.validation_ds = None
+            model_cfg.run_val_inference = False
+            model_cfg.use_utmos = False
+            model_cfg.use_meta_init_for_decoder = True
             if config.phoneme_tokenizer_path and hasattr(model_cfg, 'phoneme_tokenizer'):
                 model_cfg.phoneme_tokenizer.tokenizer_path = config.phoneme_tokenizer_path
 
