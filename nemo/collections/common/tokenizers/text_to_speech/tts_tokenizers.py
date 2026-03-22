@@ -23,7 +23,6 @@ from typing import List, Optional, Union
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerBase
 
-from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.common.tokenizers.text_to_speech.ipa_lexicon import (
     get_grapheme_character_set,
     get_ipa_punctuation_list,
@@ -39,6 +38,7 @@ from nemo.collections.common.tokenizers.text_to_speech.tokenizer_utils import (
     spanish_text_preprocessing,
     vietnamese_text_preprocessing,
 )
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.utils import logging
 
 
@@ -1235,7 +1235,7 @@ class IPABPETokenizer(TokenizerSpec):
     def ids_to_text(self, ids: List[int]) -> str:
         """Convert IDs back into text."""
         return self.decode(ids)
-    
+
     @property
     def bos(self):
         return self.bos_token_id
@@ -1243,7 +1243,7 @@ class IPABPETokenizer(TokenizerSpec):
     @property
     def eos(self):
         return self.eos_token_id
-    
+
     @property
     def pad(self):
         return self.pad_token_id
