@@ -36,7 +36,6 @@ from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     SpecialAudioToken,
     add_special_tokens,
-    remove_special_tokens,
 )
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.core.classes import ModelPT
