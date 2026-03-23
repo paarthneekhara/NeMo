@@ -28,7 +28,7 @@
         </label>
       </div>
 
-      <h3>Context setup (apply with reset)</h3>
+      <h3>Context setup (auto-applies)</h3>
       <div class="grid2">
         <label for="contextSelect">Context text
           <select id="contextSelect"></select>
@@ -48,25 +48,29 @@
       <label for="prompt">Prompt</label>
       <textarea id="prompt" rows="4">Sure. This is a streaming speech synthesis demo where text arrives gradually, tokens are consumed incrementally, and generated codec frames are decoded in the background for low-latency playback.</textarea>
 
-      <label for="tokensPerSecond">Dummy text LLM tokens-per-second</label>
+      <label for="tokensPerSecond">LLM text send rate (tokens/sec to TTS)</label>
       <input id="tokensPerSecond" type="number" min="1" step="1" value="25" />
 
       <div class="controls">
-        <button id="connectBtn">Connect</button>
         <button id="runBtn" disabled>Run Stream</button>
-        <button id="resetBtn" disabled>Reset Backend State</button>
-        <button id="replayBtn" disabled>Replay Last Audio</button>
+      </div>
+      <div id="backendLoader" class="loader hidden" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="backendLoaderText">Applying backend context/speaker...</span>
       </div>
 
       <label for="streamViz">Audio stream monitor</label>
       <canvas id="streamViz" width="860" height="90"></canvas>
-      <pre id="audioStats">chunks_rx=0 chunks_played=0 queued_sec=0.00</pre>
+      <pre id="audioStats">chunks_rx=0 chunks_played=0 queued_sec=0.00 ttfa_ms=n/a</pre>
 
       <label for="partialText">Partial text (echo from backend)</label>
       <textarea id="partialText" rows="6" readonly></textarea>
 
       <label for="status">Status</label>
       <pre id="status">Disconnected</pre>
+
+      <label for="outputClips">Finished clips</label>
+      <div id="outputClips" class="clips"></div>
     </main>
 
     <script src="/static/app.js"></script>

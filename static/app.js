@@ -1,8 +1,5 @@
 (function () {
-  const connectBtn = document.getElementById("connectBtn");
   const runBtn = document.getElementById("runBtn");
-  const resetBtn = document.getElementById("resetBtn");
-  const replayBtn = document.getElementById("replayBtn");
   const uploadAudioBtn = document.getElementById("uploadAudioBtn");
   const contextAudioFileEl = document.getElementById("contextAudioFile");
   const contextStatusEl = document.getElementById("contextStatus");
@@ -18,9 +15,14 @@
   const statusEl = document.getElementById("status");
   const streamViz = document.getElementById("streamViz");
   const audioStatsEl = document.getElementById("audioStats");
+  const outputClipsEl = document.getElementById("outputClips");
+  const backendLoaderEl = document.getElementById("backendLoader");
+  const backendLoaderTextEl = document.getElementById("backendLoaderText");
 
   let ws = null;
+  let isConnected = false;
   let running = false;
+  let resetInFlight = false;
   let audioCtx = null;
   let analyser = null;
   let gainNode = null;
@@ -32,9 +34,27 @@
   let lastRunChunkBuffers = [];
   let queuedSamples = 0;
   let uploadedContextAudioId = null;
+  let reconnectTimerId = null;
+  let reconnectAttempt = 0;
+  let autoResetTimerId = null;
+  let pendingAutoReset = false;
+  let pendingAutoResetAfterRun = false;
+  let firstTextSentAtMs = null;
+  let firstAudioChunkAtMs = null;
+  let ttfaMs = null;
+  let sawGenerationFinished = false;
+  let currentRunClipFinalized = false;
 
   function setStatus(text) {
     statusEl.textContent = text;
+  }
+
+  function setBackendLoader(isVisible, text) {
+    if (!backendLoaderEl) return;
+    backendLoaderEl.classList.toggle("hidden", !isVisible);
+    if (text && backendLoaderTextEl) {
+      backendLoaderTextEl.textContent = text;
+    }
   }
 
   function wsUrl() {
@@ -47,8 +67,12 @@
     return Math.max(0, queuedSamples / audioCtx.sampleRate);
   }
 
+  function formatTtfaMs() {
+    return Number.isFinite(ttfaMs) ? ttfaMs.toFixed(1) : "n/a";
+  }
+
   function refreshAudioStats() {
-    audioStatsEl.textContent = `chunks_rx=${receivedChunks} chunks_played=${playedChunks} queued_sec=${queuedSeconds().toFixed(2)}`;
+    audioStatsEl.textContent = `chunks_rx=${receivedChunks} chunks_played=${playedChunks} queued_sec=${queuedSeconds().toFixed(2)} ttfa_ms=${formatTtfaMs()}`;
   }
 
   function clearPlaybackQueue() {
@@ -76,6 +100,86 @@
     };
   }
 
+  function isSocketOpen() {
+    return Boolean(ws && ws.readyState === WebSocket.OPEN);
+  }
+
+  function refreshControls() {
+    const disabledBecauseBusy = running || resetInFlight || !isConnected;
+    runBtn.disabled = disabledBecauseBusy;
+    uploadAudioBtn.disabled = !isConnected || running || resetInFlight;
+    contextSelectEl.disabled = !isConnected || running || resetInFlight;
+    useContextAudioEl.disabled = !isConnected || running || resetInFlight;
+    contextAudioFileEl.disabled = !isConnected || running || resetInFlight;
+  }
+
+  function clearRunMetrics() {
+    firstTextSentAtMs = null;
+    firstAudioChunkAtMs = null;
+    ttfaMs = null;
+    refreshAudioStats();
+  }
+
+  function mergeArrayBuffers(buffers) {
+    const totalBytes = buffers.reduce((acc, buf) => acc + buf.byteLength, 0);
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const buf of buffers) {
+      const view = new Uint8Array(buf);
+      merged.set(view, offset);
+      offset += view.byteLength;
+    }
+    return merged;
+  }
+
+  async function persistFinishedClip(chunkBuffers, sampleRate) {
+    const body = mergeArrayBuffers(chunkBuffers);
+    const resp = await fetch("/api/save_pcm_clip", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Sample-Rate": String(sampleRate),
+      },
+      body,
+    });
+    const payload = await resp.json();
+    if (!resp.ok || !payload.clip_url) {
+      throw new Error(payload.error || `HTTP ${resp.status}`);
+    }
+    return payload.clip_url;
+  }
+
+  async function appendFinishedClip() {
+    if (!outputClipsEl || !lastRunChunkBuffers.length) return;
+    let clipUrl = "";
+    try {
+      clipUrl = await persistFinishedClip(lastRunChunkBuffers, sourceSampleRate);
+    } catch (err) {
+      console.error("Failed to persist finished clip", { error: String(err), sampleRate: sourceSampleRate });
+      setStatus("Failed to persist finished clip (see console).");
+      return;
+    }
+    const row = document.createElement("div");
+    row.className = "clipRow";
+    const title = document.createElement("div");
+    title.className = "clipTitle";
+    title.textContent = `Run ${outputClipsEl.children.length + 1} • chunks=${lastRunChunkBuffers.length} • ttfa_ms=${formatTtfaMs()}`;
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = clipUrl;
+    audio.addEventListener("error", () => {
+      console.error("Failed to decode finished clip", {
+        sampleRate: sourceSampleRate,
+        chunks: lastRunChunkBuffers.length,
+        blobUrl: clipUrl,
+      });
+      setStatus("Failed to decode finished clip (see console).");
+    });
+    row.appendChild(title);
+    row.appendChild(audio);
+    outputClipsEl.prepend(row);
+  }
+
   async function fetchContextTexts() {
     try {
       const resp = await fetch("/api/context_texts");
@@ -93,6 +197,163 @@
     } catch (_err) {
       setStatus("Failed to load context text list.");
     }
+  }
+
+  function maybeRunQueuedAutoReset() {
+    if (!pendingAutoReset) return;
+    pendingAutoReset = false;
+    requestAutoReset("Queued context update");
+  }
+
+  function sendResetNow(reason) {
+    if (!isSocketOpen()) return;
+    if (running) {
+      pendingAutoResetAfterRun = true;
+      setStatus(`${reason}: queued until current run finishes.`);
+      return;
+    }
+    if (resetInFlight) {
+      pendingAutoReset = true;
+      return;
+    }
+    resetInFlight = true;
+    refreshControls();
+    setBackendLoader(true, "Applying backend context/speaker...");
+    setStatus(`${reason}: applying backend state...`);
+    const payload = {
+      type: "reset",
+      inference: getInferenceOptions(),
+      ...getContextPayload(),
+    };
+    ws.send(JSON.stringify(payload));
+  }
+
+  function requestAutoReset(reason) {
+    if (!isSocketOpen()) return;
+    if (autoResetTimerId) {
+      clearTimeout(autoResetTimerId);
+      autoResetTimerId = null;
+    }
+    autoResetTimerId = setTimeout(() => {
+      autoResetTimerId = null;
+      sendResetNow(reason);
+    }, 200);
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimerId) return;
+    const delay = Math.min(5000, 1000 * (2 ** reconnectAttempt));
+    reconnectAttempt += 1;
+    setBackendLoader(false);
+    setStatus(`Disconnected. Reconnecting in ${delay}ms...`);
+    reconnectTimerId = setTimeout(() => {
+      reconnectTimerId = null;
+      connectWebSocket();
+    }, delay);
+  }
+
+  function connectWebSocket() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    setStatus("Connecting...");
+    const socket = new WebSocket(wsUrl());
+    ws = socket;
+    socket.binaryType = "arraybuffer";
+
+    socket.onopen = async () => {
+      if (ws !== socket) return;
+      isConnected = true;
+      reconnectAttempt = 0;
+      setBackendLoader(false);
+      setStatus("Connected.");
+      refreshControls();
+      await fetchContextTexts();
+      requestAutoReset("Initial state sync");
+      refreshAudioStats();
+    };
+
+    socket.onmessage = async (event) => {
+      if (ws !== socket) return;
+      if (typeof event.data === "string") {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "partial_text") {
+            partialTextEl.value = msg.text || "";
+          } else if (msg.type === "status") {
+            if (typeof msg.sample_rate === "number" && msg.sample_rate > 0) {
+              sourceSampleRate = msg.sample_rate;
+            }
+            if (msg.state === "reset_started") {
+              resetInFlight = true;
+              setBackendLoader(true, "Applying backend context/speaker...");
+              setStatus("Applying backend context/speaker...");
+            } else if (msg.state === "reset_done" || msg.state === "reset") {
+              resetInFlight = false;
+              setBackendLoader(false);
+              setStatus("Context/speaker applied.");
+              maybeRunQueuedAutoReset();
+            } else {
+              setStatus(JSON.stringify(msg));
+            }
+            if (msg.state === "generation_finished") {
+              sawGenerationFinished = true;
+            }
+            if (msg.state === "done" || msg.state === "error") {
+              running = false;
+              if (msg.state === "done" && !currentRunClipFinalized) {
+                await appendFinishedClip();
+                currentRunClipFinalized = true;
+              }
+              if (pendingAutoResetAfterRun) {
+                pendingAutoResetAfterRun = false;
+                requestAutoReset("Post-run context update");
+              }
+            }
+            refreshControls();
+          }
+        } catch (_err) {
+          setStatus(`Invalid JSON from server: ${event.data}`);
+        }
+        return;
+      }
+
+      receivedChunks += 1;
+      if (event.data instanceof ArrayBuffer) {
+        if (firstTextSentAtMs !== null && firstAudioChunkAtMs === null) {
+          firstAudioChunkAtMs = performance.now();
+          ttfaMs = firstAudioChunkAtMs - firstTextSentAtMs;
+        }
+        lastRunChunkBuffers.push(event.data.slice(0));
+        pushPcmChunk(event.data);
+      }
+    };
+
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      isConnected = false;
+      // If socket closes immediately after generation_finished, still keep clip.
+      if (running && sawGenerationFinished && !currentRunClipFinalized && lastRunChunkBuffers.length > 0) {
+        void appendFinishedClip();
+        currentRunClipFinalized = true;
+      }
+      running = false;
+      resetInFlight = false;
+      pendingAutoReset = false;
+      pendingAutoResetAfterRun = false;
+      if (autoResetTimerId) {
+        clearTimeout(autoResetTimerId);
+        autoResetTimerId = null;
+      }
+      setBackendLoader(false);
+      refreshControls();
+      scheduleReconnect();
+    };
+
+    socket.onerror = () => {
+      if (ws !== socket) return;
+      setStatus("WebSocket error.");
+    };
   }
 
   async function uploadReferenceAudio() {
@@ -113,10 +374,11 @@
       }
       uploadedContextAudioId = data.audio_id;
       contextStatusEl.textContent = `Uploaded: ${file.name} (id=${uploadedContextAudioId})`;
+      requestAutoReset("Uploaded reference audio");
     } catch (err) {
       contextStatusEl.textContent = `Upload error: ${String(err)}`;
     } finally {
-      uploadAudioBtn.disabled = false;
+      refreshControls();
     }
   }
 
@@ -216,22 +478,6 @@
     refreshAudioStats();
   }
 
-  async function replayLastAudio() {
-    if (!lastRunChunkBuffers.length) {
-      setStatus("No previous audio to replay yet.");
-      return;
-    }
-    await ensureAudioGraph();
-    clearPlaybackQueue();
-    playedChunks = 0;
-    receivedChunks = lastRunChunkBuffers.length;
-    refreshAudioStats();
-    for (const chunk of lastRunChunkBuffers) {
-      pushPcmChunk(chunk.slice(0));
-    }
-    setStatus(`Replaying ${lastRunChunkBuffers.length} chunk(s).`);
-  }
-
   async function streamDummyText(promptText) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       setStatus("WebSocket not connected.");
@@ -246,10 +492,13 @@
     const delayMs = Math.max(1, Math.floor(1000 / wordsPerSecond));
 
     running = true;
-    runBtn.disabled = true;
+    refreshControls();
     for (let i = 0; i < words.length; i++) {
       if (!running || !ws || ws.readyState !== WebSocket.OPEN) break;
       const token = i === 0 ? words[i] : ` ${words[i]}`;
+      if (firstTextSentAtMs === null) {
+        firstTextSentAtMs = performance.now();
+      }
       ws.send(JSON.stringify({ type: "text_chunk", text: token }));
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -258,67 +507,21 @@
     }
   }
 
-  connectBtn.addEventListener("click", () => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      setStatus("Already connected.");
-      return;
+  async function fetchLlmText(promptText) {
+    const resp = await fetch("/api/llm_generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: promptText }),
+    });
+    const payload = await resp.json();
+    if (!resp.ok) {
+      throw new Error(payload.error || `HTTP ${resp.status}`);
     }
-    ws = new WebSocket(wsUrl());
-    ws.binaryType = "arraybuffer";
-
-    ws.onopen = async () => {
-      setStatus("Connected.");
-      runBtn.disabled = false;
-      resetBtn.disabled = false;
-      uploadAudioBtn.disabled = false;
-      replayBtn.disabled = true;
-      await fetchContextTexts();
-      refreshAudioStats();
+    return {
+      text: String(payload.text || ""),
+      model: String(payload.model || "unknown"),
     };
-
-    ws.onmessage = async (event) => {
-      if (typeof event.data === "string") {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "partial_text") {
-            partialTextEl.value = msg.text || "";
-          } else if (msg.type === "status") {
-            if (typeof msg.sample_rate === "number" && msg.sample_rate > 0) {
-              sourceSampleRate = msg.sample_rate;
-            }
-            setStatus(JSON.stringify(msg));
-            if (msg.state === "done" || msg.state === "error") {
-              running = false;
-              runBtn.disabled = false;
-              replayBtn.disabled = !(msg.state === "done" && lastRunChunkBuffers.length > 0);
-            }
-          }
-        } catch (_err) {
-          setStatus(`Invalid JSON from server: ${event.data}`);
-        }
-        return;
-      }
-
-      receivedChunks += 1;
-      if (event.data instanceof ArrayBuffer) {
-        lastRunChunkBuffers.push(event.data.slice(0));
-        pushPcmChunk(event.data);
-      }
-    };
-
-    ws.onclose = () => {
-      running = false;
-      runBtn.disabled = true;
-      resetBtn.disabled = true;
-      uploadAudioBtn.disabled = true;
-      replayBtn.disabled = true;
-      setStatus("Disconnected.");
-    };
-
-    ws.onerror = () => {
-      setStatus("WebSocket error.");
-    };
-  });
+  }
 
   runBtn.addEventListener("click", async () => {
     if (running) return;
@@ -326,27 +529,37 @@
     playedChunks = 0;
     queuedSamples = 0;
     lastRunChunkBuffers = [];
-    replayBtn.disabled = true;
+    sawGenerationFinished = false;
+    currentRunClipFinalized = false;
+    clearRunMetrics();
     clearPlaybackQueue();
     await ensureAudioGraph();
-    await streamDummyText(promptEl.value || "");
+    const promptText = (promptEl.value || "").trim();
+    if (!promptText) {
+      setStatus("Prompt is empty.");
+      return;
+    }
+    try {
+      running = true;
+      refreshControls();
+      setStatus("Calling OpenAI...");
+      const llm = await fetchLlmText(promptText);
+      running = false;
+      setStatus(`OpenAI (${llm.model}) responded. Streaming to TTS...`);
+      await streamDummyText(llm.text);
+    } catch (err) {
+      running = false;
+      refreshControls();
+      setStatus(`OpenAI error: ${String(err)}`);
+    }
   });
 
-  resetBtn.addEventListener("click", () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    running = false;
-    clearPlaybackQueue();
-    const payload = {
-      type: "reset",
-      inference: getInferenceOptions(),
-      ...getContextPayload(),
-    };
-    ws.send(JSON.stringify(payload));
-    setStatus("Reset requested.");
+  contextSelectEl.addEventListener("change", () => {
+    requestAutoReset("Context text changed");
   });
 
-  replayBtn.addEventListener("click", async () => {
-    await replayLastAudio();
+  useContextAudioEl.addEventListener("change", () => {
+    requestAutoReset("Reference audio toggle changed");
   });
 
   uploadAudioBtn.addEventListener("click", async () => {
@@ -358,4 +571,8 @@
     if (!file) return;
     contextStatusEl.textContent = `Ready to upload: ${file.name}`;
   });
+
+  refreshControls();
+  refreshAudioStats();
+  connectWebSocket();
 })();

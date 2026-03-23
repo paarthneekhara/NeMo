@@ -20,6 +20,10 @@ import sys
 import threading
 import time
 import types
+import uuid
+import wave
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -50,7 +54,7 @@ os.environ["OMP_NUM_THREADS"] = "2"
 # ----------------------------
 # Editable defaults (no CLI)
 # ----------------------------
-MODEL_PATH = "/datap/misc/EasyMagpieAssets/EMTTS_Pretraining_Qwen_WithCrossLingual_3_5_Delay.nemo"
+MODEL_PATH = "/datap/misc/EasyMagpieAssets/PO_CodeRefactor_NoViZhHi_NGEN8_LR5e-6_epoch28.nemo"
 CODEC_MODEL_PATH = "/datap/misc/EasyMagpieAssets/25fps_spectral_codec_with_bandwidth_extension.nemo"
 PHONEME_TOKENIZER_PATH = "/datap/misc/EasyMagpieAssets/bpe_ipa_tokenizer_2048_en_de_es_fr_hi_it_vi_zh.json"
 CONTEXT_TEXTS_PATH = "/datap/misc/EasyMagpieAssets/unique_text_contexts.txt"
@@ -79,7 +83,7 @@ WARMUP_MAX_DECODER_STEPS = 80
 
 GENERATION_GPU_INDEX = 0
 DECODE_GPU_INDEX = 1
-MODEL_PRECISION = "bf16"  # bf16 | fp16 | fp32
+MODEL_PRECISION = "fp32"  # bf16 | fp16 | fp32
 LOCAL_TRANSFORMER_BACKEND = "trt"  # torch | trt
 
 SERVER_HOST = "0.0.0.0"
@@ -314,6 +318,49 @@ def _pcm_bytes_from_int16(pcm: np.ndarray) -> bytes:
     return pcm_i16.tobytes()
 
 
+def call_openai_chat(prompt: str) -> Tuple[str, str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    endpoint = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 220,
+    }
+    req = urlrequest.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI request failed ({exc.code}): {detail}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    parsed = json.loads(body)
+    choices = parsed.get("choices") or []
+    message = choices[0].get("message") if choices else None
+    text = (message or {}).get("content", "")
+    if not text:
+        raise RuntimeError(f"OpenAI response had no text. Raw response: {body}")
+    return text, model_name
+
+
 def _decode_new_audio_chunk(
     model: EasyMagpieTTSInferenceModel,
     decode_codec_helper: CodecHelper,
@@ -403,6 +450,8 @@ class EasyMagpieWsServer:
 
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         self.upload_dir = UPLOAD_DIR
+        self.clips_dir = os.path.join(self.upload_dir, "clips")
+        os.makedirs(self.clips_dir, exist_ok=True)
 
         self.base_state = create_base_streaming_state(
             model=self.model,
@@ -568,6 +617,7 @@ class EasyMagpieWsServer:
                             pending_token_ids.clear()
                             llm_done = False
                             steps = 0
+                            self._send_json(ws, {"type": "status", "state": "reset_started"})
                             requested_idx = event.get("context_text_index")
                             if isinstance(requested_idx, int) and 0 <= requested_idx < len(self.context_texts):
                                 session_context_text = self.context_texts[requested_idx]
@@ -591,7 +641,7 @@ class EasyMagpieWsServer:
                                 ws,
                                 {
                                     "type": "status",
-                                    "state": "reset",
+                                    "state": "reset_done",
                                     "context_audio_active": bool(session_context_audio_path),
                                 },
                             )
@@ -715,6 +765,51 @@ class EasyMagpieWsServer:
             dst = os.path.join(self.upload_dir, stamped_name)
             file.save(dst)
             return jsonify({"audio_id": stamped_name})
+
+        @app.post("/api/save_pcm_clip")
+        def save_pcm_clip():
+            sr_header = request.headers.get("X-Sample-Rate", "0")
+            try:
+                sample_rate = int(sr_header)
+            except ValueError:
+                return jsonify({"error": "Invalid sample rate"}), 400
+            if sample_rate <= 0:
+                return jsonify({"error": "Sample rate must be > 0"}), 400
+
+            pcm_bytes = request.get_data(cache=False, as_text=False) or b""
+            if not pcm_bytes:
+                return jsonify({"error": "Empty PCM payload"}), 400
+            if len(pcm_bytes) % 2 != 0:
+                pcm_bytes = pcm_bytes[:-1]
+            if not pcm_bytes:
+                return jsonify({"error": "PCM payload must contain at least one int16 sample"}), 400
+
+            clip_name = f"{int(time.time() * 1000)}_{uuid.uuid4().hex}.wav"
+            clip_path = os.path.join(self.clips_dir, clip_name)
+            with wave.open(clip_path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)  # int16
+                wav.setframerate(sample_rate)
+                wav.writeframes(pcm_bytes)
+
+            return jsonify({"clip_url": f"/api/clips/{clip_name}"})
+
+        @app.get("/api/clips/<path:clip_name>")
+        def get_clip(clip_name: str):
+            safe_name = os.path.basename(clip_name)
+            return send_from_directory(self.clips_dir, safe_name)
+
+        @app.post("/api/llm_generate")
+        def llm_generate():
+            payload = request.get_json(silent=True) or {}
+            prompt = (payload.get("prompt") or "").strip()
+            if not prompt:
+                return jsonify({"error": "Prompt cannot be empty"}), 400
+            try:
+                text, model_name = call_openai_chat(prompt)
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"error": str(exc)}), 500
+            return jsonify({"text": text, "model": model_name})
 
         @sock.route("/ws/stream")
         def stream(ws):

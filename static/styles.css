@@ -92,3 +92,58 @@ button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
+
+.loader {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9ec8ff;
+  font-size: 0.95rem;
+}
+
+.hidden {
+  display: none;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #3c4658;
+  border-top-color: #9ec8ff;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.clips {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.clipRow {
+  border: 1px solid #2d3440;
+  border-radius: 8px;
+  background: #171b22;
+  padding: 10px;
+}
+
+.clipTitle {
+  margin-bottom: 8px;
+  font-size: 0.9rem;
+  opacity: 0.92;
+}
+
+.clipRow audio {
+  width: 100%;
+}

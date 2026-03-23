@@ -75,7 +75,7 @@ DECODE_GPU_INDEX = 1
 # Precision mode for generation compute: "bf16" (AMP), "fp16" (AMP), or "fp32".
 MODEL_PRECISION = "bf16"
 # Local transformer backend: "torch" or "trt".
-LOCAL_TRANSFORMER_BACKEND = "torch"
+LOCAL_TRANSFORMER_BACKEND = "trt"
 
 DEFAULT_QUESTION = "What is the main idea behind this demo?"
 DUMMY_RESPONSE_TEMPLATE = (

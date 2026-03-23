@@ -66,7 +66,7 @@ def load_model(model_path, codec_model_path, phoneme_tokenizer_path,
             map_location=torch.device('cpu'),
         )
 
-    model.use_kv_cache_for_inference = True
+    model.use_kv_cache_for_inference = False
     model.eval().cuda().float()
     return model
 
