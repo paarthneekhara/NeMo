@@ -68,7 +68,7 @@ UPLOAD_DIR = os.path.abspath("./tmp/easymagpie_uploads")
 USE_CFG = True
 CFG_SCALE = 2.5
 USE_LOCAL_TRANSFORMER = True
-TEMPERATURE = 0.5
+TEMPERATURE = 0.7
 TOPK = 80
 MAX_DECODER_STEPS = 500
 PHONEME_INPUT_TYPE = "pred"
@@ -386,6 +386,9 @@ class DecodeSharedState:
     last_decode_frame_mark: int = 0
     last_emitted_sample_idx: int = 0
     decoded_chunks: Deque[np.ndarray] = field(default_factory=deque)
+    first_streaming_step_at: Optional[float] = None
+    ttfa_ms_backend: Optional[float] = None
+    ttfa_reported: bool = False
 
 
 def decode_worker(model: EasyMagpieTTSInferenceModel, decode_codec_helper: CodecHelper, shared: DecodeSharedState):
@@ -598,6 +601,10 @@ class EasyMagpieWsServer:
                             pending_token_ids.clear()
                             llm_done = False
                             steps = 0
+                            with shared.lock:
+                                shared.first_streaming_step_at = None
+                                shared.ttfa_ms_backend = None
+                                shared.ttfa_reported = False
                             session_inference_options = self._normalize_inference_options(
                                 session_inference_options, event.get("inference")
                             )
@@ -617,6 +624,10 @@ class EasyMagpieWsServer:
                             pending_token_ids.clear()
                             llm_done = False
                             steps = 0
+                            with shared.lock:
+                                shared.first_streaming_step_at = None
+                                shared.ttfa_ms_backend = None
+                                shared.ttfa_reported = False
                             self._send_json(ws, {"type": "status", "state": "reset_started"})
                             requested_idx = event.get("context_text_index")
                             if isinstance(requested_idx, int) and 0 <= requested_idx < len(self.context_texts):
@@ -681,6 +692,9 @@ class EasyMagpieWsServer:
                             text_tokens = None
 
                         if text_tokens is not None or llm_done:
+                            with shared.lock:
+                                if shared.first_streaming_step_at is None:
+                                    shared.first_streaming_step_at = time.perf_counter()
                             if self.autocast_dtype is None:
                                 state, audio_codes, _phoneme_tokens = self.model.streaming_step(
                                     state=state,
@@ -697,6 +711,9 @@ class EasyMagpieWsServer:
                             steps += 1
 
                             if audio_codes is not None:
+                                with shared.lock:
+                                    if shared.first_streaming_step_at is not None and shared.ttfa_ms_backend is None:
+                                        shared.ttfa_ms_backend = (time.perf_counter() - shared.first_streaming_step_at) * 1000.0
                                 new_codes = audio_codes.detach().to(
                                     device=self.decode_device, dtype=torch.long, non_blocking=True
                                 )
@@ -715,9 +732,18 @@ class EasyMagpieWsServer:
                     with shared.lock:
                         pending_chunks = list(shared.decoded_chunks)
                         shared.decoded_chunks.clear()
+                        ttfa_ms_backend = None
+                        if shared.ttfa_ms_backend is not None and not shared.ttfa_reported:
+                            ttfa_ms_backend = float(shared.ttfa_ms_backend)
+                            shared.ttfa_reported = True
                     for chunk in pending_chunks:
                         if chunk.size > 0:
                             ws.send(_pcm_bytes_from_int16(chunk))
+                    if ttfa_ms_backend is not None:
+                        self._send_json(
+                            ws,
+                            {"type": "status", "state": "ttfa", "ttfa_ms_backend": round(ttfa_ms_backend, 3)},
+                        )
 
                     if started and llm_done and bool(state.finished.all()):
                         break

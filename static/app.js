@@ -39,8 +39,6 @@
   let autoResetTimerId = null;
   let pendingAutoReset = false;
   let pendingAutoResetAfterRun = false;
-  let firstTextSentAtMs = null;
-  let firstAudioChunkAtMs = null;
   let ttfaMs = null;
   let sawGenerationFinished = false;
   let currentRunClipFinalized = false;
@@ -114,8 +112,6 @@
   }
 
   function clearRunMetrics() {
-    firstTextSentAtMs = null;
-    firstAudioChunkAtMs = null;
     ttfaMs = null;
     refreshAudioStats();
   }
@@ -186,6 +182,7 @@
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       const items = Array.isArray(data.items) ? data.items : [];
+      const prevSelectedValue = contextSelectEl.value;
       contextSelectEl.innerHTML = "";
       items.forEach((t, idx) => {
         const opt = document.createElement("option");
@@ -194,6 +191,12 @@
         opt.textContent = `${idx}: ${trimmed}`;
         contextSelectEl.appendChild(opt);
       });
+      if (items.length > 0) {
+        const wanted = Number(prevSelectedValue);
+        if (Number.isInteger(wanted) && wanted >= 0 && wanted < items.length) {
+          contextSelectEl.value = String(wanted);
+        }
+      }
     } catch (_err) {
       setStatus("Failed to load context text list.");
     }
@@ -284,6 +287,10 @@
             if (typeof msg.sample_rate === "number" && msg.sample_rate > 0) {
               sourceSampleRate = msg.sample_rate;
             }
+            if (typeof msg.ttfa_ms_backend === "number" && Number.isFinite(msg.ttfa_ms_backend)) {
+              ttfaMs = msg.ttfa_ms_backend;
+              refreshAudioStats();
+            }
             if (msg.state === "reset_started") {
               resetInFlight = true;
               setBackendLoader(true, "Applying backend context/speaker...");
@@ -320,10 +327,6 @@
 
       receivedChunks += 1;
       if (event.data instanceof ArrayBuffer) {
-        if (firstTextSentAtMs !== null && firstAudioChunkAtMs === null) {
-          firstAudioChunkAtMs = performance.now();
-          ttfaMs = firstAudioChunkAtMs - firstTextSentAtMs;
-        }
         lastRunChunkBuffers.push(event.data.slice(0));
         pushPcmChunk(event.data);
       }
@@ -496,9 +499,6 @@
     for (let i = 0; i < words.length; i++) {
       if (!running || !ws || ws.readyState !== WebSocket.OPEN) break;
       const token = i === 0 ? words[i] : ` ${words[i]}`;
-      if (firstTextSentAtMs === null) {
-        firstTextSentAtMs = performance.now();
-      }
       ws.send(JSON.stringify({ type: "text_chunk", text: token }));
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
