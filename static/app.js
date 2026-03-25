@@ -1,7 +1,8 @@
 (function () {
   const runBtn = document.getElementById("runBtn");
-  const uploadAudioBtn = document.getElementById("uploadAudioBtn");
   const contextAudioFileEl = document.getElementById("contextAudioFile");
+  const contextAudioSelectEl = document.getElementById("contextAudioSelect");
+  const contextAudioPreviewEl = document.getElementById("contextAudioPreview");
   const contextStatusEl = document.getElementById("contextStatus");
   const contextSelectEl = document.getElementById("contextSelect");
   const useContextAudioEl = document.getElementById("useContextAudio");
@@ -34,6 +35,9 @@
   let lastRunChunkBuffers = [];
   let queuedSamples = 0;
   let uploadedContextAudioId = null;
+  let uploadedContextAudioUrl = "";
+  let uploadedContextAudioLabel = "Uploaded audio";
+  let contextAudioCandidates = [];
   let reconnectTimerId = null;
   let reconnectAttempt = 0;
   let autoResetTimerId = null;
@@ -91,10 +95,13 @@
   }
 
   function getContextPayload() {
+    const selectedAudioId = contextAudioSelectEl.value || null;
+    const selectedCandidate = selectedAudioId ? findContextAudioCandidateById(selectedAudioId) : null;
+    const selectedUsable = !selectedCandidate || selectedCandidate.available !== false;
     return {
       context_text_index: Number(contextSelectEl.value || 0),
-      use_context_audio: Boolean(useContextAudioEl.checked),
-      context_audio_id: uploadedContextAudioId,
+      use_context_audio: Boolean(useContextAudioEl.checked && selectedUsable),
+      context_audio_id: selectedUsable ? selectedAudioId : null,
     };
   }
 
@@ -105,9 +112,9 @@
   function refreshControls() {
     const disabledBecauseBusy = running || resetInFlight || !isConnected;
     runBtn.disabled = disabledBecauseBusy;
-    uploadAudioBtn.disabled = !isConnected || running || resetInFlight;
     contextSelectEl.disabled = !isConnected || running || resetInFlight;
     useContextAudioEl.disabled = !isConnected || running || resetInFlight;
+    contextAudioSelectEl.disabled = !isConnected || running || resetInFlight;
     contextAudioFileEl.disabled = !isConnected || running || resetInFlight;
   }
 
@@ -202,6 +209,103 @@
     }
   }
 
+  function findContextAudioCandidateById(audioId) {
+    const merged = [...contextAudioCandidates];
+    if (
+      uploadedContextAudioId &&
+      uploadedContextAudioUrl &&
+      !merged.some((item) => item.id === uploadedContextAudioId)
+    ) {
+      merged.push({
+        id: uploadedContextAudioId,
+        label: uploadedContextAudioLabel,
+        url: uploadedContextAudioUrl,
+      });
+    }
+    return merged.find((item) => item.id === audioId) || null;
+  }
+
+  function setContextAudioPreview() {
+    const selectedAudioId = contextAudioSelectEl.value || "";
+    const selected = selectedAudioId ? findContextAudioCandidateById(selectedAudioId) : null;
+    if (selected && selected.available === false) {
+      contextAudioPreviewEl.removeAttribute("src");
+      contextAudioPreviewEl.load();
+      contextStatusEl.textContent = "Selected preset audio is unavailable (Git LFS pointer file).";
+    } else if (selected && selected.url) {
+      contextAudioPreviewEl.src = selected.url;
+    } else {
+      contextAudioPreviewEl.removeAttribute("src");
+      contextAudioPreviewEl.load();
+    }
+  }
+
+  function renderContextAudioOptions(preferredId) {
+    const previousValue = contextAudioSelectEl.value || "";
+    const merged = [...contextAudioCandidates];
+    if (
+      uploadedContextAudioId &&
+      uploadedContextAudioUrl &&
+      !merged.some((item) => item.id === uploadedContextAudioId)
+    ) {
+      merged.push({
+        id: uploadedContextAudioId,
+        label: uploadedContextAudioLabel,
+        url: uploadedContextAudioUrl,
+      });
+    }
+    contextAudioSelectEl.innerHTML = "";
+    const noneOpt = document.createElement("option");
+    noneOpt.value = "";
+    noneOpt.textContent = "None";
+    contextAudioSelectEl.appendChild(noneOpt);
+
+    merged.forEach((item) => {
+      const opt = document.createElement("option");
+      opt.value = String(item.id || "");
+      const unavailable = item.available === false;
+      opt.textContent = unavailable
+        ? `${String(item.label || item.id || "")} (unavailable)`
+        : String(item.label || item.id || "");
+      opt.disabled = unavailable;
+      contextAudioSelectEl.appendChild(opt);
+    });
+
+    const validIds = new Set(merged.filter((item) => item.available !== false).map((item) => item.id));
+    if (preferredId && validIds.has(preferredId)) {
+      contextAudioSelectEl.value = preferredId;
+    } else if (previousValue && validIds.has(previousValue)) {
+      contextAudioSelectEl.value = previousValue;
+    } else {
+      contextAudioSelectEl.value = "";
+    }
+
+    setContextAudioPreview();
+  }
+
+  async function fetchContextAudios(preferredId) {
+    try {
+      const resp = await fetch("/api/context_audios");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      contextAudioCandidates = items
+        .map((item) => ({
+          id: String(item.id || ""),
+          label: String(item.label || item.id || ""),
+          url: String(item.url || ""),
+          available: item.available !== false,
+        }))
+        .filter((item) => item.id && item.url);
+      renderContextAudioOptions(preferredId);
+    } catch (_err) {
+      contextAudioCandidates = [];
+      renderContextAudioOptions(null);
+      contextStatusEl.textContent = "Failed to load preset context audios.";
+      setStatus("Failed to load preset context audios.");
+    }
+  }
+
   function maybeRunQueuedAutoReset() {
     if (!pendingAutoReset) return;
     pendingAutoReset = false;
@@ -271,7 +375,7 @@
       setBackendLoader(false);
       setStatus("Connected.");
       refreshControls();
-      await fetchContextTexts();
+      await Promise.all([fetchContextTexts(), fetchContextAudios(uploadedContextAudioId)]);
       requestAutoReset("Initial state sync");
       refreshAudioStats();
     };
@@ -298,7 +402,11 @@
             } else if (msg.state === "reset_done" || msg.state === "reset") {
               resetInFlight = false;
               setBackendLoader(false);
-              setStatus("Context/speaker applied.");
+              if (msg.warning) {
+                setStatus(String(msg.warning));
+              } else {
+                setStatus("Context/speaker applied.");
+              }
               maybeRunQueuedAutoReset();
             } else {
               setStatus(JSON.stringify(msg));
@@ -367,7 +475,7 @@
     }
     const form = new FormData();
     form.append("file", file);
-    uploadAudioBtn.disabled = true;
+    refreshControls();
     contextStatusEl.textContent = "Uploading...";
     try {
       const resp = await fetch("/api/upload_reference_audio", { method: "POST", body: form });
@@ -376,7 +484,15 @@
         throw new Error(data.error || "Upload failed");
       }
       uploadedContextAudioId = data.audio_id;
-      contextStatusEl.textContent = `Uploaded: ${file.name} (id=${uploadedContextAudioId})`;
+      uploadedContextAudioUrl = String(data.audio_url || "");
+      uploadedContextAudioLabel = `Uploaded: ${file.name}`;
+      await fetchContextAudios(uploadedContextAudioId);
+      if (uploadedContextAudioUrl) {
+        contextAudioPreviewEl.src = uploadedContextAudioUrl;
+      }
+      contextAudioSelectEl.value = uploadedContextAudioId;
+      useContextAudioEl.checked = true;
+      contextStatusEl.textContent = `Uploaded and selected: ${file.name}`;
       requestAutoReset("Uploaded reference audio");
     } catch (err) {
       contextStatusEl.textContent = `Upload error: ${String(err)}`;
@@ -562,17 +678,24 @@
     requestAutoReset("Reference audio toggle changed");
   });
 
-  uploadAudioBtn.addEventListener("click", async () => {
-    await uploadReferenceAudio();
+  contextAudioSelectEl.addEventListener("change", () => {
+    setContextAudioPreview();
+    const selectedAudioId = contextAudioSelectEl.value || "";
+    const selected = selectedAudioId ? findContextAudioCandidateById(selectedAudioId) : null;
+    if (selected && selected.available === false) {
+      return;
+    }
+    requestAutoReset("Reference audio selection changed");
   });
 
-  contextAudioFileEl.addEventListener("change", () => {
+  contextAudioFileEl.addEventListener("change", async () => {
     const file = contextAudioFileEl.files && contextAudioFileEl.files[0];
     if (!file) return;
-    contextStatusEl.textContent = `Ready to upload: ${file.name}`;
+    await uploadReferenceAudio();
   });
 
   refreshControls();
   refreshAudioStats();
+  setContextAudioPreview();
   connectWebSocket();
 })();

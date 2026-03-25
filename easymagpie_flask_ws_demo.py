@@ -16,6 +16,7 @@ import csv
 import json
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -54,7 +55,7 @@ os.environ["OMP_NUM_THREADS"] = "2"
 # ----------------------------
 # Editable defaults (no CLI)
 # ----------------------------
-MODEL_PATH = "/datap/misc/EasyMagpieAssets/PO_CodeRefactor_NoViZhHi_NGEN8_LR5e-6_epoch28.nemo"
+MODEL_PATH = "/datap/misc/DecoderOnly/EMTTS_Pretraining_Qwen_WithCrossLingual_3_5_Delay.nemo"
 CODEC_MODEL_PATH = "/datap/misc/EasyMagpieAssets/25fps_spectral_codec_with_bandwidth_extension.nemo"
 PHONEME_TOKENIZER_PATH = "/datap/misc/EasyMagpieAssets/bpe_ipa_tokenizer_2048_en_de_es_fr_hi_it_vi_zh.json"
 CONTEXT_TEXTS_PATH = "/datap/misc/EasyMagpieAssets/unique_text_contexts.txt"
@@ -64,6 +65,8 @@ CONTEXT_AUDIO_PATH: Optional[str] = None
 CONTEXT_AUDIO_DURATION_SEC = 5.0
 LANGUAGE = "en"
 UPLOAD_DIR = os.path.abspath("./tmp/easymagpie_uploads")
+PRESET_CONTEXT_AUDIO_SOURCE_DIR = "/home/pneekhara/2023/SimpleT5NeMo/context_audios"
+SUPPORTED_AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac")
 
 USE_CFG = True
 CFG_SCALE = 2.5
@@ -453,6 +456,9 @@ class EasyMagpieWsServer:
 
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         self.upload_dir = UPLOAD_DIR
+        self.preset_context_audio_dir = os.path.join(self.upload_dir, "preset_context_audios")
+        os.makedirs(self.preset_context_audio_dir, exist_ok=True)
+        self._sync_preset_context_audios()
         self.clips_dir = os.path.join(self.upload_dir, "clips")
         os.makedirs(self.clips_dir, exist_ok=True)
 
@@ -506,9 +512,75 @@ class EasyMagpieWsServer:
     def _resolve_context_audio_path(self, audio_id: Optional[str]) -> Optional[str]:
         if not audio_id:
             return None
+        audio_id = str(audio_id).strip()
+        if audio_id.startswith("preset:"):
+            safe_name = os.path.basename(audio_id[len("preset:") :])
+            path = os.path.join(self.preset_context_audio_dir, safe_name)
+            return path if os.path.isfile(path) else None
+        if audio_id.startswith("upload:"):
+            safe_name = os.path.basename(audio_id[len("upload:") :])
+            path = os.path.join(self.upload_dir, safe_name)
+            return path if os.path.isfile(path) else None
+        # Backward compatibility: treat plain ids as uploads.
         safe_name = os.path.basename(audio_id)
         path = os.path.join(self.upload_dir, safe_name)
-        return path if os.path.exists(path) else None
+        return path if os.path.isfile(path) else None
+
+    @staticmethod
+    def _is_supported_audio_filename(filename: str) -> bool:
+        return filename.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS)
+
+    @staticmethod
+    def _audio_file_is_usable(path: str) -> bool:
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "rb") as f:
+                first_line = f.readline(256)
+        except OSError:
+            return False
+        # Guard against Git-LFS pointer files checked out without content.
+        if first_line.startswith(b"version https://git-lfs.github.com/spec/v1"):
+            return False
+        return True
+
+    def _sync_preset_context_audios(self) -> None:
+        source_dir = PRESET_CONTEXT_AUDIO_SOURCE_DIR
+        if not source_dir or not os.path.isdir(source_dir):
+            logging.warning(f"Preset context audio directory not found: {source_dir}")
+            return
+        for name in sorted(os.listdir(source_dir)):
+            src = os.path.join(source_dir, name)
+            if not os.path.isfile(src):
+                continue
+            if not self._is_supported_audio_filename(name):
+                continue
+            dst = os.path.join(self.preset_context_audio_dir, os.path.basename(name))
+            try:
+                shutil.copy2(src, dst)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(f"Failed to copy preset context audio '{src}' -> '{dst}': {exc}")
+
+    def _list_context_audio_candidates(self) -> List[dict]:
+        items: List[dict] = []
+        if os.path.isdir(self.preset_context_audio_dir):
+            for name in sorted(os.listdir(self.preset_context_audio_dir)):
+                path = os.path.join(self.preset_context_audio_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                if not self._is_supported_audio_filename(name):
+                    continue
+                audio_id = f"preset:{name}"
+                available = self._audio_file_is_usable(path)
+                items.append(
+                    {
+                        "id": audio_id,
+                        "label": f"Preset: {name}",
+                        "url": f"/api/context_audio/{audio_id}",
+                        "available": bool(available),
+                    }
+                )
+        return items
 
     def _build_state_for_context(self, context_text: str, context_audio_path: Optional[str], inference_options: dict):
         return create_base_streaming_state(
@@ -608,13 +680,25 @@ class EasyMagpieWsServer:
                             session_inference_options = self._normalize_inference_options(
                                 session_inference_options, event.get("inference")
                             )
-                            with self.state_lock:
-                                session_base_state = self._build_state_for_context(
-                                    context_text=session_context_text,
-                                    context_audio_path=session_context_audio_path,
-                                    inference_options=session_inference_options,
+                            try:
+                                with self.state_lock:
+                                    session_base_state = self._build_state_for_context(
+                                        context_text=session_context_text,
+                                        context_audio_path=session_context_audio_path,
+                                        inference_options=session_inference_options,
+                                    )
+                                    state = clone_streaming_state(session_base_state)
+                            except Exception as exc:  # noqa: BLE001
+                                self._send_json(
+                                    ws,
+                                    {
+                                        "type": "status",
+                                        "state": "error",
+                                        "detail": f"Failed to start with current context: {exc}",
+                                    },
                                 )
-                                state = clone_streaming_state(session_base_state)
+                                started = False
+                                continue
                             self._send_json(ws, {"type": "status", "state": "running"})
                             continue
                         if etype == "reset":
@@ -636,24 +720,43 @@ class EasyMagpieWsServer:
                             requested_audio_id = event.get("context_audio_id")
                             use_context_audio = bool(event.get("use_context_audio", False))
                             resolved_audio = self._resolve_context_audio_path(requested_audio_id)
+                            if resolved_audio and not self._audio_file_is_usable(resolved_audio):
+                                resolved_audio = None
                             session_context_audio_path = resolved_audio if use_context_audio and resolved_audio else None
 
                             session_inference_options = self._normalize_inference_options(
                                 session_inference_options, event.get("inference")
                             )
-                            with self.state_lock:
-                                session_base_state = self._build_state_for_context(
-                                    context_text=session_context_text,
-                                    context_audio_path=session_context_audio_path,
-                                    inference_options=session_inference_options,
-                                )
-                                state = clone_streaming_state(session_base_state)
+                            reset_error = None
+                            try:
+                                with self.state_lock:
+                                    session_base_state = self._build_state_for_context(
+                                        context_text=session_context_text,
+                                        context_audio_path=session_context_audio_path,
+                                        inference_options=session_inference_options,
+                                    )
+                                    state = clone_streaming_state(session_base_state)
+                            except Exception as exc:  # noqa: BLE001
+                                reset_error = str(exc)
+                                session_context_audio_path = None
+                                with self.state_lock:
+                                    session_base_state = self._build_state_for_context(
+                                        context_text=session_context_text,
+                                        context_audio_path=None,
+                                        inference_options=session_inference_options,
+                                    )
+                                    state = clone_streaming_state(session_base_state)
                             self._send_json(
                                 ws,
                                 {
                                     "type": "status",
                                     "state": "reset_done",
                                     "context_audio_active": bool(session_context_audio_path),
+                                    "warning": (
+                                        f"Reference audio was not applied. Falling back to text-only context: {reset_error}"
+                                        if reset_error
+                                        else None
+                                    ),
                                 },
                             )
                             continue
@@ -777,6 +880,10 @@ class EasyMagpieWsServer:
         def context_texts():
             return jsonify({"items": self.context_texts})
 
+        @app.get("/api/context_audios")
+        def context_audios():
+            return jsonify({"items": self._list_context_audio_candidates()})
+
         @app.post("/api/upload_reference_audio")
         def upload_reference_audio():
             if "file" not in request.files:
@@ -787,10 +894,24 @@ class EasyMagpieWsServer:
             safe_name = secure_filename(file.filename)
             if not safe_name:
                 return jsonify({"error": "Invalid filename"}), 400
+            if not self._is_supported_audio_filename(safe_name):
+                return jsonify({"error": "Unsupported audio file extension"}), 400
             stamped_name = f"{int(time.time() * 1000)}_{safe_name}"
             dst = os.path.join(self.upload_dir, stamped_name)
             file.save(dst)
-            return jsonify({"audio_id": stamped_name})
+            audio_id = f"upload:{stamped_name}"
+            return jsonify({"audio_id": audio_id, "audio_url": f"/api/context_audio/{audio_id}"})
+
+        @app.get("/api/context_audio/<path:audio_id>")
+        def context_audio(audio_id: str):
+            resolved = self._resolve_context_audio_path(audio_id)
+            if not resolved:
+                return jsonify({"error": "Context audio not found"}), 404
+            if not self._audio_file_is_usable(resolved):
+                return jsonify({"error": "Context audio exists but content is unavailable"}), 404
+            directory = os.path.dirname(resolved)
+            filename = os.path.basename(resolved)
+            return send_from_directory(directory, filename)
 
         @app.post("/api/save_pcm_clip")
         def save_pcm_clip():

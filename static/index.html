@@ -9,7 +9,7 @@
   <body>
     <main>
       <h1>EasyMagpie WebSocket Streaming Demo</h1>
-      <p class="hint">Frontend simulates dummy LLM text chunks and streams to backend.</p>
+      <!-- <p class="hint">Frontend simulates dummy LLM text chunks and streams to backend.</p> -->
 
       <h3>Inference knobs</h3>
       <div class="grid2">
@@ -33,20 +33,21 @@
         <label for="contextSelect">Context text
           <select id="contextSelect"></select>
         </label>
+        <label for="contextAudioSelect">Reference speaker audio
+          <select id="contextAudioSelect"></select>
+        </label>
         <label class="inlineRow">
           <input id="useContextAudio" type="checkbox" />
-          Use uploaded reference speaker audio
+          Use reference speaker audio
         </label>
       </div>
       <label for="contextAudioFile">Upload reference speaker audio</label>
-      <div class="controls">
-        <input id="contextAudioFile" type="file" accept=".wav,.mp3,.flac,.ogg,.m4a,.aac,audio/*" />
-        <button id="uploadAudioBtn" disabled>Upload Audio</button>
-      </div>
+      <input id="contextAudioFile" type="file" accept=".wav,.mp3,.flac,.ogg,.m4a,.aac,audio/*" />
       <pre id="contextStatus">No uploaded reference audio.</pre>
+      <audio id="contextAudioPreview" controls></audio>
 
       <label for="prompt">Prompt</label>
-      <textarea id="prompt" rows="4">Sure. This is a streaming speech synthesis demo where text arrives gradually, tokens are consumed incrementally, and generated codec frames are decoded in the background for low-latency playback.</textarea>
+      <textarea id="prompt" rows="4">This is a streaming speech synthesis demo where text arrives gradually, tokens are consumed incrementally, and generated codec frames are decoded in the background for low-latency playback. Generare a sentence about this demo that Jensen Huang will say.</textarea>
 
       <label for="tokensPerSecond">LLM text send rate (tokens/sec to TTS)</label>
       <input id="tokensPerSecond" type="number" min="1" step="1" value="25" />
