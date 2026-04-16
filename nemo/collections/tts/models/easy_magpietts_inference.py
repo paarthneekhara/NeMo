@@ -643,14 +643,18 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         audio_embedding = self.audio_in_projection(audio_embedding)
         return audio_embedding
 
-    def embed_text_tokens(self, text_tokens: torch.Tensor, text_lens: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def embed_text_tokens(self, text_tokens: torch.Tensor, text_lens: Optional[torch.Tensor] = None, is_multiturn: bool = False) -> torch.Tensor:
         """Embed text tokens using decoder embedding + optional CAS, or CAS-only when configured."""
         if text_lens is None:
             text_lens = torch.full(
                 (text_tokens.size(0),), text_tokens.size(1), dtype=torch.long, device=text_tokens.device
             )
 
-        text_mask = get_mask_from_lengths(text_lens)
+        if is_multiturn:
+            text_mask = (text_tokens != self.tokenizer.pad)
+        else:
+            text_mask = get_mask_from_lengths(text_lens)
+
         if self.disable_subword_embedding:
             return self.cas_encoder(text_tokens, subword_mask=text_mask)
 
@@ -1249,6 +1253,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 )
                 gt_phoneme_embeddings = self.embed_phoneme_tokens(gt_phoneme_stacked)  # (B, T', E)
 
+                if self.cfg.get("use_multiturn_dataset", False):
+                    phoneme_pad_id = getattr(self.phoneme_tokenizer, "pad", -1)
+                    phoneme_mask = (gt_phoneme_stacked[:, 0, :] != phoneme_pad_id)
+                    gt_phoneme_embeddings = gt_phoneme_embeddings * phoneme_mask.unsqueeze(2)
+
             # Process GT audio codes if provided (for teacher forcing)
             gt_audio_embeddings = None
             gt_audio_lens_state = None
@@ -1415,10 +1424,16 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             text_embedded = self.embed_text_tokens(
                 text_tokens_2d,
                 text_lens=torch.ones(batch_size, dtype=torch.long, device=device),
+                is_multiturn=self.cfg.get("use_multiturn_dataset", False),
             )  # (B, 1, E)
 
             if force_dropout_text:
                 text_embedded = text_embedded * 0
+
+            # Zero out padding tokens exactly like in process_batch
+            if self.cfg.get("use_multiturn_dataset", False):
+                is_pad = (text_tokens_2d == self.tokenizer.pad)
+                text_embedded[is_pad] = 0.0
 
             is_eos_token = (text_tokens == self.eos_id) & needs_text  # (B,) bool
             text_add_mask = needs_text.view(batch_size, 1, 1).float()
