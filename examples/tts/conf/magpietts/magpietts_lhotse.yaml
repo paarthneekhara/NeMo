@@ -45,6 +45,17 @@ model:
 
   text_context_remapping_json: null # JSON file defining mapping of multiple text contexts to a single text context. Does not need to cover all text contexts.
   text_context_remapping_prob: 0.0 # Probability of remapping the original text context to a remapped text context.
+  phoneme_as_text_prob: 0.0
+
+  pronunciation_control_g2p:
+    en:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      phoneme_dict: "scripts/tts_dataset_files/ipa_cmudict-0.7b_nv23.01.txt"
+      heteronyms: "scripts/tts_dataset_files/heteronyms-052722"
+      phoneme_probability: 0.8
+      ignore_ambiguous_words: false
+      use_chars: true
+      use_stresses: true
 
   text_tokenizers:
     english_phoneme:
