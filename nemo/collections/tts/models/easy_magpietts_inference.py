@@ -273,7 +273,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         self.num_all_tokens_per_codebook = self.codebook_size + len(SpecialAudioToken)
         self.use_bpe_char_tokenizer = cfg.get('use_bpe_char_tokenizer', False)
         self.disable_subword_embedding = cfg.get('disable_subword_embedding', False)
-        self.disable_lm_text_head = cfg.get('disable_lm_text_head', False)
+        self.disable_lm_text_head = cfg.get('disable_lm_text_head', True)
         if self.disable_subword_embedding and not self.use_bpe_char_tokenizer:
             logging.warning(
                 "`disable_subword_embedding=True` requires `use_bpe_char_tokenizer=True`; overriding automatically."
