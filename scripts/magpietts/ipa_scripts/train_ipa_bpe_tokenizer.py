@@ -61,8 +61,11 @@ OUTPUT_SUFFIX = "_with_ipa"  # cuts -> cuts_with_ipa
 SHARD_GLOB = "cuts.*.jsonl.gz"
 
 
-def get_ipa_dir(cuts_dir: Path) -> Path:
+def get_ipa_dir(cuts_dir: Path, cuts_dirs_are_ipa_dirs: bool = False) -> Path:
     """Convert a cuts directory path to its corresponding cuts_with_ipa path."""
+    if cuts_dirs_are_ipa_dirs:
+        return cuts_dir
+
     name = cuts_dir.name
     if name == "cuts":
         out_name = f"cuts{OUTPUT_SUFFIX}"
@@ -157,6 +160,7 @@ def collect_ipa_strings(
 def iter_ipa_strings_for_lang(
     lang: str,
     cuts_dirs: Dict[str, List[str]],
+    cuts_dirs_are_ipa_dirs: bool = False,
 ) -> Generator[str, None, None]:
     """Iterate over all IPA strings for a single language (memory-efficient)."""
     if lang not in cuts_dirs:
@@ -164,7 +168,7 @@ def iter_ipa_strings_for_lang(
     
     for cuts_dir_str in cuts_dirs[lang]:
         cuts_dir = Path(cuts_dir_str)
-        ipa_dir = get_ipa_dir(cuts_dir)
+        ipa_dir = get_ipa_dir(cuts_dir, cuts_dirs_are_ipa_dirs)
         
         if not ipa_dir.exists():
             continue
@@ -173,10 +177,15 @@ def iter_ipa_strings_for_lang(
             yield ipa
 
 
-def count_ipa_strings_for_lang(lang: str, cuts_dirs: Dict[str, List[str]], max_count: int = 100000) -> int:
+def count_ipa_strings_for_lang(
+    lang: str,
+    cuts_dirs: Dict[str, List[str]],
+    max_count: int = 100000,
+    cuts_dirs_are_ipa_dirs: bool = False,
+) -> int:
     """Count IPA strings for a language without loading into memory."""
     count = 0
-    for _ in iter_ipa_strings_for_lang(lang, cuts_dirs):
+    for _ in iter_ipa_strings_for_lang(lang, cuts_dirs, cuts_dirs_are_ipa_dirs):
         count += 1
         if count >= max_count:
             break
@@ -189,6 +198,7 @@ def simple_sample_ipa_strings(
     k: int,
     max_collect: int = 100000,
     seed: int = 42,
+    cuts_dirs_are_ipa_dirs: bool = False,
 ) -> List[str]:
     """
     Simple sampling: collect up to max_collect IPA strings, then randomly sample k.
@@ -208,7 +218,7 @@ def simple_sample_ipa_strings(
     rng = random.Random(seed)
     collected: List[str] = []
     
-    for ipa in iter_ipa_strings_for_lang(lang, cuts_dirs):
+    for ipa in iter_ipa_strings_for_lang(lang, cuts_dirs, cuts_dirs_are_ipa_dirs):
         collected.append(ipa)
         if len(collected) >= max_collect:
             break
@@ -239,6 +249,7 @@ def create_balanced_corpus(
     max_samples_per_lang: Optional[int] = None,
     max_count_per_lang: int = 100000,
     seed: int = 42,
+    cuts_dirs_are_ipa_dirs: bool = False,
 ) -> Tuple[str, Dict[str, int]]:
     """
     Create a balanced IPA corpus file with equal samples from each language.
@@ -267,7 +278,9 @@ def create_balanced_corpus(
             print(f"[WARN] Language {lang} not in config, skipping")
             continue
         print(f"[INFO] Counting {lang}...", end=" ", flush=True)
-        count = count_ipa_strings_for_lang(lang, cuts_dirs, max_count_per_lang)
+        count = count_ipa_strings_for_lang(
+            lang, cuts_dirs, max_count_per_lang, cuts_dirs_are_ipa_dirs
+        )
         lang_counts[lang] = count
         print(f"{count} IPA strings")
     
@@ -294,7 +307,14 @@ def create_balanced_corpus(
             print(f"[INFO] Sampling from {lang}...", end=" ", flush=True)
             # Use different seed per language for variety, but reproducible
             lang_seed = seed + hash(lang) % 10000
-            sampled = simple_sample_ipa_strings(lang, cuts_dirs, samples_per_lang, max_count_per_lang, lang_seed)
+            sampled = simple_sample_ipa_strings(
+                lang,
+                cuts_dirs,
+                samples_per_lang,
+                max_count_per_lang,
+                lang_seed,
+                cuts_dirs_are_ipa_dirs,
+            )
             
             for ipa in sampled:
                 f.write(ipa + "\n")
@@ -361,6 +381,7 @@ def train_bpe_tokenizer(
         vocab_size=vocab_size,
         min_frequency=min_frequency,
         special_tokens=special_tokens,
+        initial_alphabet=ByteLevel.alphabet(),
         show_progress=True,
     )
     
@@ -439,6 +460,11 @@ def main():
         default=100000,
         help="Max count per language when counting IPA strings (default: 100000)",
     )
+    parser.add_argument(
+        "--cuts_dirs_are_ipa_dirs",
+        action="store_true",
+        help="Treat config paths as the exact IPA cuts directories instead of deriving *_with_ipa siblings",
+    )
     args = parser.parse_args()
     
     # Load config
@@ -484,6 +510,7 @@ def main():
             max_samples_per_lang=args.max_samples_per_lang,
             max_count_per_lang=args.max_count_per_lang,
             seed=args.seed,
+            cuts_dirs_are_ipa_dirs=args.cuts_dirs_are_ipa_dirs,
         )
     
     # Step 2: Train tokenizer

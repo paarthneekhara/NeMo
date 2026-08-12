@@ -1,0 +1,88 @@
+{
+    "ar-AE": [
+        "/eos_data/tts_lhotse_datasets/ar-AE/kingAsr109/train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/ar-AE/kingAsr109/train/cuts_diacritics_by_catt_with_ipaNG_Aligned"
+    ],
+    "ar-MSA": [
+        "/eos_data/tts_lhotse_datasets/ar-MSA/nvyt2605/cuts_with_ipaNG_Aligned"
+    ],
+    "ar-SA": [
+        "/eos_data/tts_lhotse_datasets/ar-SA/ClArTTS/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/ar-SA/kingAsr318/train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/ar-SA/nvyt2605/cuts_with_ipaNG_Aligned"
+    ],
+    "ar-SY": [
+        "/eos_data/tts_lhotse_datasets/ar-SY/arabicSpeechCorpus/cuts_with_ipaNG_Aligned"
+    ],
+    "de": [
+        "/eos_data/tts_lhotse_datasets/de/cmltts_de_train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/de/kingAsr182/cuts_with_ipaNG_Aligned"
+    ],
+    "en": [
+        "/eos_data/tts_lhotse_datasets/en/davidAI_v2602/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/Emilia-YODAS/lhotse_shar_shuffle_shardSize256/cuts_without_numbers_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/GLOBE_V2/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/hifitts/lhotse_shar_shuffle_shardSize256/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/hifitts2/lhotse_shar_shuffle_shardSize256/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/jhsdGtc20Amp20Keynote/lhotse_shar_shuffle_shardSize256/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/jhsdGtc20Amp20Keynote/lhotse_shar_shuffle_shardSize256/cuts_textContext_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/libritts/lhotse_shar_shuffle_shardSize256/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/rivaEmmaMeganSeanTom/lhotse_shar_shuffle_shardSize256/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/rivaEmmaMeganSeanTom/lhotse_shar_shuffle_shardSize256/cuts_textContext_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/rivaLindyRodney/lhotse_shar_shuffle_shardSize256/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/en/rivaLindyRodney/lhotse_shar_shuffle_shardSize256/cuts_textContext_with_ipaNG_Aligned"
+    ],
+    "es": [
+        "/eos_data/tts_lhotse_datasets/es/cmltts_es_train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/es/ESP_ASR003/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/es/riva_ES_RubbyCarlos/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/es/riva_ES_RubbyCarlos/cuts_textContext_with_ipaNG_Aligned"
+    ],
+    "fr": [
+        "/eos_data/tts_lhotse_datasets/fr/cmltts_fr_train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/fr/riva_FR_VirginieSamy/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/fr/riva_FR_VirginieSamy/cuts_textContext_with_ipaNG_Aligned"
+    ],
+    "hi": [
+        "/eos_data/tts_lhotse_datasets/hi/ai4bharat/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/hi/mucs2021_hi_en/train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/hi/nvyt2605/cuts_with_ipaNG_Aligned"
+    ],
+    "it": [
+        "/eos_data/tts_lhotse_datasets/it/cmltts_it_train/cuts_with_ipaNG_Aligned"
+    ],
+    "ja": [
+        "/eos_data/tts_lhotse_datasets/ja/ja_anime_speech/lhotse_shar/train/cuts",
+        "/eos_data/tts_lhotse_datasets/ja/common_voice_ja/lhotse_shar/train/cuts",
+        "/eos_data/tts_lhotse_datasets/ja/Emilia-YODAS_ja/lhotse_shar/cuts",
+        "/eos_data/tts_lhotse_datasets/ja/Emilia-YODAS_ja_en/cuts",
+        "/eos_data/tts_lhotse_datasets/ja/kingAsr444/lhotse_shar/cuts"
+    ],
+    "ko-KR": [
+        "/eos_data/tts_lhotse_datasets/ko-KR/emiliaYodas/cuts_with_ipaNG_Aligned"
+    ],
+    "pt-BR": [
+        "/eos_data/tts_lhotse_datasets/pt-BR/cmltts_pt_train/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/pt-BR/pt-br_char/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/pt-BR/tts_portuguese_corpus/cuts_with_ipaNG_Aligned"
+    ],
+    "vi": [
+        "/eos_data/tts_lhotse_datasets/vi/femalePhung/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/vi/femalePhung/cut_contextText_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/vi/infore1/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/vi/maleLong/cuts_with_ipaNG_Aligned",
+        "/eos_data/tts_lhotse_datasets/vi/maleLong/cut_ipa_contextText",
+        "/eos_data/tts_lhotse_datasets/vi/nvyt_vi/nvyt_yt12k/cuts_with_ipa",
+        "/eos_data/tts_lhotse_datasets/vi/nvyt_vi/nvyt_yt2025/cuts_with_ipaNG_Aligned"
+    ],
+    "zh": [
+        "/eos_data/tts_lhotse_datasets/zh/AISHELL3/cuts_with_ipaNG",
+        "/eos_data/tts_lhotse_datasets/zh/emiliaYodas/cuts_with_ipaNG",
+        "/eos_data/tts_lhotse_datasets/zh/nvyt2605/lhotse_shar/cuts_with_ipaNG",
+        "/eos_data/tts_lhotse_datasets/zh/riva_ZH_SiweiHouZhen/cuts_with_ipaNG",
+        "/eos_data/tts_lhotse_datasets/zh/riva_ZH_SiweiHouZhen/cuts_textContext_with_ipaNG"
+    ],
+    "crosslingual": [
+        "/eos_data/tts_lhotse_datasets/crosslingual/context_dataset/cuts_with_ipaNG"
+    ]
+}

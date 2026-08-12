@@ -17,6 +17,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "ipa_manifest_config.json"
 ESPEAK_VOICE_BY_LANG: Dict[str, str] = {
     "de": "de",
     "en": "en",
+    "en-US": "en-us",
     "es": "es",
     "fr": "fr",
     "hi": "hi",
