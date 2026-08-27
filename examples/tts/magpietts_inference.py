@@ -204,6 +204,7 @@ def run_inference_and_evaluation(
             "audio_dir": meta["audio_dir"],
             "language": language,
             "tokenizer_names": tokenizer_names,
+            "ignore_manifest_language": args.ignore_manifest_language,
         }
 
         # Setup output directories
