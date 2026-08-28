@@ -1233,6 +1233,8 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     # Common inference parameters
     infer_group = parser.add_argument_group('Common Inference Parameters')
     infer_group.add_argument('--batch_size', type=int, default=32)
+    infer_group.add_argument('--context_duration_min', type=float, default=None)
+    infer_group.add_argument('--context_duration_max', type=float, default=None)
     infer_group.add_argument('--use_cfg', action='store_true', help='Enable classifier-free guidance')
     infer_group.add_argument('--use_local_transformer', action='store_true')
 

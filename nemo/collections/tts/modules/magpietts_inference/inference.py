@@ -296,10 +296,10 @@ class BaseInferenceRunner(abc.ABC):
             context_duration_min = self.model.cfg.get('context_duration_min', 5.0)
         if context_duration_max is None:
             context_duration_max = self.model.cfg.get('context_duration_max', 5.0)
-        # For multi-encoder models, use fixed 5s context for fair evaluation
-        if context_duration_min < 5.0 and context_duration_max > 5.0:
-            context_duration_min = 5.0
-            context_duration_max = 5.0
+        # # For multi-encoder models, use fixed 5s context for fair evaluation
+        # if context_duration_min < 5.0 and context_duration_max > 5.0:
+        #     context_duration_min = 5.0
+        #     context_duration_max = 5.0
         return context_duration_min, context_duration_max
 
     @staticmethod

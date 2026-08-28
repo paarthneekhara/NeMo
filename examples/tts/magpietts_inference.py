@@ -116,6 +116,8 @@ def run_inference_and_evaluation(
     clean_up_disk: bool = False,
     skip_evaluation: bool = False,
     ignore_manifest_language: bool = False,
+    context_duration_min: Optional[float] = None,
+    context_duration_max: Optional[float] = None,
 ) -> Tuple[Optional[float], Optional[float]]:
     """Run inference and optional evaluation on specified datasets.
 
@@ -138,6 +140,8 @@ def run_inference_and_evaluation(
         clean_up_disk: Whether to clean up output directory after completion.
         skip_evaluation: Whether to skip evaluation (inference only mode).
         ignore_manifest_language: Whether dataset-level language should override manifest records.
+        context_duration_min: Minimum context duration override, or None to use the model config.
+        context_duration_max: Maximum context duration override, or None to use the model config.
 
     Returns:
         Tuple of (mean CER across datasets, mean SSIM across datasets).
@@ -232,7 +236,11 @@ def run_inference_and_evaluation(
             os.makedirs(repeat_audio_dir, exist_ok=True)
 
             # Create dataset and run inference
-            test_dataset = runner.create_dataset({dataset: dataset_meta_for_dl})
+            test_dataset = runner.create_dataset(
+                {dataset: dataset_meta_for_dl},
+                context_duration_min=context_duration_min,
+                context_duration_max=context_duration_max,
+            )
 
             if len(test_dataset) != len(manifest_records):
                 raise ValueError(
@@ -525,6 +533,8 @@ def main(argv=None):
                 clean_up_disk=args.clean_up_disk,
                 skip_evaluation=not args.run_evaluation,
                 ignore_manifest_language=args.ignore_manifest_language,
+                context_duration_min=args.context_duration_min,
+                context_duration_max=args.context_duration_max,
             )
 
     else:  # nemo mode
@@ -564,6 +574,8 @@ def main(argv=None):
                 clean_up_disk=args.clean_up_disk,
                 skip_evaluation=not args.run_evaluation,
                 ignore_manifest_language=args.ignore_manifest_language,
+                context_duration_min=args.context_duration_min,
+                context_duration_max=args.context_duration_max,
             )
 
     # Check quality targets
