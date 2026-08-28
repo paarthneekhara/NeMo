@@ -448,8 +448,6 @@ class MagpieTTSDataset(TextToSpeechDataset):
         data = self.data_samples[index]
 
         def _sample_context_duration_with_available_limit(available_duration_sec: float) -> float:
-            if self.dataset_type == 'test':
-                return min(available_duration_sec, self.context_duration_max)
             effective_duration_max = min(self.context_duration_max, available_duration_sec)
             effective_duration_max = max(self.context_duration_min, effective_duration_max)
             return random.uniform(self.context_duration_min, effective_duration_max)
