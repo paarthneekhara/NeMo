@@ -33,4 +33,5 @@ MetricsRegistry: list[MetricSpec] = [
 DistributionMetricsRegistry: list[DistributionMetricSpec] = [
     DistributionMetricSpec("cer", "CER", True, True, (0.0, 0.3)),
     DistributionMetricSpec("utmosv2", "UTMOS v2", False),
+    DistributionMetricSpec("pred_context_ssim", "SSIM (pred vs context)", False, optional=True),
 ]
