@@ -510,7 +510,10 @@ class BucketData:
             items = self.benchmarks[name].filewise_metrics
             if items is None or not items:
                 raise ValueError(f"Filewise metrics not loaded for benchmark: '{name}'.")
-            if not any(metric_name in item for item in items):
+            values = [item[metric_name] for item in items if metric_name in item]
+            if not values:
+                return False
+            if all(isinstance(value, (int, float)) and math.isnan(value) for value in values):
                 return False
 
         return True
