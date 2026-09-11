@@ -106,14 +106,14 @@ def run_stat_tests(
     results = []
 
     for metric in DistributionMetricsRegistry:
-        try:
-            baseline = bucket_baseline.get_metric_samples(metric.key, benchmark_name)
-            candidate = bucket_candidate.get_metric_samples(metric.key, benchmark_name)
-        except ValueError as error:
-            missing_metric = str(error).startswith(("Unknown or empty metric", "Unknown or empty aggregated metric"))
-            if metric.optional and missing_metric:
+        if metric.optional:
+            baseline_has_metric = bucket_baseline.has_metric_samples(metric.key, benchmark_name)
+            candidate_has_metric = bucket_candidate.has_metric_samples(metric.key, benchmark_name)
+            if not baseline_has_metric or not candidate_has_metric:
                 continue
-            raise
+
+        baseline = bucket_baseline.get_metric_samples(metric.key, benchmark_name)
+        candidate = bucket_candidate.get_metric_samples(metric.key, benchmark_name)
         winner, alternative, p_value = _run_single_stat_test(
             baseline=baseline,
             candidate=candidate,
