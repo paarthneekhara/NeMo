@@ -195,6 +195,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         phoneme_tokenizer_config: DictConfig = None,
         ignore_phoneme_languages: List[str] = None,
         enable_phoneme_text_input: bool = False,
+        enable_unified_text_phoneme_input: bool = False,
         text_phoneme_token_offset: int = None,
         partial_phoneme_text_prob: float = 0.0,
         partial_phoneme_portion_min: float = 0.25,
@@ -228,6 +229,11 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.phoneme_tokenizer_config = phoneme_tokenizer_config
         self.ignore_phoneme_languages = ignore_phoneme_languages or []
         self.enable_phoneme_text_input = enable_phoneme_text_input
+        self.enable_unified_text_phoneme_input = enable_unified_text_phoneme_input
+        if self.enable_phoneme_text_input and self.enable_unified_text_phoneme_input:
+            raise ValueError(
+                "`enable_phoneme_text_input` and `enable_unified_text_phoneme_input` are mutually exclusive."
+            )
         self.text_phoneme_token_offset = text_phoneme_token_offset
         self.partial_phoneme_text_prob = partial_phoneme_text_prob
         self.partial_phoneme_portion_min = partial_phoneme_portion_min
@@ -488,14 +494,17 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             text_for_tokens = text_str
             if (
                 self.dataset_type == 'train'
-                and self.enable_phoneme_text_input
+                and (self.enable_phoneme_text_input or self.enable_unified_text_phoneme_input)
                 and self.partial_phoneme_text_prob > 0.0
                 and language not in self.ignore_phoneme_languages
                 and cut.supervisions[0].has_custom("ipa_alignment")
-                and not has_phoneme_text_spans(
-                    text_str,
-                    bop_marker=self.phoneme_text_bop_marker,
-                    eop_marker=self.phoneme_text_eop_marker,
+                and (
+                    self.enable_unified_text_phoneme_input
+                    or not has_phoneme_text_spans(
+                        text_str,
+                        bop_marker=self.phoneme_text_bop_marker,
+                        eop_marker=self.phoneme_text_eop_marker,
+                    )
                 )
                 and random.random() < self.partial_phoneme_text_prob
             ):
@@ -509,8 +518,8 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                     ipa_alignment=cut.supervisions[0].ipa_alignment,
                     partial_phoneme_portion=sampled_portion,
                     full_ipa_text=(cut.supervisions[0].ipa if cut.supervisions[0].has_custom("ipa") else None),
-                    bop_marker=self.phoneme_text_bop_marker,
-                    eop_marker=self.phoneme_text_eop_marker,
+                    bop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_bop_marker,
+                    eop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_eop_marker,
                 )
             if cut.has_custom("tokenizer_names"):
                 # Pick a random tokenizer from the list of tokenizers

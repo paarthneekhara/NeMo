@@ -59,8 +59,13 @@ class _FakeIPATokenizer:
 class _FakeTextTokenizer:
     tokens = list(range(100))
     pad = 0
+    tokenizer_pad_ids = {BPE_TOKENIZER_NAME: 0}
+
+    def __init__(self):
+        self.encoded_texts = []
 
     def encode(self, text, tokenizer_name):
+        self.encoded_texts.append(text)
         return [10 + len(text)]
 
 
@@ -307,6 +312,76 @@ class TestMagpieTTSLhotseDatasets:
         ]
         assert torch.all(source_tokens < dataset.text_phoneme_token_offset)
         assert target_tokens[25].item() == dataset.interruption_token_id
+
+    def test_multiturn_unified_phoneme_input_uses_text_tokenizer_without_markers(self):
+        _seed_everything()
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "codec_model_input_sample_rate": CODEC_MODEL_INPUT_SAMPLE_RATE,
+                "frame_stacking_factor": FRAME_STACKING_FACTOR,
+                "source_sample_rate": SAMPLE_RATE,
+                "input_roles": ["user"],
+                "output_roles": ["assistant"],
+                "add_text_bos": False,
+                "use_text_conditioning_tokenizer": False,
+                "enable_unified_text_phoneme_input": True,
+                "partial_phoneme_text_prob": 1.0,
+                "partial_phoneme_portion_min": 1.0,
+                "partial_phoneme_portion_max": 1.0,
+            }
+        )
+        dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.cfg_unk_token_id = dataset.bos_id + 2
+        dataset.interruption_token_id = dataset.bos_id + 3
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        dataset[_multiturn_cutset()]
+
+        assert dataset.phoneme_tokenizer is None
+        assert "həloʊ" in dataset.text_tokenizer.encoded_texts
+        assert "hi" in dataset.text_tokenizer.encoded_texts
+        assert all("<bop>" not in text and "<eop>" not in text for text in dataset.text_tokenizer.encoded_texts)
+
+    def test_single_turn_unified_phoneme_input_uses_text_tokenizer_without_markers(self):
+        _seed_everything()
+        cuts = _single_turn_cutset()
+        next(iter(cuts)).supervisions[0].custom.update({"ipa": "həloʊ", "ipa_alignment": [[0, 5, "hello", "həloʊ"]]})
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "enable_unified_text_phoneme_input": True,
+                "partial_phoneme_text_prob": 1.0,
+                "partial_phoneme_portion_min": 1.0,
+                "partial_phoneme_portion_max": 1.0,
+            }
+        )
+        dataset = MagpieTTSLhotseDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.text_phoneme_token_offset = dataset.eos_id + 2
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        dataset[cuts]
+
+        assert dataset.phoneme_tokenizer is None
+        assert "həloʊ" in dataset.text_tokenizer.encoded_texts
+        assert all("<bop>" not in text and "<eop>" not in text for text in dataset.text_tokenizer.encoded_texts)
+
+    def test_unified_and_shifted_phoneme_inputs_are_mutually_exclusive(self):
+        kwargs = _multiturn_dataset_kwargs()
+        kwargs.update(
+            {
+                "enable_phoneme_text_input": True,
+                "enable_unified_text_phoneme_input": True,
+            }
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            MagpieTTSLhotseMultiturnDataset(**kwargs)
 
     def test_multiturn_dataset_uses_bpe_and_cached_codes(self):
         _seed_everything()

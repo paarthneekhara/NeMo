@@ -157,6 +157,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         phoneme_tokenizer_config: DictConfig = None,
         ignore_phoneme_languages: List[str] = None,
         enable_phoneme_text_input: bool = False,
+        enable_unified_text_phoneme_input: bool = False,
         text_phoneme_token_offset: int = None,
         partial_phoneme_text_prob: float = 0.0,
         partial_phoneme_portion_min: float = 0.25,
@@ -200,6 +201,11 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         self.phoneme_tokenizer_config = phoneme_tokenizer_config
         self.ignore_phoneme_languages = ignore_phoneme_languages or []
         self.enable_phoneme_text_input = enable_phoneme_text_input
+        self.enable_unified_text_phoneme_input = enable_unified_text_phoneme_input
+        if self.enable_phoneme_text_input and self.enable_unified_text_phoneme_input:
+            raise ValueError(
+                "`enable_phoneme_text_input` and `enable_unified_text_phoneme_input` are mutually exclusive."
+            )
         self.text_phoneme_token_offset = text_phoneme_token_offset
         self.partial_phoneme_text_prob = partial_phoneme_text_prob
         self.partial_phoneme_portion_min = partial_phoneme_portion_min
@@ -399,6 +405,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             interruption_token_id=self.interruption_token_id,
             phoneme_tokenizer=self.phoneme_tokenizer,
             enable_phoneme_text_input=self.enable_phoneme_text_input,
+            enable_unified_text_phoneme_input=self.enable_unified_text_phoneme_input,
             text_phoneme_token_offset=self.text_phoneme_token_offset,
             partial_phoneme_text_prob=self.partial_phoneme_text_prob,
             partial_phoneme_portion_min=self.partial_phoneme_portion_min,
@@ -928,6 +935,7 @@ def collate_token_channel(
     interruption_token_id: int = None,
     phoneme_tokenizer=None,
     enable_phoneme_text_input: bool = False,
+    enable_unified_text_phoneme_input: bool = False,
     text_phoneme_token_offset: int = None,
     partial_phoneme_text_prob: float = 0.0,
     partial_phoneme_portion_min: float = 0.25,
@@ -956,6 +964,7 @@ def collate_token_channel(
                 tok_name,
                 phoneme_tokenizer,
                 enable_phoneme_text_input,
+                enable_unified_text_phoneme_input,
                 text_phoneme_token_offset,
                 partial_phoneme_text_prob,
                 partial_phoneme_portion_min,
@@ -1011,6 +1020,7 @@ def build_token_channel(
     tokenizer_name: str = "english_phoneme",
     phoneme_tokenizer=None,
     enable_phoneme_text_input: bool = False,
+    enable_unified_text_phoneme_input: bool = False,
     text_phoneme_token_offset: int = None,
     partial_phoneme_text_prob: float = 0.0,
     partial_phoneme_portion_min: float = 0.25,
@@ -1033,15 +1043,18 @@ def build_token_channel(
             language = cut.lang if cut.has_custom("lang") else supervision.language
             if (
                 apply_partial_phoneme_text
-                and enable_phoneme_text_input
+                and (enable_phoneme_text_input or enable_unified_text_phoneme_input)
                 and partial_phoneme_text_prob > 0.0
                 and language not in (ignore_phoneme_languages or [])
                 and not supervision.has_custom("challenging_text_replaced")
                 and supervision.has_custom("ipa_alignment")
-                and not has_phoneme_text_spans(
-                    text,
-                    bop_marker=phoneme_text_bop_marker,
-                    eop_marker=phoneme_text_eop_marker,
+                and (
+                    enable_unified_text_phoneme_input
+                    or not has_phoneme_text_spans(
+                        text,
+                        bop_marker=phoneme_text_bop_marker,
+                        eop_marker=phoneme_text_eop_marker,
+                    )
                 )
                 and random.random() < partial_phoneme_text_prob
             ):
@@ -1055,8 +1068,8 @@ def build_token_channel(
                     ipa_alignment=supervision.ipa_alignment,
                     partial_phoneme_portion=sampled_portion,
                     full_ipa_text=_get_supervision_ipa_text(supervision),
-                    bop_marker=phoneme_text_bop_marker,
-                    eop_marker=phoneme_text_eop_marker,
+                    bop_marker="" if enable_unified_text_phoneme_input else phoneme_text_bop_marker,
+                    eop_marker="" if enable_unified_text_phoneme_input else phoneme_text_eop_marker,
                 )
             raw_ids = tokenize_text_with_phoneme_spans(
                 text_tokenizer=tokenizer,

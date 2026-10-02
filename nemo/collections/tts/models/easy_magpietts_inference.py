@@ -380,6 +380,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             self.phoneme_confidence_unk_threshold = cfg.get('phoneme_confidence_unk_threshold', 0.0)
 
         self.enable_phoneme_text_input = cfg.get('enable_phoneme_text_input', False)
+        self.enable_unified_text_phoneme_input = cfg.get('enable_unified_text_phoneme_input', False)
+        if self.enable_phoneme_text_input and self.enable_unified_text_phoneme_input:
+            raise ValueError(
+                "`enable_phoneme_text_input` and `enable_unified_text_phoneme_input` are mutually exclusive."
+            )
         self.partial_phoneme_text_prob = cfg.get('partial_phoneme_text_prob', 0.0)
         self.partial_phoneme_portion_min = cfg.get('partial_phoneme_portion_min', 0.25)
         self.partial_phoneme_portion_max = cfg.get('partial_phoneme_portion_max', 0.75)
