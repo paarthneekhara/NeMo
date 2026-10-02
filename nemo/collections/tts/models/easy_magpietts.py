@@ -123,6 +123,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.phoneme_loss_weight = cfg.get('phoneme_loss_weight', 1.0)
         self.parallel_codebook_loss_scale = cfg.get('parallel_codebook_loss_scale', 1.0)
         self.local_transformer_loss_scale = cfg.get('local_transformer_loss_scale', 1.0)
+        self.debug_text_gradient_interval = int(cfg.get('debug_text_gradient_interval', 0) or 0)
+        self.debug_text_batch_max_batches = int(cfg.get('debug_text_batch_max_batches', 0) or 0)
+        self._debug_text_batches_logged = 0
 
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
 
@@ -1279,6 +1282,39 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             selected_training_mode=selected_training_mode.name if selected_training_mode is not None else None,
         )
 
+    def on_after_backward(self) -> None:
+        super().on_after_backward()
+        if self.debug_text_gradient_interval <= 0 or self.global_rank != 0:
+            return
+        step = int(self.global_step)
+        if step >= 3 and (step + 1) % self.debug_text_gradient_interval != 0:
+            return
+
+        modules = {}
+        if hasattr(self, "cas_encoder"):
+            modules["cas_encoder"] = self.cas_encoder
+        if self.text_embedding is not None:
+            modules["text_embedding"] = self.text_embedding
+        for module_name, module in modules.items():
+            params_with_grad = 0
+            squared_grad_norm = 0.0
+            max_abs_grad = 0.0
+            for parameter in module.parameters():
+                if parameter.grad is None:
+                    continue
+                grad = parameter.grad.detach().float()
+                params_with_grad += parameter.numel()
+                squared_grad_norm += grad.norm().item() ** 2
+                max_abs_grad = max(max_abs_grad, grad.abs().max().item())
+            logging.info(
+                "[text_gradient_debug] step=%d module=%s params_with_grad=%d grad_norm=%.6g max_abs_grad=%.6g",
+                step,
+                module_name,
+                params_with_grad,
+                squared_grad_norm**0.5,
+                max_abs_grad,
+            )
+
     def training_step(self, batch, batch_idx):
         if 'context_audio_codes' in batch:
             context_audio_codes = batch['context_audio_codes']
@@ -1297,6 +1333,28 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             audio = batch['audio']
             audio_lens = batch['audio_lens']
             audio_codes, audio_codes_lens = self._codec_helper.audio_to_codes(audio, audio_lens)
+
+        if (
+            self.global_rank == 0
+            and self.debug_text_batch_max_batches > 0
+            and self._debug_text_batches_logged < self.debug_text_batch_max_batches
+        ):
+            logging.info(
+                "[text_batch_debug] batch_idx=%d text_shape=%s text_lens=%s audio_code_lens=%s "
+                "context_text_lens=%s context_audio_code_lens=%s languages=%s tasks=%s "
+                "has_text_context=%s phoneme_channel_present=%s",
+                batch_idx,
+                tuple(batch["text"].shape),
+                batch["text_lens"][:8].tolist(),
+                audio_codes_lens[:8].tolist(),
+                batch["context_text_tokens_lens"][:8].tolist(),
+                context_audio_codes_lens[:8].tolist(),
+                batch.get("languages", [])[:8],
+                batch.get("task", [])[:8],
+                batch.get("has_text_context", torch.tensor([]))[:8].tolist(),
+                batch.get("phoneme_tokens") is not None,
+            )
+            self._debug_text_batches_logged += 1
 
         if (
             self.cfg.get("use_multiturn_dataset", False)
@@ -2003,6 +2061,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 context_audio_shuffle_batch_prob=dataset_cfg.dataset.get(
                     "context_audio_shuffle_batch_prob", 0.0
                 ),
+                unified_text_debug_max_samples=self.cfg.get("unified_text_debug_max_samples", 0),
+                unified_text_debug_frame_rate=self.cfg.get("unified_text_debug_frame_rate", 12.5),
             )
             dataset = FallbackDataset(dataset)
         else:
@@ -2032,6 +2092,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_text_bop_marker=self.phoneme_text_bop_marker,
                 phoneme_text_eop_marker=self.phoneme_text_eop_marker,
                 add_language_to_context_text=self.add_language_to_context_text,
+                unified_text_debug_max_samples=self.cfg.get("unified_text_debug_max_samples", 0),
+                unified_text_debug_frame_rate=self.cfg.get("unified_text_debug_frame_rate", 12.5),
             )
 
         data_loader = get_lhotse_dataloader_from_config(
