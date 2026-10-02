@@ -68,9 +68,6 @@ class _FakeTextTokenizer:
         self.encoded_texts.append(text)
         return [10 + len(text)]
 
-    def decode(self, tokens, tokenizer_name):
-        return f"decoded:{tokenizer_name}:{tokens}"
-
 
 def _seed_everything():
     random.seed(42)
@@ -293,7 +290,6 @@ class TestMagpieTTSLhotseDatasets:
                 "partial_phoneme_text_prob": 1.0,
                 "partial_phoneme_portion_min": 1.0,
                 "partial_phoneme_portion_max": 1.0,
-                "unified_text_debug_max_samples": 1,
             }
         )
         dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
@@ -333,7 +329,6 @@ class TestMagpieTTSLhotseDatasets:
                 "partial_phoneme_text_prob": 1.0,
                 "partial_phoneme_portion_min": 1.0,
                 "partial_phoneme_portion_max": 1.0,
-                "unified_text_debug_max_samples": 1,
             }
         )
         dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)

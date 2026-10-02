@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import random
 import re
 from typing import Dict, List, Union
@@ -176,8 +175,6 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         challenging_texts_path: str = None,
         challenging_text_replacement_prob: float = 0.0,
         context_audio_shuffle_batch_prob: float = 0.0,
-        unified_text_debug_max_samples: int = 0,
-        unified_text_debug_frame_rate: float = 12.5,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -224,9 +221,6 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         self.phoneme_turn_dropout_batch_prob = phoneme_turn_dropout_batch_prob
         self.phoneme_turn_dropout_turn_prob = phoneme_turn_dropout_turn_prob
         self.phoneme_turn_max_words_to_drop = phoneme_turn_max_words_to_drop
-        self.unified_text_debug_max_samples = unified_text_debug_max_samples
-        self.unified_text_debug_frame_rate = unified_text_debug_frame_rate
-        self._unified_text_debug_samples_logged = 0
         if not 0.0 <= context_audio_shuffle_batch_prob <= 1.0:
             raise ValueError("context_audio_shuffle_batch_prob must be between 0 and 1.")
         self.context_audio_shuffle_batch_prob = context_audio_shuffle_batch_prob
@@ -420,7 +414,6 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             phoneme_text_eop_marker=self.phoneme_text_eop_marker,
             ignore_phoneme_languages=self.ignore_phoneme_languages,
             apply_partial_phoneme_text=self.dataset_type == 'train',
-            debug_log_fn=self._maybe_log_unified_text_sample,
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts,
@@ -441,56 +434,6 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
         }
-
-    def _maybe_log_unified_text_sample(
-        self,
-        *,
-        cut: Cut,
-        supervision,
-        language: str,
-        tokenizer_name: str,
-        original_text: str,
-        rendered_text: str,
-        token_ids: list[int],
-    ) -> None:
-        if (
-            not self.enable_unified_text_phoneme_input
-            or self.unified_text_debug_max_samples <= 0
-            or self._unified_text_debug_samples_logged >= self.unified_text_debug_max_samples
-        ):
-            return
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None and worker_info.id != 0:
-            return
-        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-        if rank != 0:
-            return
-
-        duration = float(supervision.duration)
-        token_count_with_eos = len(token_ids) + 1
-        token_rate = token_count_with_eos / duration
-        available_slots = max(1, round(duration * self.unified_text_debug_frame_rate))
-        decoded = self.text_tokenizer.decode(token_ids, tokenizer_name=tokenizer_name)
-        logging.info(
-            "[unified_text_debug] cut_id=%s supervision_id=%s role=%s language=%s tokenizer=%s "
-            "duration=%.3f tokens_with_eos=%d token_rate=%.3f available_slots=%d overflow=%s "
-            "original=%r rendered=%r decoded=%r token_ids=%s",
-            cut.id,
-            supervision.id,
-            supervision.speaker,
-            language,
-            tokenizer_name,
-            duration,
-            token_count_with_eos,
-            token_rate,
-            available_slots,
-            token_count_with_eos > available_slots,
-            original_text,
-            rendered_text,
-            decoded,
-            token_ids[:64],
-        )
-        self._unified_text_debug_samples_logged += 1
 
     def _collate_phoneme_tokens(self, cuts: CutSet) -> Dict[str, Union[torch.Tensor, None]]:
         if self.phoneme_tokenizer is not None:
@@ -1001,7 +944,6 @@ def collate_token_channel(
     phoneme_text_eop_marker: str = "<eop>",
     ignore_phoneme_languages: list[str] = None,
     apply_partial_phoneme_text: bool = False,
-    debug_log_fn=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build and collate token channels aligned to the audio frame grid."""
     tokens = []
@@ -1031,7 +973,6 @@ def collate_token_channel(
                 phoneme_text_eop_marker,
                 ignore_phoneme_languages,
                 apply_partial_phoneme_text,
-                debug_log_fn,
             )
         )
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -1088,7 +1029,6 @@ def build_token_channel(
     phoneme_text_eop_marker: str = "<eop>",
     ignore_phoneme_languages: list[str] = None,
     apply_partial_phoneme_text: bool = False,
-    debug_log_fn=None,
 ) -> torch.Tensor:
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
@@ -1141,16 +1081,6 @@ def build_token_channel(
                 bop_marker=phoneme_text_bop_marker,
                 eop_marker=phoneme_text_eop_marker,
             )
-            if debug_log_fn is not None:
-                debug_log_fn(
-                    cut=cut,
-                    supervision=supervision,
-                    language=language,
-                    tokenizer_name=tokenizer_name,
-                    original_text=text,
-                    rendered_text=text_for_tokens,
-                    token_ids=raw_ids,
-                )
 
             if add_text_bos:
                 text_ids = torch.as_tensor([bos_id] + raw_ids + [eos_id])

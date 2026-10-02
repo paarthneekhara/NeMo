@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import random
 import re
 from typing import Dict, List, Union
@@ -204,8 +203,6 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         phoneme_text_bop_marker: str = "<bop>",
         phoneme_text_eop_marker: str = "<eop>",
         add_language_to_context_text: bool = False,
-        unified_text_debug_max_samples: int = 0,
-        unified_text_debug_frame_rate: float = 12.5,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -244,61 +241,11 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.phoneme_text_bop_marker = phoneme_text_bop_marker
         self.phoneme_text_eop_marker = phoneme_text_eop_marker
         self.add_language_to_context_text = add_language_to_context_text
-        self.unified_text_debug_max_samples = unified_text_debug_max_samples
-        self.unified_text_debug_frame_rate = unified_text_debug_frame_rate
-        self._unified_text_debug_samples_logged = 0
 
     def get_num_audio_samples_to_slice(self, duration, sample_rate):
         num_codec_frames = int(duration * sample_rate / self.codec_model_samples_per_frame)
         num_audio_samples = num_codec_frames * self.codec_model_samples_per_frame
         return num_audio_samples
-
-    def _maybe_log_unified_text_sample(
-        self,
-        *,
-        cut,
-        language: str,
-        tokenizer_name: str,
-        original_text: str,
-        rendered_text: str,
-        token_ids: list[int],
-    ) -> None:
-        if (
-            not self.enable_unified_text_phoneme_input
-            or self.unified_text_debug_max_samples <= 0
-            or self._unified_text_debug_samples_logged >= self.unified_text_debug_max_samples
-        ):
-            return
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None and worker_info.id != 0:
-            return
-        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-        if rank != 0:
-            return
-
-        duration = float(cut.supervisions[0].duration)
-        token_count_with_eos = len(token_ids) + 1
-        token_rate = token_count_with_eos / duration
-        available_slots = max(1, round(duration * self.unified_text_debug_frame_rate))
-        decoded = self.text_tokenizer.decode(token_ids, tokenizer_name=tokenizer_name)
-        logging.info(
-            "[unified_text_debug] cut_id=%s language=%s tokenizer=%s duration=%.3f "
-            "tokens_with_eos=%d token_rate=%.3f available_slots=%d overflow=%s "
-            "original=%r rendered=%r decoded=%r token_ids=%s",
-            cut.id,
-            language,
-            tokenizer_name,
-            duration,
-            token_count_with_eos,
-            token_rate,
-            available_slots,
-            token_count_with_eos > available_slots,
-            original_text,
-            rendered_text,
-            decoded,
-            token_ids[:64],
-        )
-        self._unified_text_debug_samples_logged += 1
 
     def __getitem__(self, cuts: CutSet) -> Dict[str, Union[torch.Tensor, List]]:
         # layze initialize tokenizers. The first time any specific worker
@@ -588,14 +535,6 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                 text_phoneme_token_offset=self.text_phoneme_token_offset,
                 bop_marker=self.phoneme_text_bop_marker,
                 eop_marker=self.phoneme_text_eop_marker,
-            )
-            self._maybe_log_unified_text_sample(
-                cut=cut,
-                language=language,
-                tokenizer_name=tokenizer_name,
-                original_text=text_str,
-                rendered_text=text_for_tokens,
-                token_ids=tokens,
             )
             tokens = tokens + [self.eos_id]  # Not adding BOS id
             tokens = torch.tensor(tokens, dtype=torch.int32)

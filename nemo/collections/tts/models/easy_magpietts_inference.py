@@ -601,29 +601,6 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         if self.disable_subword_embedding and not hasattr(self, 'cas_encoder'):
             raise ValueError("`disable_subword_embedding=True` requires CAS encoder initialization.")
 
-        text_embedding_params = (
-            sum(parameter.numel() for parameter in self.text_embedding.parameters())
-            if self.text_embedding is not None
-            else 0
-        )
-        cas_params = (
-            sum(parameter.numel() for parameter in self.cas_encoder.parameters())
-            if hasattr(self, 'cas_encoder')
-            else 0
-        )
-        logging.info(
-            "Text input architecture: base_vocab=%d text_vocab=%d use_cas=%s cas_only=%s "
-            "text_embedding_params=%d cas_params=%d phoneme_channel=%s unified_phoneme_input=%s",
-            base_num_tokens,
-            self.text_vocab_size,
-            hasattr(self, 'cas_encoder'),
-            self.disable_subword_embedding,
-            text_embedding_params,
-            cas_params,
-            self.phoneme_tokenizer is not None,
-            self.enable_unified_text_phoneme_input,
-        )
-
         # Projection from hidden_dim to audio_embedding_dim before final_proj (Identity if same)
         if self.audio_embedding_dim != cfg.hidden_dim:
             self.audio_out_projection = nn.Linear(cfg.hidden_dim, self.audio_embedding_dim)
