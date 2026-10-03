@@ -34,6 +34,7 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     has_phoneme_text_spans,
     normalize_volume,
     partially_phonemize_text,
+    select_text_for_tokenization,
     stack_tensors,
     tokenize_text_with_phoneme_spans,
 )
@@ -175,6 +176,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         challenging_texts_path: str = None,
         challenging_text_replacement_prob: float = 0.0,
         context_audio_shuffle_batch_prob: float = 0.0,
+        normalized_text_prob: float = 1.0,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -221,6 +223,9 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         self.phoneme_turn_dropout_batch_prob = phoneme_turn_dropout_batch_prob
         self.phoneme_turn_dropout_turn_prob = phoneme_turn_dropout_turn_prob
         self.phoneme_turn_max_words_to_drop = phoneme_turn_max_words_to_drop
+        if not 0.0 <= normalized_text_prob <= 1.0:
+            raise ValueError(f"`normalized_text_prob` must be in [0, 1], got {normalized_text_prob}.")
+        self.normalized_text_prob = normalized_text_prob
         if not 0.0 <= context_audio_shuffle_batch_prob <= 1.0:
             raise ValueError("context_audio_shuffle_batch_prob must be between 0 and 1.")
         self.context_audio_shuffle_batch_prob = context_audio_shuffle_batch_prob
@@ -414,6 +419,8 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             phoneme_text_eop_marker=self.phoneme_text_eop_marker,
             ignore_phoneme_languages=self.ignore_phoneme_languages,
             apply_partial_phoneme_text=self.dataset_type == 'train',
+            normalized_text_prob=self.normalized_text_prob,
+            sample_normalized_text=self.dataset_type == 'train',
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts,
@@ -426,6 +433,8 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             eos_id=self.eos_id,
             bos_id=self.bos_id,
             interruption_token_id=self.interruption_token_id,
+            normalized_text_prob=self.normalized_text_prob,
+            sample_normalized_text=self.dataset_type == 'train',
         )
 
         return {
@@ -944,6 +953,8 @@ def collate_token_channel(
     phoneme_text_eop_marker: str = "<eop>",
     ignore_phoneme_languages: list[str] = None,
     apply_partial_phoneme_text: bool = False,
+    normalized_text_prob: float = 1.0,
+    sample_normalized_text: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build and collate token channels aligned to the audio frame grid."""
     tokens = []
@@ -973,6 +984,8 @@ def collate_token_channel(
                 phoneme_text_eop_marker,
                 ignore_phoneme_languages,
                 apply_partial_phoneme_text,
+                normalized_text_prob,
+                sample_normalized_text,
             )
         )
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -1029,6 +1042,8 @@ def build_token_channel(
     phoneme_text_eop_marker: str = "<eop>",
     ignore_phoneme_languages: list[str] = None,
     apply_partial_phoneme_text: bool = False,
+    normalized_text_prob: float = 1.0,
+    sample_normalized_text: bool = False,
 ) -> torch.Tensor:
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
@@ -1036,15 +1051,18 @@ def build_token_channel(
 
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
-            # TODO: Current multi-turn datasets do not contain the normalized_text field so check will always default to the else branch. Will need to evaluate whether it makes sense to keep this in future.
-            # This code path is used for both multi-turn and single-turn datasets.
-            text = supervision.normalized_text if supervision.has_custom("normalized_text") else supervision.text
+            text, alignment_matches_text, _ = select_text_for_tokenization(
+                supervision,
+                normalized_text_prob=normalized_text_prob,
+                sample_normalized_text=sample_normalized_text,
+            )
             text_for_tokens = text
             language = cut.lang if cut.has_custom("lang") else supervision.language
             if (
                 apply_partial_phoneme_text
                 and (enable_phoneme_text_input or enable_unified_text_phoneme_input)
                 and partial_phoneme_text_prob > 0.0
+                and alignment_matches_text
                 and language not in (ignore_phoneme_languages or [])
                 and not supervision.has_custom("challenging_text_replaced")
                 and supervision.has_custom("ipa_alignment")

@@ -34,6 +34,7 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     has_phoneme_text_spans,
     normalize_volume,
     partially_phonemize_text,
+    select_text_for_tokenization,
     stack_tensors,
     tokenize_text_with_phoneme_spans,
 )
@@ -203,6 +204,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         phoneme_text_bop_marker: str = "<bop>",
         phoneme_text_eop_marker: str = "<eop>",
         add_language_to_context_text: bool = False,
+        normalized_text_prob: float = 1.0,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -241,6 +243,9 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.phoneme_text_bop_marker = phoneme_text_bop_marker
         self.phoneme_text_eop_marker = phoneme_text_eop_marker
         self.add_language_to_context_text = add_language_to_context_text
+        if not 0.0 <= normalized_text_prob <= 1.0:
+            raise ValueError(f"`normalized_text_prob` must be in [0, 1], got {normalized_text_prob}.")
+        self.normalized_text_prob = normalized_text_prob
 
     def get_num_audio_samples_to_slice(self, duration, sample_rate):
         num_codec_frames = int(duration * sample_rate / self.codec_model_samples_per_frame)
@@ -485,17 +490,18 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                 context_has_text_context_list.append(has_text_context)
 
             # tokenize transcript
-            # there may exist "normalized_text" in the suprvisionsegement. Prioritize it over "text" if available.
-            if cut.supervisions[0].has_custom("normalized_text"):
-                text_str = cut.supervisions[0].normalized_text
-            else:
-                text_str = cut.supervisions[0].text
+            text_str, alignment_matches_text, _ = select_text_for_tokenization(
+                cut.supervisions[0],
+                normalized_text_prob=self.normalized_text_prob,
+                sample_normalized_text=self.dataset_type == 'train',
+            )
             raw_text_list.append(text_str)
             text_for_tokens = text_str
             if (
                 self.dataset_type == 'train'
                 and (self.enable_phoneme_text_input or self.enable_unified_text_phoneme_input)
                 and self.partial_phoneme_text_prob > 0.0
+                and alignment_matches_text
                 and language not in self.ignore_phoneme_languages
                 and cut.supervisions[0].has_custom("ipa_alignment")
                 and (

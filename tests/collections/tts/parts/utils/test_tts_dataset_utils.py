@@ -34,6 +34,7 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     load_audio,
     normalize_volume,
     partially_phonemize_text,
+    select_text_for_tokenization,
     split_by_sentence,
     stack_tensors,
     tokenize_text_with_phoneme_spans,
@@ -55,6 +56,15 @@ class _FakePhonemeTokenizer:
         self.seen_text.append(text)
         vocab = {"a": 1, "b": 2, "c": 3}
         return [vocab[char] for char in text if char in vocab]
+
+
+class _FakeSupervision:
+    def __init__(self, text: str, normalized_text=None):
+        self.text = text
+        self.normalized_text = normalized_text
+
+    def has_custom(self, name: str):
+        return name == "normalized_text" and self.normalized_text is not None
 
 
 class TestTTSDatasetUtils:
@@ -487,6 +497,47 @@ class TestPhonemeTextInput:
                 phoneme_tokenizer=_FakePhonemeTokenizer(),
                 text_phoneme_token_offset=100,
             )
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_select_text_raw_disables_normalized_alignment(self, monkeypatch):
+        monkeypatch.setattr(tts_dataset_utils.random, "random", lambda: 0.9)
+        text, alignment_matches, used_normalized = select_text_for_tokenization(
+            _FakeSupervision(text="Raw text!", normalized_text="normalized text"),
+            normalized_text_prob=0.5,
+            sample_normalized_text=True,
+        )
+
+        assert text == "Raw text!"
+        assert not alignment_matches
+        assert not used_normalized
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_select_text_normalized_keeps_alignment(self, monkeypatch):
+        monkeypatch.setattr(tts_dataset_utils.random, "random", lambda: 0.1)
+        text, alignment_matches, used_normalized = select_text_for_tokenization(
+            _FakeSupervision(text="Raw text!", normalized_text="normalized text"),
+            normalized_text_prob=0.5,
+            sample_normalized_text=True,
+        )
+
+        assert text == "normalized text"
+        assert alignment_matches
+        assert used_normalized
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_select_raw_text_without_normalized_text_keeps_alignment(self):
+        text, alignment_matches, used_normalized = select_text_for_tokenization(
+            _FakeSupervision(text="raw alignment text"),
+            normalized_text_prob=0.0,
+            sample_normalized_text=True,
+        )
+
+        assert text == "raw alignment text"
+        assert alignment_matches
+        assert not used_normalized
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit

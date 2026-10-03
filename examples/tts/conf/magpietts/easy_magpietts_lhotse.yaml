@@ -101,6 +101,7 @@ model:
   partial_phoneme_text_prob: 0.0 # Training-only probability of using precomputed IPA alignments.
   partial_phoneme_portion_min: 0.25 # Minimum portion of aligned words to phonemize in a selected sample.
   partial_phoneme_portion_max: 0.75 # Maximum portion of aligned words to phonemize in a selected sample.
+  normalized_text_prob: 1.0 # When normalized_text exists, training-time probability of selecting it instead of raw text.
   phoneme_text_bop_marker: "<bop>"
   phoneme_text_eop_marker: "<eop>"
   ignore_phoneme_languages: [] # Languages for which missing IPA phoneme fields are allowed during training.

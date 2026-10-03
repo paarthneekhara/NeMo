@@ -201,6 +201,34 @@ def _split_text_and_phoneme_spans(
     return [(kind, segment) for kind, segment in segments if segment]
 
 
+def select_text_for_tokenization(
+    supervision,
+    normalized_text_prob: float = 1.0,
+    sample_normalized_text: bool = False,
+) -> tuple[str, bool, bool]:
+    """Select raw or normalized text and report IPA-alignment compatibility.
+
+    IPA alignments are assumed to reference ``normalized_text`` whenever that
+    field is available. Consequently, selecting raw text in that case disables
+    alignment-based partial phonemization. When normalized text is absent, raw
+    text remains alignment-compatible, preserving existing dataset behavior.
+
+    Returns:
+        A tuple of ``(selected_text, alignment_matches_text, used_normalized_text)``.
+    """
+    _validate_probability("normalized_text_prob", normalized_text_prob)
+    raw_text = supervision.text
+    normalized_text = supervision.normalized_text if supervision.has_custom("normalized_text") else None
+    has_normalized_text = isinstance(normalized_text, str) and bool(normalized_text.strip())
+    if not has_normalized_text:
+        return raw_text, True, False
+
+    use_normalized_text = not sample_normalized_text or random.random() < normalized_text_prob
+    if use_normalized_text:
+        return normalized_text, True, True
+    return raw_text, False, False
+
+
 def partially_phonemize_text(
     text: str,
     ipa_alignment: Optional[List],

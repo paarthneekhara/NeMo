@@ -372,6 +372,43 @@ class TestMagpieTTSLhotseDatasets:
         assert "həloʊ" in dataset.text_tokenizer.encoded_texts
         assert all("<bop>" not in text and "<eop>" not in text for text in dataset.text_tokenizer.encoded_texts)
 
+    def test_raw_text_selection_skips_normalized_text_ipa_alignment(self):
+        _seed_everything()
+        cuts = _multiturn_cutset()
+        assistant_supervision = next(
+            supervision for supervision in next(iter(cuts)).supervisions if supervision.id == "turn-agent-0"
+        )
+        assistant_supervision.text = "HELLO RAW!"
+        assistant_supervision.custom["normalized_text"] = "hello"
+
+        kwargs = _multiturn_dataset_kwargs()
+        kwargs.update(
+            {
+                "source_sample_rate": SAMPLE_RATE,
+                "input_roles": ["user"],
+                "output_roles": ["assistant"],
+                "add_text_bos": False,
+                "use_text_conditioning_tokenizer": False,
+                "enable_unified_text_phoneme_input": True,
+                "partial_phoneme_text_prob": 1.0,
+                "partial_phoneme_portion_min": 1.0,
+                "partial_phoneme_portion_max": 1.0,
+                "normalized_text_prob": 0.0,
+            }
+        )
+        dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.cfg_unk_token_id = dataset.bos_id + 2
+        dataset.interruption_token_id = dataset.bos_id + 3
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        dataset[cuts]
+
+        assert "HELLO RAW!" in dataset.text_tokenizer.encoded_texts
+        assert "həloʊ" not in dataset.text_tokenizer.encoded_texts
+
     def test_unified_and_shifted_phoneme_inputs_are_mutually_exclusive(self):
         kwargs = _multiturn_dataset_kwargs()
         kwargs.update(
