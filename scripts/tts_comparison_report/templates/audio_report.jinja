@@ -255,6 +255,28 @@
       min-width: 0;
     }
 
+    .load-audio-button {
+      width: 100%;
+      min-height: 40px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--bg);
+      color: var(--accent);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .load-audio-button:hover {
+      border-color: var(--audio-pair-card-hover);
+      color: var(--sub-header);
+    }
+
+    .load-audio-button:focus-visible {
+      outline: 2px solid var(--highlighted);
+      outline-offset: 2px;
+    }
+
     audio {
       width: 100%;
     }
@@ -339,6 +361,24 @@
 </div>
 
 <script>
+  document.addEventListener("click", function(event) {
+    const button = event.target.closest(".load-audio-button");
+    if (!button) return;
+
+    const placeholder = button.closest(".lazy-audio");
+    if (!placeholder) return;
+
+    const audioUrl = placeholder.dataset.audioSrc;
+    if (!audioUrl) return;
+
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "none";
+    audio.src = audioUrl;
+    placeholder.replaceWith(audio);
+    audio.play().catch(() => {});
+  });
+
   document.addEventListener("play", function(event) {
     const audios = document.querySelectorAll("audio");
     const cards = document.querySelectorAll(".audio-pair-card");

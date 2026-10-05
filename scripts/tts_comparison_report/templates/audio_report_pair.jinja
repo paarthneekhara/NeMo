@@ -1,19 +1,19 @@
 <div class="audio-pair-card">
   <div class="audio-pair-row">
     <div class="audio-cell">
-      <audio controls preload="metadata">
-      <source src="{{ context_url }}" type="audio/wav">
-      </audio>
+      <div class="lazy-audio" data-audio-src="{{ context_url }}">
+        <button type="button" class="load-audio-button">Load audio</button>
+      </div>
     </div>
     <div class="audio-cell">
-      <audio controls preload="metadata">
-      <source src="{{ baseline_url }}" type="audio/wav">
-      </audio>
+      <div class="lazy-audio" data-audio-src="{{ baseline_url }}">
+        <button type="button" class="load-audio-button">Load audio</button>
+      </div>
     </div>
     <div class="audio-cell">
-      <audio controls preload="metadata">
-      <source src="{{ candidate_url }}" type="audio/wav">
-      </audio>
+      <div class="lazy-audio" data-audio-src="{{ candidate_url }}">
+        <button type="button" class="load-audio-button">Load audio</button>
+      </div>
     </div>
   </div>
   <p class="pair-comment">
