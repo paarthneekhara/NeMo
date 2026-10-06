@@ -26,11 +26,61 @@ from __future__ import annotations
 
 import sys
 import types
+from copy import deepcopy
 
 import pytest
 import torch
 
-from nemo.collections.common.data.lhotse.dataloader import _build_dataloader, _PerRankStatefulDataLoader
+from nemo.collections.common.data.lhotse.dataloader import (
+    _build_dataloader,
+    _CheckpointableRoundRobinSampler,
+    _PerRankStatefulDataLoader,
+)
+
+
+class _StubCutSampler:
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.position = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.position += 1
+        return [_StubCut(self.source)]
+
+    def state_dict(self) -> dict:
+        return {"position": self.position}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.position = state_dict["position"]
+
+    def allow_iter_to_reset_state(self) -> None:
+        pass
+
+    def set_epoch(self, epoch: int) -> None:
+        pass
+
+    @property
+    def diagnostics(self):
+        return _StubDiagnostics()
+
+
+class _StubCut:
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+
+class _StubDiagnostics:
+    def __add__(self, other):
+        return self
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        pass
 
 
 class _StubStatefulDataLoader:
@@ -79,6 +129,31 @@ def _new_wrapper(dp_rank: int, dp_world_size: int, dp_group=None) -> _PerRankSta
         dataset=object(),
         num_workers=4,
     )
+
+
+def test_randomized_round_robin_restores_source_selection_rng():
+    def make_sampler():
+        return _CheckpointableRoundRobinSampler(
+            _StubCutSampler("tts"),
+            _StubCutSampler("duplex"),
+            _StubCutSampler("davidai"),
+            randomize=[0.746, 0.046, 0.208],
+            seed=42,
+        )
+
+    sampler = make_sampler()
+    iter(sampler)
+    for _ in range(37):
+        next(sampler)
+    state = deepcopy(sampler.state_dict())
+    expected = [next(sampler)[0].source for _ in range(100)]
+
+    resumed = make_sampler()
+    resumed.load_state_dict(deepcopy(state))
+    iter(resumed)
+    actual = [next(resumed)[0].source for _ in range(100)]
+
+    assert actual == expected
 
 
 def test_build_dataloader_forwards_dp_group():

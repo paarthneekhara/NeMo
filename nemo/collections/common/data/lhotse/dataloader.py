@@ -285,6 +285,36 @@ class LhotseDataLoadingConfig:
     use_stateful_dataloader: bool = False
 
 
+class _CheckpointableRoundRobinSampler(RoundRobinSampler):
+    """Round-robin sampler that restores its source-selection RNG exactly.
+
+    Lhotse restores the selected child sampler index and child sampler states,
+    but recreates ``rng`` from ``seed + epoch`` in ``__iter__``. For randomized
+    round robin this replays source-selection draws from the beginning after a
+    mid-epoch restart, so the resumed dataset blend differs from uninterrupted
+    training.
+    """
+
+    _RNG_STATE_KEY = "_nemo_round_robin_rng_state"
+
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        state[self._RNG_STATE_KEY] = None if self.rng is None else deepcopy(self.rng.bit_generator.state)
+        return state
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._restored_rng_state = state_dict.pop(self._RNG_STATE_KEY, None)
+        super().load_state_dict(state_dict)
+
+    def __iter__(self):
+        iterator = super().__iter__()
+        restored_rng_state = getattr(self, "_restored_rng_state", None)
+        if restored_rng_state is not None:
+            self.rng.bit_generator.state = deepcopy(restored_rng_state)
+            self._restored_rng_state = None
+        return iterator
+
+
 def resolve_excluded_speaker_ids(excluded_speaker_ids):
     """Normalize ``excluded_speaker_ids`` from a dataloader config for :class:`SpeakerFilter`.
 
@@ -712,14 +742,14 @@ def get_lhotse_dataloader_from_multi_config(
     if shared_opts.sampler_fusion == "zip":
         sampler = ZipSampler(*source_samplers.values())
     elif shared_opts.sampler_fusion == "round_robin":
-        sampler = RoundRobinSampler(*source_samplers.values())
+        sampler = _CheckpointableRoundRobinSampler(*source_samplers.values())
     elif shared_opts.sampler_fusion == "randomized_round_robin":
         _samplers, _weights = [], []
         for key in source_samplers.keys():
             _samplers.append(source_samplers[key])
             if shared_opts.sampler_weights is not None:
                 _weights.append(shared_opts.sampler_weights[key])
-        sampler = RoundRobinSampler(
+        sampler = _CheckpointableRoundRobinSampler(
             *_samplers,
             randomize=_weights if len(_weights) > 0 else True,
             seed=shared_opts.seed,
