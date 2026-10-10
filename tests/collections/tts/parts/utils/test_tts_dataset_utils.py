@@ -32,8 +32,11 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     get_audio_filepaths,
     get_tokenizer_for_language,
     load_audio,
+    normalize_phonemizer_language,
     normalize_volume,
     partially_phonemize_text,
+    partially_phonemize_text_with_tokenizer,
+    phonemize_text_with_tokenizer,
     select_text_for_tokenization,
     split_by_sentence,
     stack_tensors,
@@ -56,6 +59,16 @@ class _FakePhonemeTokenizer:
         self.seen_text.append(text)
         vocab = {"a": 1, "b": 2, "c": 3}
         return [vocab[char] for char in text if char in vocab]
+
+
+class _FakeNeMoPhonemizer:
+    def __init__(self):
+        self.g2p = self
+        self.text_preprocessing_func = lambda text: text.lower()
+
+    def __call__(self, text):
+        pronunciations = {"hello": "həloʊ", "brave": "bɹeɪv", "world": "wɜːld"}
+        return list(pronunciations.get(text, text))
 
 
 class _FakeSupervision:
@@ -538,6 +551,60 @@ class TestPhonemeTextInput:
         assert text == "raw alignment text"
         assert alignment_matches
         assert not used_normalized
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_normalize_phonemizer_language_aliases(self):
+        assert normalize_phonemizer_language("EN_us") == "en"
+        assert normalize_phonemizer_language("pt") == "pt-br"
+        assert normalize_phonemizer_language("ar-SA") == "ar-sa"
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_phonemize_text_with_tokenizer_preserves_source_alignment(self):
+        rendered, alignment = phonemize_text_with_tokenizer(
+            text="Hello, brave world!",
+            phonemizer=_FakeNeMoPhonemizer(),
+            language="en",
+        )
+
+        assert rendered == "həloʊ, bɹeɪv wɜːld!"
+        assert alignment == [
+            [0, 5, "Hello", "həloʊ"],
+            [7, 12, "brave", "bɹeɪv"],
+            [13, 18, "world", "wɜːld"],
+        ]
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_partially_phonemize_text_with_tokenizer_is_markerless(self, monkeypatch):
+        monkeypatch.setattr(tts_dataset_utils.random, "sample", lambda population, count: [1])
+
+        rendered = partially_phonemize_text_with_tokenizer(
+            text="Hello brave world",
+            phonemizer=_FakeNeMoPhonemizer(),
+            language="en",
+            partial_phoneme_portion=1 / 3,
+            bop_marker="",
+            eop_marker="",
+        )
+
+        assert rendered == "Hello bɹeɪv world"
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_full_only_phonemizer_ignores_partial_span_selection(self):
+        rendered = partially_phonemize_text_with_tokenizer(
+            text="Hello world",
+            phonemizer=_FakeNeMoPhonemizer(),
+            language="ja",
+            partial_phoneme_portion=0.1,
+            full_only=True,
+            bop_marker="",
+            eop_marker="",
+        )
+
+        assert rendered == "hello world"
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit

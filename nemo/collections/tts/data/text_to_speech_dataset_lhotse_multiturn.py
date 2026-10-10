@@ -32,8 +32,10 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     _sample_probability_range,
     beta_binomial_prior_distribution,
     has_phoneme_text_spans,
+    normalize_phonemizer_language,
     normalize_volume,
     partially_phonemize_text,
+    partially_phonemize_text_with_tokenizer,
     select_text_for_tokenization,
     stack_tensors,
     tokenize_text_with_phoneme_spans,
@@ -165,6 +167,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         partial_phoneme_portion_max: float = 0.75,
         phoneme_text_bop_marker: str = "<bop>",
         phoneme_text_eop_marker: str = "<eop>",
+        unified_text_phonemizer_config: DictConfig = None,
         add_language_to_context_text: bool = False,
         source_sample_rate: int = 16000,
         input_roles: List[str] = ["user", "User"],
@@ -214,6 +217,16 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         self.partial_phoneme_portion_max = partial_phoneme_portion_max
         self.phoneme_text_bop_marker = phoneme_text_bop_marker
         self.phoneme_text_eop_marker = phoneme_text_eop_marker
+        self.unified_text_phonemizer_config = unified_text_phonemizer_config
+        self.unified_text_phonemizers = {}
+        self.full_only_phoneme_languages = {
+            normalize_phonemizer_language(language)
+            for language in (
+                unified_text_phonemizer_config.get("full_only_languages", [])
+                if unified_text_phonemizer_config is not None
+                else []
+            )
+        }
         self.add_language_to_context_text = add_language_to_context_text
 
         self.source_sample_rate = source_sample_rate
@@ -272,6 +285,18 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
 
         if self.phoneme_tokenizer is None and self.phoneme_tokenizer_config is not None:
             self.phoneme_tokenizer = safe_instantiate(self.phoneme_tokenizer_config)
+
+    def _get_unified_text_phonemizer(self, language: str):
+        language = normalize_phonemizer_language(language)
+        if not language or self.unified_text_phonemizer_config is None:
+            return None
+        configs = self.unified_text_phonemizer_config.get("phonemizers", {})
+        if language not in configs:
+            return None
+        if language not in self.unified_text_phonemizers:
+            logging.info(f"Initializing unified-text phonemizer for language={language}")
+            self.unified_text_phonemizers[language] = safe_instantiate(configs[language])
+        return self.unified_text_phonemizers[language]
 
     def _prepare_cuts(self, cuts: CutSet) -> tuple[CutSet, list[str]]:
         cuts = cuts.transform_text(_strip_timestamps)
@@ -397,6 +422,10 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         }
 
     def _collate_text_channels(self, cuts: CutSet, batch_tokenizer_names: list[str]) -> Dict[str, torch.Tensor]:
+        if self.dataset_type == 'train' and self.partial_phoneme_text_prob > 0.0:
+            for cut in cuts:
+                language = cut.lang if cut.has_custom("lang") else cut.supervisions[0].language
+                self._get_unified_text_phonemizer(language)
         target_text_tokens, target_token_lens = collate_token_channel(
             cuts,
             self.text_tokenizer,
@@ -421,6 +450,8 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             apply_partial_phoneme_text=self.dataset_type == 'train',
             normalized_text_prob=self.normalized_text_prob,
             sample_normalized_text=self.dataset_type == 'train',
+            unified_text_phonemizers=self.unified_text_phonemizers,
+            full_only_phoneme_languages=self.full_only_phoneme_languages,
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts,
@@ -955,6 +986,8 @@ def collate_token_channel(
     apply_partial_phoneme_text: bool = False,
     normalized_text_prob: float = 1.0,
     sample_normalized_text: bool = False,
+    unified_text_phonemizers: dict = None,
+    full_only_phoneme_languages: set[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build and collate token channels aligned to the audio frame grid."""
     tokens = []
@@ -986,6 +1019,8 @@ def collate_token_channel(
                 apply_partial_phoneme_text,
                 normalized_text_prob,
                 sample_normalized_text,
+                unified_text_phonemizers,
+                full_only_phoneme_languages,
             )
         )
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -1044,6 +1079,8 @@ def build_token_channel(
     apply_partial_phoneme_text: bool = False,
     normalized_text_prob: float = 1.0,
     sample_normalized_text: bool = False,
+    unified_text_phonemizers: dict = None,
+    full_only_phoneme_languages: set[str] = None,
 ) -> torch.Tensor:
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
@@ -1058,14 +1095,20 @@ def build_token_channel(
             )
             text_for_tokens = text
             language = cut.lang if cut.has_custom("lang") else supervision.language
+            normalized_language = normalize_phonemizer_language(language)
+            phonemizer = (unified_text_phonemizers or {}).get(normalized_language)
+            can_use_stored_alignment = (
+                alignment_matches_text
+                and supervision.has_custom("ipa_alignment")
+                and bool(_get_supervision_ipa_text(supervision))
+            )
             if (
                 apply_partial_phoneme_text
                 and (enable_phoneme_text_input or enable_unified_text_phoneme_input)
                 and partial_phoneme_text_prob > 0.0
-                and alignment_matches_text
                 and language not in (ignore_phoneme_languages or [])
                 and not supervision.has_custom("challenging_text_replaced")
-                and supervision.has_custom("ipa_alignment")
+                and (phonemizer is not None or can_use_stored_alignment)
                 and (
                     enable_unified_text_phoneme_input
                     or not has_phoneme_text_spans(
@@ -1081,14 +1124,25 @@ def build_token_channel(
                     partial_phoneme_portion_min,
                     partial_phoneme_portion_max,
                 )
-                text_for_tokens = partially_phonemize_text(
-                    text=text,
-                    ipa_alignment=supervision.ipa_alignment,
-                    partial_phoneme_portion=sampled_portion,
-                    full_ipa_text=_get_supervision_ipa_text(supervision),
-                    bop_marker="" if enable_unified_text_phoneme_input else phoneme_text_bop_marker,
-                    eop_marker="" if enable_unified_text_phoneme_input else phoneme_text_eop_marker,
-                )
+                if phonemizer is not None:
+                    text_for_tokens = partially_phonemize_text_with_tokenizer(
+                        text=text,
+                        phonemizer=phonemizer,
+                        language=normalized_language,
+                        partial_phoneme_portion=sampled_portion,
+                        full_only=normalized_language in (full_only_phoneme_languages or set()),
+                        bop_marker="" if enable_unified_text_phoneme_input else phoneme_text_bop_marker,
+                        eop_marker="" if enable_unified_text_phoneme_input else phoneme_text_eop_marker,
+                    )
+                else:
+                    text_for_tokens = partially_phonemize_text(
+                        text=text,
+                        ipa_alignment=supervision.ipa_alignment,
+                        partial_phoneme_portion=sampled_portion,
+                        full_ipa_text=_get_supervision_ipa_text(supervision),
+                        bop_marker="" if enable_unified_text_phoneme_input else phoneme_text_bop_marker,
+                        eop_marker="" if enable_unified_text_phoneme_input else phoneme_text_eop_marker,
+                    )
             raw_ids = tokenize_text_with_phoneme_spans(
                 text_tokenizer=tokenizer,
                 text_str=text_for_tokens,

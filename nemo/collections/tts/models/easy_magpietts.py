@@ -23,7 +23,7 @@ import torch
 import wandb
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.utils.data.distributed import DistributedSampler
 
@@ -1960,6 +1960,10 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
     def get_lhotse_dataloader(self, dataset_cfg, mode='train') -> torch.utils.data.DataLoader:
         # TODO @xueyang: better to distinguish cfg. self.cfg is the model cfg, while cfg here is train_ds cfg. Also
         #   cfg is a classifier-free guidance.
+        unified_text_phonemizer_config = None
+        unified_text_phonemizer_config_path = self.cfg.get("unified_text_phonemizer_config", None)
+        if unified_text_phonemizer_config_path:
+            unified_text_phonemizer_config = OmegaConf.load(unified_text_phonemizer_config_path)
         if self.cfg.get("use_multiturn_dataset", False):
             dataset = MagpieTTSLhotseMultiturnDataset(
                 sample_rate=self.sample_rate,
@@ -1988,6 +1992,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 partial_phoneme_portion_max=self.partial_phoneme_portion_max,
                 phoneme_text_bop_marker=self.phoneme_text_bop_marker,
                 phoneme_text_eop_marker=self.phoneme_text_eop_marker,
+                unified_text_phonemizer_config=unified_text_phonemizer_config,
                 add_language_to_context_text=self.add_language_to_context_text,
                 source_sample_rate=self.sample_rate,
                 input_roles=["user", "User"],
@@ -2032,6 +2037,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 partial_phoneme_portion_max=self.partial_phoneme_portion_max,
                 phoneme_text_bop_marker=self.phoneme_text_bop_marker,
                 phoneme_text_eop_marker=self.phoneme_text_eop_marker,
+                unified_text_phonemizer_config=unified_text_phonemizer_config,
                 add_language_to_context_text=self.add_language_to_context_text,
                 normalized_text_prob=self.cfg.get("normalized_text_prob", 1.0),
             )

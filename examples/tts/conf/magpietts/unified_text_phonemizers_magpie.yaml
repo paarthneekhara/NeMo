@@ -1,0 +1,115 @@
+# NeMo phonemizers used to generate markerless phonetic spans for the unified
+# EasyMagpie text tokenizer. Paths assume the NeMo checkout is mounted at /code.
+full_only_languages: [ja]
+
+phonemizers:
+  en:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    locale: en-US
+    punct: true
+    apostrophe: true
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      locale: en-US
+      phoneme_dict: /code/scripts/tts_dataset_files/ipa_cmudict-0.7b_nv26.07.txt
+      heteronyms: /code/scripts/tts_dataset_files/heteronyms-052722
+      phoneme_probability: null
+      ignore_ambiguous_words: false
+      use_chars: true
+      use_stresses: true
+
+  de:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    locale: de-DE
+    punct: true
+    apostrophe: true
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      locale: de-DE
+      phoneme_dict: /code/scripts/tts_dataset_files/de/de_nv230119.dict
+      heteronyms: /code/scripts/tts_dataset_files/de/de_nv230119.heteronym
+      phoneme_probability: null
+      ignore_ambiguous_words: false
+      use_chars: true
+      use_stresses: true
+      grapheme_case: mixed
+      grapheme_prefix: "#"
+
+  es:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    locale: es-ES
+    punct: true
+    apostrophe: true
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      locale: es-ES
+      phoneme_dict: /code/scripts/tts_dataset_files/es_ES/es_ES_nv230301.dict
+      phoneme_probability: null
+      ignore_ambiguous_words: false
+      use_chars: true
+      use_stresses: true
+
+  hi:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    locale: hi-IN
+    punct: true
+    apostrophe: true
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      _convert_: all
+      locale: hi-IN
+      phoneme_dict:
+        - /code/scripts/tts_dataset_files/hi_IN/hi_prondict-v0.3_nostress_fixed.dict
+        - /code/scripts/tts_dataset_files/ipa_cmudict-0.7b_nv26.07.txt
+      phoneme_probability: null
+      ignore_ambiguous_words: false
+      use_chars: true
+      use_stresses: true
+      grapheme_case: upper
+      grapheme_prefix: ""
+
+  pt-br:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    locale: pt-BR
+    punct: true
+    apostrophe: true
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      locale: pt-BR
+      phoneme_dict: /code/scripts/tts_dataset_files/pt_BR/pt_br_prondict-v1.0.dict
+      phoneme_probability: null
+      ignore_ambiguous_words: false
+      use_chars: true
+      use_stresses: true
+      grapheme_case: upper
+      grapheme_prefix: "#"
+
+  ja:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.JapanesePhonemeTokenizer
+    punct: true
+    apostrophe: false
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.ja_jp_ipa.JapaneseKatakanaAccentG2p
+      ascii_letter_prefix: ""
+      ascii_letter_case: lower
+
+  zh:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.ChinesePhonemesTokenizer
+    punct: true
+    apostrophe: true
+    pad_with_space: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.zh_cn_pinyin.ChineseG2p
+      phoneme_dict: /code/scripts/tts_dataset_files/zh/36finals/ipa_dict_nv23.05.txt
+      word_segmenter: jieba
+      phoneme_prefix: ""
+      phoneme_case: lower
+      tone_prefix: "#"
+      ascii_letter_prefix: ""
+      ascii_letter_case: upper

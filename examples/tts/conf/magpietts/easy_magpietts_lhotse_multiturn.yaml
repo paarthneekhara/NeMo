@@ -95,6 +95,7 @@ model:
   phoneme_corruption_type: "repeat_skip_unk" # "repeat_skip_unk" or "complete_channel"
   enable_phoneme_text_input: false # Enable inline IPA spans in text as <bop>...<eop>; requires phoneme_tokenizer.
   enable_unified_text_phoneme_input: false # Markerless IPA mixing through the regular text tokenizer; no phoneme_tokenizer required.
+  unified_text_phonemizer_config: null # Optional YAML mapping languages to NeMo TTS phonemizers.
   partial_phoneme_text_prob: 0.0 # Training-only probability of using precomputed IPA alignments.
   partial_phoneme_portion_min: 0.25 # Minimum portion of aligned words to phonemize in a selected sample.
   partial_phoneme_portion_max: 0.75 # Maximum portion of aligned words to phonemize in a selected sample.

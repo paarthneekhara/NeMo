@@ -32,8 +32,10 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     _sample_probability_range,
     beta_binomial_prior_distribution,
     has_phoneme_text_spans,
+    normalize_phonemizer_language,
     normalize_volume,
     partially_phonemize_text,
+    partially_phonemize_text_with_tokenizer,
     select_text_for_tokenization,
     stack_tensors,
     tokenize_text_with_phoneme_spans,
@@ -203,6 +205,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         partial_phoneme_portion_max: float = 0.75,
         phoneme_text_bop_marker: str = "<bop>",
         phoneme_text_eop_marker: str = "<eop>",
+        unified_text_phonemizer_config: DictConfig = None,
         add_language_to_context_text: bool = False,
         normalized_text_prob: float = 1.0,
     ):
@@ -242,6 +245,16 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.partial_phoneme_portion_max = partial_phoneme_portion_max
         self.phoneme_text_bop_marker = phoneme_text_bop_marker
         self.phoneme_text_eop_marker = phoneme_text_eop_marker
+        self.unified_text_phonemizer_config = unified_text_phonemizer_config
+        self.unified_text_phonemizers = {}
+        self.full_only_phoneme_languages = {
+            normalize_phonemizer_language(language)
+            for language in (
+                unified_text_phonemizer_config.get("full_only_languages", [])
+                if unified_text_phonemizer_config is not None
+                else []
+            )
+        }
         self.add_language_to_context_text = add_language_to_context_text
         if not 0.0 <= normalized_text_prob <= 1.0:
             raise ValueError(f"`normalized_text_prob` must be in [0, 1], got {normalized_text_prob}.")
@@ -282,6 +295,18 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         # initialize the phoneme tokenizer once per dataset/worker when config is available.
         if self.phoneme_tokenizer is None and self.phoneme_tokenizer_config is not None:
             self.phoneme_tokenizer = safe_instantiate(self.phoneme_tokenizer_config)
+
+    def _get_unified_text_phonemizer(self, language: str):
+        language = normalize_phonemizer_language(language)
+        if not language or self.unified_text_phonemizer_config is None:
+            return None
+        configs = self.unified_text_phonemizer_config.get("phonemizers", {})
+        if language not in configs:
+            return None
+        if language not in self.unified_text_phonemizers:
+            logging.info(f"Initializing unified-text phonemizer for language={language}")
+            self.unified_text_phonemizers[language] = safe_instantiate(configs[language])
+        return self.unified_text_phonemizers[language]
 
         # define list to store batched information
         dataset_name_list = []
@@ -497,13 +522,23 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             )
             raw_text_list.append(text_str)
             text_for_tokens = text_str
+            normalized_language = normalize_phonemizer_language(language)
+            phonemizer = (
+                self._get_unified_text_phonemizer(normalized_language)
+                if self.dataset_type == 'train' and self.partial_phoneme_text_prob > 0.0
+                else None
+            )
+            can_use_stored_alignment = (
+                alignment_matches_text
+                and cut.supervisions[0].has_custom("ipa_alignment")
+                and cut.supervisions[0].has_custom("ipa")
+            )
             if (
                 self.dataset_type == 'train'
                 and (self.enable_phoneme_text_input or self.enable_unified_text_phoneme_input)
                 and self.partial_phoneme_text_prob > 0.0
-                and alignment_matches_text
                 and language not in self.ignore_phoneme_languages
-                and cut.supervisions[0].has_custom("ipa_alignment")
+                and (phonemizer is not None or can_use_stored_alignment)
                 and (
                     self.enable_unified_text_phoneme_input
                     or not has_phoneme_text_spans(
@@ -519,14 +554,25 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                     self.partial_phoneme_portion_min,
                     self.partial_phoneme_portion_max,
                 )
-                text_for_tokens = partially_phonemize_text(
-                    text=text_str,
-                    ipa_alignment=cut.supervisions[0].ipa_alignment,
-                    partial_phoneme_portion=sampled_portion,
-                    full_ipa_text=(cut.supervisions[0].ipa if cut.supervisions[0].has_custom("ipa") else None),
-                    bop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_bop_marker,
-                    eop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_eop_marker,
-                )
+                if phonemizer is not None:
+                    text_for_tokens = partially_phonemize_text_with_tokenizer(
+                        text=text_str,
+                        phonemizer=phonemizer,
+                        language=normalized_language,
+                        partial_phoneme_portion=sampled_portion,
+                        full_only=normalized_language in self.full_only_phoneme_languages,
+                        bop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_bop_marker,
+                        eop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_eop_marker,
+                    )
+                else:
+                    text_for_tokens = partially_phonemize_text(
+                        text=text_str,
+                        ipa_alignment=cut.supervisions[0].ipa_alignment,
+                        partial_phoneme_portion=sampled_portion,
+                        full_ipa_text=cut.supervisions[0].ipa,
+                        bop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_bop_marker,
+                        eop_marker="" if self.enable_unified_text_phoneme_input else self.phoneme_text_eop_marker,
+                    )
             if cut.has_custom("tokenizer_names"):
                 # Pick a random tokenizer from the list of tokenizers
                 tokenizer_name = random.choice(cut.tokenizer_names)

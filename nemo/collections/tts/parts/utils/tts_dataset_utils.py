@@ -229,6 +229,130 @@ def select_text_for_tokenization(
     return raw_text, False, False
 
 
+_PHONEMIZER_LANGUAGE_ALIASES = {
+    "en-us": "en",
+    "de-de": "de",
+    "es-es": "es",
+    "hi-in": "hi",
+    "ja-jp": "ja",
+    "pt": "pt-br",
+    "zh-cn": "zh",
+}
+_LEXICAL_SPAN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+
+
+def normalize_phonemizer_language(language: Optional[str]) -> str:
+    """Normalize dataset language tags to the keys used by phonemizer configs."""
+    if not isinstance(language, str):
+        return ""
+    normalized = language.strip().lower().replace("_", "-")
+    return _PHONEMIZER_LANGUAGE_ALIASES.get(normalized, normalized)
+
+
+def _phonemizer_g2p(phonemizer, text: str) -> str:
+    """Render NeMo tokenizer G2P output as markerless Unicode text."""
+    preprocessor = getattr(phonemizer, "text_preprocessing_func", None)
+    processed = preprocessor(text) if callable(preprocessor) else text
+    g2p = getattr(phonemizer, "g2p", phonemizer)
+    tokens = g2p(processed)
+    return "".join(str(token) for token in tokens)
+
+
+def _phonemizer_source_spans(text: str, phonemizer, language: str) -> List[Tuple[int, int]]:
+    """Return source spans suitable for independently applying a NeMo phonemizer."""
+    language = normalize_phonemizer_language(language)
+    if language != "zh":
+        return [match.span() for match in _LEXICAL_SPAN_RE.finditer(text)]
+
+    g2p = getattr(phonemizer, "g2p", phonemizer)
+    segmenter = getattr(g2p, "word_segmenter", None)
+    if not callable(segmenter):
+        return [match.span() for match in _CJK_RE.finditer(text)]
+
+    spans = []
+    cursor = 0
+    for segment in segmenter(text):
+        if not isinstance(segment, str) or not segment:
+            continue
+        start = text.find(segment, cursor)
+        if start < 0:
+            return []
+        end = start + len(segment)
+        cursor = end
+        if _CJK_RE.search(segment) or any(character.isalnum() for character in segment):
+            spans.append((start, end))
+    return spans
+
+
+def phonemize_text_with_tokenizer(
+    text: str,
+    phonemizer,
+    language: str,
+    full_only: bool = False,
+) -> Tuple[str, Optional[List[List[Union[int, str]]]]]:
+    """Render full phonetic text and source-aligned spans with a NeMo TTS tokenizer.
+
+    Dictionary-backed tokenizers are applied independently to lexical spans so
+    their output can also drive markerless partial phonemization. Mandarin uses
+    the configured word segmenter. Context-sensitive tokenizers such as the
+    Japanese accent tokenizer should set ``full_only=True``.
+    """
+    if not text:
+        return text, None
+    if full_only:
+        rendered = _phonemizer_g2p(phonemizer, text)
+        return (rendered or text), None
+
+    spans = _phonemizer_source_spans(text, phonemizer, language)
+    if not spans:
+        return text, None
+
+    output = []
+    alignment: List[List[Union[int, str]]] = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor or end > len(text):
+            return text, None
+        source = text[start:end]
+        rendered = _phonemizer_g2p(phonemizer, source)
+        if not rendered:
+            rendered = source
+        output.extend((text[cursor:start], rendered))
+        alignment.append([start, end, source, rendered])
+        cursor = end
+    output.append(text[cursor:])
+    return "".join(output), alignment
+
+
+def partially_phonemize_text_with_tokenizer(
+    text: str,
+    phonemizer,
+    language: str,
+    partial_phoneme_portion: float,
+    full_only: bool = False,
+    bop_marker: str = "<bop>",
+    eop_marker: str = "<eop>",
+) -> str:
+    """Apply a NeMo tokenizer to a sampled subset of source spans."""
+    full_text, alignment = phonemize_text_with_tokenizer(
+        text=text,
+        phonemizer=phonemizer,
+        language=language,
+        full_only=full_only,
+    )
+    if full_only:
+        return f"{bop_marker}{full_text}{eop_marker}" if partial_phoneme_portion > 0.0 else text
+    return partially_phonemize_text(
+        text=text,
+        ipa_alignment=alignment,
+        partial_phoneme_portion=partial_phoneme_portion,
+        full_ipa_text=full_text,
+        bop_marker=bop_marker,
+        eop_marker=eop_marker,
+    )
+
+
 def partially_phonemize_text(
     text: str,
     ipa_alignment: Optional[List],
