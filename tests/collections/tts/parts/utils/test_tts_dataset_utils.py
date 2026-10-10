@@ -67,7 +67,7 @@ class _FakeNeMoPhonemizer:
         self.text_preprocessing_func = lambda text: text.lower()
 
     def __call__(self, text):
-        pronunciations = {"hello": "həloʊ", "brave": "bɹeɪv", "world": "wɜːld"}
+        pronunciations = {"hello": "həloʊ", "brave": "bɹeɪv", "world": "wɜːld", "देवी": "deːviː"}
         return list(pronunciations.get(text, text))
 
 
@@ -577,6 +577,18 @@ class TestPhonemeTextInput:
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit
+    def test_phonemize_text_keeps_indic_combining_marks_in_word(self):
+        rendered, alignment = phonemize_text_with_tokenizer(
+            text="देवी का",
+            phonemizer=_FakeNeMoPhonemizer(),
+            language="hi",
+        )
+
+        assert rendered == "deːviː का"
+        assert alignment[0] == [0, 4, "देवी", "deːviː"]
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
     def test_partially_phonemize_text_with_tokenizer_is_markerless(self, monkeypatch):
         monkeypatch.setattr(tts_dataset_utils.random, "sample", lambda population, count: [1])
 
@@ -655,6 +667,22 @@ class TestPhonemeTextInput:
         )
 
         assert text == "one <bop>b c<eop> four"
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_partially_phonemize_text_consumes_trailing_combining_marks(self, monkeypatch):
+        monkeypatch.setattr(tts_dataset_utils.random, "sample", lambda population, count: [0])
+
+        text = partially_phonemize_text(
+            text="بِ تَ",
+            ipa_alignment=[[0, 1, "ب", "b"], [3, 4, "ت", "t"]],
+            partial_phoneme_portion=0.5,
+            full_ipa_text="b t",
+            bop_marker="",
+            eop_marker="",
+        )
+
+        assert text == "b تَ"
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit

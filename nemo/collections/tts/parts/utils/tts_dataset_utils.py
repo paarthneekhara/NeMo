@@ -19,6 +19,7 @@ import os
 import random
 import re
 import traceback
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -238,7 +239,6 @@ _PHONEMIZER_LANGUAGE_ALIASES = {
     "pt": "pt-br",
     "zh-cn": "zh",
 }
-_LEXICAL_SPAN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
@@ -259,11 +259,39 @@ def _phonemizer_g2p(phonemizer, text: str) -> str:
     return "".join(str(token) for token in tokens)
 
 
+def _unicode_lexical_spans(text: str) -> List[Tuple[int, int]]:
+    """Find words while keeping Unicode combining marks with their base letters."""
+
+    def is_lexical(character: str) -> bool:
+        return unicodedata.category(character)[0] in {"L", "M", "N"}
+
+    spans = []
+    start = None
+    for index, character in enumerate(text):
+        if is_lexical(character):
+            if start is None:
+                start = index
+            continue
+        if (
+            character in {"'", "’"}
+            and start is not None
+            and index + 1 < len(text)
+            and is_lexical(text[index + 1])
+        ):
+            continue
+        if start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
 def _phonemizer_source_spans(text: str, phonemizer, language: str) -> List[Tuple[int, int]]:
     """Return source spans suitable for independently applying a NeMo phonemizer."""
     language = normalize_phonemizer_language(language)
     if language != "zh":
-        return [match.span() for match in _LEXICAL_SPAN_RE.finditer(text)]
+        return _unicode_lexical_spans(text)
 
     g2p = getattr(phonemizer, "g2p", phonemizer)
     segmenter = getattr(g2p, "word_segmenter", None)
@@ -416,6 +444,8 @@ def partially_phonemize_text(
     for first_index, last_index in selected_runs:
         start = ipa_alignment[first_index][0]
         end = ipa_alignment[last_index][1]
+        while end < len(text) and unicodedata.category(text[end]).startswith("M"):
+            end += 1
         ipa_start = ipa_ranges[first_index][0]
         ipa_end = ipa_ranges[last_index][1]
         output_parts.append(text[cursor:start])
