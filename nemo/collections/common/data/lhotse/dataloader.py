@@ -60,6 +60,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     TokenCountFilter,
     TokenPerSecondFilter,
     TokenPerTokenFilter,
+    TrailingSilenceFilter,
     ValidationStatusFilter,
 )
 from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn
@@ -153,6 +154,9 @@ class LhotseDataLoadingConfig:
     # Per-language overrides keyed by the cut's ``lang`` tag, e.g. {en: 0.03}; null disables the filter for a language.
     max_cer_by_lang: Any = None
     min_context_speaker_similarity_by_lang: Any = None
+    # Minimum trailing silence in seconds per ``lang`` tag, read from custom.qualv1.trail_sil_s; languages not
+    # listed (and cuts without the field) are not filtered.
+    min_trailing_silence_by_lang: Any = None
     excluded_speaker_ids: Any = None
     speaker_filter_fields: list[str] | None = None
 
@@ -917,6 +921,7 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
             config.min_context_speaker_similarity, config.min_context_speaker_similarity_by_lang
         )
     )
+    cuts = cuts.filter(TrailingSilenceFilter(config.min_trailing_silence_by_lang))
 
     if tokenizer is not None and config.pretokenize:
         cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))

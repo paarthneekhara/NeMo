@@ -21,6 +21,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     CERFilter,
     ContextSpeakerSimilarityFilter,
     SpeakerFilter,
+    TrailingSilenceFilter,
     ValidationStatusFilter,
 )
 
@@ -155,6 +156,23 @@ def test_cut_context_speaker_similarity_filter_by_lang(cut_example):
     assert ContextSpeakerSimilarityFilter(0.95, {"en": None})(cut_example) == True
     assert ContextSpeakerSimilarityFilter(0.3, {"en": 0.95})(cut_example) == False
     assert ContextSpeakerSimilarityFilter(0.95, {"de": 0.3})(cut_example) == False
+
+
+def test_cut_trailing_silence_filter(cut_example):
+    assert TrailingSilenceFilter(None)(cut_example) == True
+    assert TrailingSilenceFilter({"vi": 0.06})(cut_example) == True  # no lang tag and no qualv1 field
+
+    cut_example.lang = "vi"
+    assert TrailingSilenceFilter({"vi": 0.06})(cut_example) == True  # no qualv1 field
+
+    cut_example.qualv1 = {"trail_sil_s": 0.02}
+    assert TrailingSilenceFilter({"vi": 0.06})(cut_example) == False
+    assert TrailingSilenceFilter({"vi": 0.02})(cut_example) == True
+    assert TrailingSilenceFilter({"vi": None})(cut_example) == True
+    assert TrailingSilenceFilter({"en": 0.06})(cut_example) == True
+
+    cut_example.lang = "en"
+    assert TrailingSilenceFilter({"vi": 0.06})(cut_example) == True
 
 
 def test_cut_validation_status_filter(cut_example):

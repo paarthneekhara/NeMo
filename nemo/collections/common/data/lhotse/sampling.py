@@ -395,6 +395,32 @@ class ContextSpeakerSimilarityFilter:
             return True
 
 
+class TrailingSilenceFilter:
+    """
+    Callable, returns ``False`` for cuts whose language is a key of ``min_trailing_silence_by_lang`` and whose
+    trailing silence (seconds, read from ``custom[field][key]``, by default ``custom["qualv1"]["trail_sil_s"]``)
+    is below that language's threshold, and ``True`` otherwise. Cuts of other languages or without the field
+    pass, as does anything that is not a Cut.
+    """
+
+    def __init__(
+        self, min_trailing_silence_by_lang: dict[str, float | None] | None, field: str = "qualv1.trail_sil_s"
+    ) -> None:
+        self.min_trailing_silence_by_lang = {
+            k: v for k, v in (min_trailing_silence_by_lang or {}).items() if v is not None
+        }
+        self.field, self.key = field.split(".", 1)
+
+    def __call__(self, example) -> bool:
+        if not self.min_trailing_silence_by_lang or not isinstance(example, MonoCut) or not example.custom:
+            return True
+        threshold = self.min_trailing_silence_by_lang.get(example.custom.get("lang"))
+        trail = (example.custom.get(self.field) or {}).get(self.key)
+        if threshold is None or trail is None:
+            return True
+        return trail >= threshold
+
+
 class TokenCountFilter:
     """
     Callable, returns ``True`` if an example's number of tokens is in range [t_min, t_max] and ``False`` otherwise.
