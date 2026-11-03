@@ -319,7 +319,23 @@ def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
     # Attach extra tags to every utterance dynamically, if provided.
     if (extra_tags := grp_cfg.get("tags")) is not None:
         cuts = cuts.map(partial(attach_tags, tags=extra_tags), apply_fn=None)
+    if (keep_custom := grp_cfg.get("keep_supervision_custom")) is not None:
+        keep_custom = OmegaConf.to_container(keep_custom, resolve=True) if isinstance(keep_custom, DictConfig) else keep_custom
+        allowed = {field: frozenset(values) for field, values in keep_custom.items()}
+        cuts = cuts.filter(partial(supervision_custom_in, allowed=allowed))
     return cuts, is_tarred
+
+
+def supervision_custom_in(cut, allowed: dict) -> bool:
+    """Keep a cut when, for every field in ``allowed``, its first supervision's custom value is one of the listed values.
+
+    Lets a single entry of an input_cfg select a subset of a dataset, e.g.
+    ``keep_supervision_custom: {emotion: [other, neutral]}``. Cuts without supervisions are dropped.
+    """
+    if not cut.supervisions:
+        return False
+    custom = cut.supervisions[0].custom or {}
+    return all(custom.get(field) in values for field, values in allowed.items())
 
 
 def _resolve_index_pack(config) -> Path | None:
