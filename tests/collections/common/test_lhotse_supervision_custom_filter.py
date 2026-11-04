@@ -95,3 +95,42 @@ def test_filter_applies_only_to_its_entry():
     assert len([i for i in ids if not i.startswith("subset-")]) == len(EMOTIONS)
     subset = [c for c in cuts if c.id.startswith("subset-")]
     assert [c.supervisions[0].custom["emotion"] for c in subset] == ["other"]
+
+
+def _text_cuts(texts):
+    cuts = []
+    for idx, text in enumerate(texts):
+        sup = dummy_supervision(idx, text=text)
+        sup.custom = {"emotion": "other" if idx % 2 == 0 else "angry"}
+        cuts.append(dummy_cut(idx, supervisions=[sup]))
+    return CutSet.from_cuts(cuts)
+
+
+TEXTS = ["Is that right?", "What a day!", "Plain sentence.", "Can [you] help?", "  Oh well, sure.  ", "No markers here"]
+
+
+def _filtered_texts(entry):
+    cfg = OmegaConf.create({"type": "lhotse_shar", "shar_path": "/fake", **entry})
+    with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=_parser_returning(_text_cuts(TEXTS))):
+        cuts, _ = parse_group(cfg, PROPAGATE)
+    return [c.supervisions[0].text for c in cuts]
+
+
+def test_keep_text_regex_uses_search_on_stripped_text():
+    assert _filtered_texts({"keep_text_regex": r"[?!]$|^(?i:oh)\b"}) == TEXTS[:2] + ["Can [you] help?", TEXTS[4]]
+
+
+def test_drop_text_regex_removes_matches():
+    assert _filtered_texts({"keep_text_regex": r"\?$", "drop_text_regex": r"\["}) == ["Is that right?"]
+
+
+def test_text_and_custom_filters_combine():
+    entry = {"keep_text_regex": r"[?!.]$", "keep_supervision_custom": {"emotion": ["other"]}}
+    assert _filtered_texts(entry) == ["Is that right?", "Plain sentence.", TEXTS[4]]
+
+
+def test_invalid_text_regex_fails_at_parse_time():
+    import pytest
+
+    with pytest.raises(Exception):
+        _filtered_texts({"keep_text_regex": "(unclosed"})

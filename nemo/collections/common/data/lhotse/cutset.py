@@ -323,7 +323,27 @@ def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
         keep_custom = OmegaConf.to_container(keep_custom, resolve=True) if isinstance(keep_custom, DictConfig) else keep_custom
         allowed = {field: frozenset(values) for field, values in keep_custom.items()}
         cuts = cuts.filter(partial(supervision_custom_in, allowed=allowed))
+    keep_text, drop_text = grp_cfg.get("keep_text_regex"), grp_cfg.get("drop_text_regex")
+    if keep_text is not None or drop_text is not None:
+        for pattern in (keep_text, drop_text):
+            if pattern is not None:
+                re.compile(pattern)
+        cuts = cuts.filter(partial(supervision_text_matches, keep=keep_text, drop=drop_text))
     return cuts, is_tarred
+
+
+def supervision_text_matches(cut, keep: str | None = None, drop: str | None = None) -> bool:
+    """Keep a cut when its first supervision's stripped text matches ``keep`` and does not match ``drop``.
+
+    Both are :func:`re.search` patterns and either may be None, e.g. ``keep_text_regex: '\\?$'`` keeps
+    questions and ``drop_text_regex: '\\['`` drops bracket-annotated texts. Cuts without supervisions are dropped.
+    """
+    if not cut.supervisions:
+        return False
+    text = (cut.supervisions[0].text or "").strip()
+    if keep is not None and re.search(keep, text) is None:
+        return False
+    return drop is None or re.search(drop, text) is None
 
 
 def supervision_custom_in(cut, allowed: dict) -> bool:
