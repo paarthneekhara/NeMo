@@ -59,8 +59,13 @@ class _FakeIPATokenizer:
 class _FakeTextTokenizer:
     tokens = list(range(100))
     pad = 0
+    tokenizer_pad_ids = {BPE_TOKENIZER_NAME: 0}
+
+    def __init__(self):
+        self.encoded_texts = []
 
     def encode(self, text, tokenizer_name):
+        self.encoded_texts.append(text)
         return [10 + len(text)]
 
 
@@ -191,6 +196,32 @@ def _multiturn_cutset():
     return CutSet.from_cuts([cut])
 
 
+def _multiturn_fallback_cut(with_target_codes: bool):
+    cut = dummy_cut(
+        2,
+        duration=0.8,
+        recording=dummy_recording(2, duration=0.8, with_data=True, sampling_rate=SAMPLE_RATE),
+    )
+    cut.target_audio = dummy_recording(12, duration=0.8, with_data=True, sampling_rate=SAMPLE_RATE)
+    cut.supervisions = [
+        SupervisionSegment(
+            id="fallback-agent-turn",
+            recording_id=cut.recording_id,
+            start=0.2,
+            duration=0.3,
+            text="fallback context",
+            language="en",
+            speaker="assistant",
+        )
+    ]
+    if with_target_codes:
+        cut.custom = {
+            **(cut.custom or {}),
+            "target_codes": _memory_temporal_array(_cached_codes(num_frames=40)),
+        }
+    return cut
+
+
 def _dataset_kwargs():
     return {
         "sample_rate": SAMPLE_RATE,
@@ -208,6 +239,17 @@ def _dataset_kwargs():
         "text_conditioning_tokenizer_name": BPE_TOKENIZER_NAME,
         "tokenizer_config": _tokenizer_config(),
     }
+
+
+def _multiturn_dataset_kwargs():
+    kwargs = _dataset_kwargs()
+    kwargs.update(
+        {
+            "codec_model_input_sample_rate": CODEC_MODEL_INPUT_SAMPLE_RATE,
+            "frame_stacking_factor": FRAME_STACKING_FACTOR,
+        }
+    )
+    return kwargs
 
 
 class TestMagpieTTSLhotseDatasets:
@@ -271,6 +313,113 @@ class TestMagpieTTSLhotseDatasets:
         assert torch.all(source_tokens < dataset.text_phoneme_token_offset)
         assert target_tokens[25].item() == dataset.interruption_token_id
 
+    def test_multiturn_unified_phoneme_input_uses_text_tokenizer_without_markers(self):
+        _seed_everything()
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "codec_model_input_sample_rate": CODEC_MODEL_INPUT_SAMPLE_RATE,
+                "frame_stacking_factor": FRAME_STACKING_FACTOR,
+                "source_sample_rate": SAMPLE_RATE,
+                "input_roles": ["user"],
+                "output_roles": ["assistant"],
+                "add_text_bos": False,
+                "use_text_conditioning_tokenizer": False,
+                "enable_unified_text_phoneme_input": True,
+                "partial_phoneme_text_prob": 1.0,
+                "partial_phoneme_portion_min": 1.0,
+                "partial_phoneme_portion_max": 1.0,
+            }
+        )
+        dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.cfg_unk_token_id = dataset.bos_id + 2
+        dataset.interruption_token_id = dataset.bos_id + 3
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        dataset[_multiturn_cutset()]
+
+        assert dataset.phoneme_tokenizer is None
+        assert "həloʊ" in dataset.text_tokenizer.encoded_texts
+        assert "hi" in dataset.text_tokenizer.encoded_texts
+        assert all("<bop>" not in text and "<eop>" not in text for text in dataset.text_tokenizer.encoded_texts)
+
+    def test_single_turn_unified_phoneme_input_uses_text_tokenizer_without_markers(self):
+        _seed_everything()
+        cuts = _single_turn_cutset()
+        next(iter(cuts)).supervisions[0].custom.update({"ipa": "həloʊ", "ipa_alignment": [[0, 5, "hello", "həloʊ"]]})
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "enable_unified_text_phoneme_input": True,
+                "partial_phoneme_text_prob": 1.0,
+                "partial_phoneme_portion_min": 1.0,
+                "partial_phoneme_portion_max": 1.0,
+            }
+        )
+        dataset = MagpieTTSLhotseDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.text_phoneme_token_offset = dataset.eos_id + 2
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        dataset[cuts]
+
+        assert dataset.phoneme_tokenizer is None
+        assert "həloʊ" in dataset.text_tokenizer.encoded_texts
+        assert all("<bop>" not in text and "<eop>" not in text for text in dataset.text_tokenizer.encoded_texts)
+
+    def test_raw_text_selection_skips_normalized_text_ipa_alignment(self):
+        _seed_everything()
+        cuts = _multiturn_cutset()
+        assistant_supervision = next(
+            supervision for supervision in next(iter(cuts)).supervisions if supervision.id == "turn-agent-0"
+        )
+        assistant_supervision.text = "HELLO RAW!"
+        assistant_supervision.custom["normalized_text"] = "hello"
+
+        kwargs = _multiturn_dataset_kwargs()
+        kwargs.update(
+            {
+                "source_sample_rate": SAMPLE_RATE,
+                "input_roles": ["user"],
+                "output_roles": ["assistant"],
+                "add_text_bos": False,
+                "use_text_conditioning_tokenizer": False,
+                "enable_unified_text_phoneme_input": True,
+                "partial_phoneme_text_prob": 1.0,
+                "partial_phoneme_portion_min": 1.0,
+                "partial_phoneme_portion_max": 1.0,
+                "normalized_text_prob": 0.0,
+            }
+        )
+        dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.cfg_unk_token_id = dataset.bos_id + 2
+        dataset.interruption_token_id = dataset.bos_id + 3
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        dataset[cuts]
+
+        assert "HELLO RAW!" in dataset.text_tokenizer.encoded_texts
+        assert "həloʊ" not in dataset.text_tokenizer.encoded_texts
+
+    def test_unified_and_shifted_phoneme_inputs_are_mutually_exclusive(self):
+        kwargs = _multiturn_dataset_kwargs()
+        kwargs.update(
+            {
+                "enable_phoneme_text_input": True,
+                "enable_unified_text_phoneme_input": True,
+            }
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            MagpieTTSLhotseMultiturnDataset(**kwargs)
+
     def test_multiturn_dataset_uses_bpe_and_cached_codes(self):
         _seed_everything()
         kwargs = _dataset_kwargs()
@@ -316,3 +465,28 @@ class TestMagpieTTSLhotseDatasets:
         assert batch["context_text_tokens_lens"].item() > 0
         assert batch["has_text_context"].tolist() == [True]
         torch.testing.assert_close(batch["rewards"], torch.tensor([0.5], device=batch["rewards"].device))
+
+    def test_multiturn_fallback_uses_cached_target_turn_codes_when_available(self):
+        dataset = MagpieTTSLhotseMultiturnDataset(**_multiturn_dataset_kwargs())
+        cut = _multiturn_fallback_cut(with_target_codes=True)
+
+        context_audio, context_audio_codes = dataset._load_fallback_context(cut, context_text=None)
+
+        assert context_audio is None
+        expected = torch.from_numpy(_cached_codes(num_frames=40))[:, 10:25].T
+        torch.testing.assert_close(context_audio_codes, expected)
+
+    def test_multiturn_fallback_uses_target_turn_audio_when_cached_codes_are_unavailable(self):
+        dataset = MagpieTTSLhotseMultiturnDataset(**_multiturn_dataset_kwargs())
+        cut = _multiturn_fallback_cut(with_target_codes=False)
+
+        context_audio, context_audio_codes = dataset._load_fallback_context(cut, context_text=None)
+
+        expected = (
+            cut.resample(SAMPLE_RATE, recording_field="target_audio")
+            .truncate(offset=0.2, duration=0.3)
+            .load_custom("target_audio")
+            .squeeze(0)
+        )
+        assert context_audio_codes is None
+        torch.testing.assert_close(context_audio, torch.from_numpy(expected))

@@ -1988,6 +1988,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_tokenizer_config=self.cfg.get("phoneme_tokenizer", None),
                 ignore_phoneme_languages=self.cfg.get("ignore_phoneme_languages", []),
                 enable_phoneme_text_input=self.enable_phoneme_text_input,
+                enable_unified_text_phoneme_input=self.enable_unified_text_phoneme_input,
                 text_phoneme_token_offset=self.text_phoneme_token_offset,
                 partial_phoneme_text_prob=self.partial_phoneme_text_prob if mode == 'train' else 0.0,
                 partial_phoneme_portion_min=self.partial_phoneme_portion_min,
@@ -2010,6 +2011,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 context_audio_shuffle_batch_prob=dataset_cfg.dataset.get(
                     "context_audio_shuffle_batch_prob", 0.0
                 ),
+                normalized_text_prob=self.cfg.get("normalized_text_prob", 1.0),
             )
             dataset = FallbackDataset(dataset)
         else:
@@ -2031,6 +2033,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_tokenizer_config=self.cfg.get("phoneme_tokenizer", None),
                 ignore_phoneme_languages=self.cfg.get("ignore_phoneme_languages", []),
                 enable_phoneme_text_input=self.enable_phoneme_text_input,
+                enable_unified_text_phoneme_input=self.enable_unified_text_phoneme_input,
                 text_phoneme_token_offset=self.text_phoneme_token_offset,
                 partial_phoneme_text_prob=self.partial_phoneme_text_prob if mode == 'train' else 0.0,
                 partial_phoneme_portion_min=self.partial_phoneme_portion_min,
@@ -2038,6 +2041,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_text_bop_marker=self.phoneme_text_bop_marker,
                 phoneme_text_eop_marker=self.phoneme_text_eop_marker,
                 add_language_to_context_text=self.add_language_to_context_text,
+                normalized_text_prob=self.cfg.get("normalized_text_prob", 1.0),
             )
 
         data_loader = get_lhotse_dataloader_from_config(
