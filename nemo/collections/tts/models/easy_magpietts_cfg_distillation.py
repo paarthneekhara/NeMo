@@ -18,6 +18,7 @@ Adapted EasyMagpieTTSModel class for classifier-free guidance distillation.
 import copy
 import json
 import random
+import tempfile
 from dataclasses import dataclass
 from io import TextIOWrapper
 from pathlib import Path
@@ -33,6 +34,7 @@ from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch import Tensor
 
+from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.tts.losses.magpietts_cfg_distillation import (
     CodesCrossEntropyLoss,
     KLDivergenceLoss,
@@ -45,6 +47,7 @@ from nemo.collections.tts.modules.easy_magpietts_cfg_distillation import (
     MONITORED_KEYS_VALID,
     ON_EPOCH_TRAIN_KEYS,
     ROLLOUT_TIMING_KEYS,
+    ASRRejectionParams,
     LossKey,
     LossMode,
     MetricKey,
@@ -55,12 +58,14 @@ from nemo.collections.tts.modules.easy_magpietts_cfg_distillation import (
     ValidationInferenceEngine,
     ValidationInferenceParams,
     aggregate_language_metrics,
+    apply_asr_rejection,
     collect_validation_outputs,
     compute_validation_metrics,
     get_loss_key,
 )
 from nemo.collections.tts.modules.magpietts_modules import LocalTransformerType, remove_special_tokens
-from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
+from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths, process_text_for_cer
+from nemo.collections.tts.parts.utils.reward_asr import RewardASRRouter
 from nemo.lightning.callback_group import CallbackGroup
 from nemo.utils import logging
 
@@ -483,6 +488,12 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         self.rejection_debug_meta_fp: Optional[TextIOWrapper] = None
         self.debug_meta_flush_interval_steps: int = 1
 
+        asr_rejection_cfg = self.cfg.get("asr_rejection")
+        if asr_rejection_cfg is not None:
+            asr_rejection_cfg = OmegaConf.to_container(asr_rejection_cfg, resolve=True)
+        self._asr_rejection_params = ASRRejectionParams.create_from_config(asr_rejection_cfg, self.rejection_weight)
+        self._asr_rejection_router: Optional[RewardASRRouter] = None
+
     @property
     def use_rollout_rejection(self) -> bool:
         """Return whether either rollout rejection bound is enabled.
@@ -667,12 +678,22 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         self._load_teacher_model()
         self._val_inference_engine.setup()
 
+        if self._asr_rejection_params is not None and self._asr_rejection_router is None:
+            self._asr_rejection_router = RewardASRRouter(
+                self._asr_rejection_params.router_cfg, device_getter=lambda: self.device
+            )
+            logging.info(f"ASR rollout rejection enabled: {self._asr_rejection_params}.")
+
     def on_fit_end(self) -> None:
-        """Close and flush rejection-debug metadata resources."""
+        """Close and flush rejection-debug metadata resources and release the rejection ASR."""
         if self.rejection_debug_meta_fp is not None:
             self.rejection_debug_meta_fp.flush()
             self.rejection_debug_meta_fp.close()
             self.rejection_debug_meta_fp = None
+
+        if self._asr_rejection_router is not None:
+            self._asr_rejection_router.close()
+            self._asr_rejection_router = None
 
     def on_validation_start(self) -> None:
         """Move active validation inference helpers to the model device."""
@@ -1521,6 +1542,80 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         logging.info(f"Saved {len(rejected_indices)} rejected samples for debugging to {debug_dir}.")
 
+    @torch.no_grad()
+    def _apply_asr_rejection(
+        self,
+        batch: dict[str, Tensor | list],
+        teacher_output: TeacherOutput,
+    ) -> tuple[TeacherOutput, dict[str, Tensor]]:
+        """Transcribe the checked teacher rollouts and reject those above their CER threshold.
+
+        Rollouts already rejected by a length rule are not checked. CER is computed as in validation, on
+        `process_text_for_cer` of the transcript and of the batch's `raw_texts`.
+
+        Args:
+            batch: Batch containing `raw_texts` and optional `languages` and `dataset_names`.
+            teacher_output: Finalized teacher-rollout predictions and rejection flags.
+
+        Returns:
+            The updated teacher output, and the fractions of the batch checked and rejected by ASR.
+        """
+        params = self._asr_rejection_params
+        batch_size = teacher_output.lens.size(0)
+        languages = batch.get("languages") or ["en"] * batch_size
+        dataset_names = batch.get("dataset_names") or ["unknown"] * batch_size
+        already_rejected = teacher_output.rejected
+
+        item_indices, thresholds = [], []
+        for idx in range(batch_size):
+            if already_rejected is not None and bool(already_rejected[idx]):
+                continue
+            threshold = params.threshold_for(languages[idx], dataset_names[idx])
+            if threshold is not None:
+                item_indices.append(idx)
+                thresholds.append(threshold)
+
+        cers, transcripts = [], []
+        if item_indices:
+            codes, codes_lens = self._prepare_codes_for_decode(
+                codes=teacher_output.codes[item_indices].clone(),
+                codes_len=teacher_output.lens[item_indices].clone(),
+            )
+            audio, audio_lens, _ = self._codec_helper.codes_to_audio(codes=codes, codes_len=codes_lens)
+
+            with tempfile.TemporaryDirectory(prefix="asr_rejection_") as tmp_dir:
+                paths = []
+                for local_idx in range(len(item_indices)):
+                    audio_np = audio[local_idx, : int(audio_lens[local_idx].item())].float().cpu().numpy()
+                    path = f"{tmp_dir}/{local_idx}.wav"
+                    sf.write(path, audio_np, self.output_sample_rate)
+                    paths.append(path)
+                raw_transcripts = self._asr_rejection_router.transcribe(paths, [languages[i] for i in item_indices])
+
+            for idx, raw_transcript in zip(item_indices, raw_transcripts):
+                transcript = process_text_for_cer(raw_transcript)
+                reference = process_text_for_cer(batch["raw_texts"][idx])
+                cers.append(min(word_error_rate([transcript], [reference], use_cer=True), 1.0))
+                transcripts.append(transcript)
+
+            teacher_output = apply_asr_rejection(
+                teacher_output=teacher_output,
+                batch=batch,
+                item_indices=item_indices,
+                cers=cers,
+                thresholds=thresholds,
+                transcripts=transcripts,
+                rejection_weight=params.rejection_weight,
+            )
+
+        num_rejected = sum(cer > t for cer, t in zip(cers, thresholds))
+        device = teacher_output.lens.device
+        metrics = {
+            MetricKey.asr_check_rate.value: torch.tensor(len(item_indices) / batch_size, device=device),
+            MetricKey.asr_rejection_rate.value: torch.tensor(num_rejected / batch_size, device=device),
+        }
+        return teacher_output, metrics
+
     def _process_batch_distillation(
         self,
         batch: dict[str, Tensor | list],
@@ -1564,6 +1659,10 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             rejection_weight=self.rejection_weight if mode == "train" else None,
         )
 
+        asr_metrics = {}
+        if mode == "train" and self._asr_rejection_router is not None:
+            teacher_output, asr_metrics = self._apply_asr_rejection(batch, teacher_output)
+
         if self.use_rejection_debug_mode:
             self._log_rejections(batch, teacher_output)
 
@@ -1574,8 +1673,9 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         for key, value in teacher_output.timing_metrics.items():
             output[key] = torch.tensor(value, device=self.device)
 
-        if mode == "train" and self.use_rollout_rejection:
+        if mode == "train" and (self.use_rollout_rejection or asr_metrics):
             output[MetricKey.rejection_rate.value] = _compute_rejection_rate(teacher_output)
+        output.update(asr_metrics)
 
         return output
 

@@ -15,6 +15,10 @@
 
 """Public components for EasyMagpieTTS classifier-free guidance distillation."""
 
+from nemo.collections.tts.modules.easy_magpietts_cfg_distillation.asr_rejection import (
+    ASRRejectionParams,
+    apply_asr_rejection,
+)
 from nemo.collections.tts.modules.easy_magpietts_cfg_distillation.distillation_types import (
     StudentOutput,
     TeacherOutput,
@@ -44,6 +48,8 @@ from nemo.collections.tts.modules.easy_magpietts_cfg_distillation.validation_met
 )
 
 __all__ = [
+    "ASRRejectionParams",
+    "apply_asr_rejection",
     "StudentOutput",
     "TeacherOutput",
     "LossKey",

@@ -61,6 +61,8 @@ class MetricKey(str, Enum):
     ssim = "ssim"
     utmos = "utmos"
     rejection_rate = "rejection_rate"
+    asr_check_rate = "asr_check_rate"
+    asr_rejection_rate = "asr_rejection_rate"
 
     def __str__(self) -> str:
         return self.value
@@ -93,6 +95,8 @@ MONITORED_KEYS_TRAIN: list[str] = [
     get_loss_key(key=LossKey.loss, mode=LossMode.phoneme),
     get_loss_key(key=LossKey.ce_loss, mode=LossMode.phoneme),
     MetricKey.rejection_rate.value,
+    MetricKey.asr_check_rate.value,
+    MetricKey.asr_rejection_rate.value,
 ]
 
 
