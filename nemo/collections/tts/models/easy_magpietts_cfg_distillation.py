@@ -503,6 +503,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         self._asr_rejection_router: Optional[RewardASRRouter] = None
         self._asr_rejection_normalizers: dict[str, Optional[Normalizer]] = {}
         self._asr_rejection_unrouted_languages: set[str] = set()
+        self._asr_rejection_warned_unknown_dataset = False
 
     @property
     def use_rollout_rejection(self) -> bool:
@@ -1594,6 +1595,14 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         languages = batch.get("languages") or ["en"] * batch_size
         dataset_names = batch.get("dataset_names") or ["unknown"] * batch_size
         already_rejected = teacher_output.rejected
+
+        has_dataset_rules = params.datasets is not None or bool(params.max_cer_by_dataset)
+        if has_dataset_rules and "unknown" in dataset_names and not self._asr_rejection_warned_unknown_dataset:
+            self._asr_rejection_warned_unknown_dataset = True
+            logging.warning(
+                "ASR rejection has dataset-specific rules but the batch has items without a dataset name; "
+                "those items get the default thresholds."
+            )
 
         item_indices, thresholds = [], []
         routes = params.router_cfg["language_routes"]

@@ -304,6 +304,8 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         cuts = cuts.transform_text(_strip_timestamps)
         for cut in cuts:
             if str(getattr(cut, "task", "tts")).lower() == "tts":
+                # The dataset name is parsed from the speaker tag, which is overwritten by the role here.
+                cut.dataset_name = self._get_dataset_name(cut)
                 for supervision in cut.supervisions:
                     supervision.speaker = "agent"
 
@@ -494,6 +496,8 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         }
 
     def _get_dataset_name(self, cut: Cut) -> str:
+        if cut.has_custom("dataset_name"):
+            return cut.dataset_name
         speaker_found = False
         for sup in reversed(cut.supervisions):
             if check_speaker_format(sup.speaker):
