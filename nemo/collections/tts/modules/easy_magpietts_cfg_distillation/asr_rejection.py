@@ -30,21 +30,29 @@ class ASRRejectionParams:
 
     A teacher rollout is checked when its dataset is listed in `datasets` (or `datasets` is `None`), its
     language has an ASR route in `router_cfg.language_routes`, and its CER threshold is not `None`. The
-    threshold is `max_cer_by_lang[language]` when the language is listed there, else `max_cer`. A checked
-    rollout whose CER against the reference text exceeds the threshold is rejected.
+    threshold is `max_cer_by_dataset[dataset]` when the dataset is listed there, else
+    `max_cer_by_lang[language]` when the language is listed there, else `max_cer`. A checked rollout whose
+    CER against the reference text exceeds the threshold is rejected.
 
     Attributes:
         max_cer: Default CER threshold, or `None` to check only the languages in `max_cer_by_lang`.
         max_cer_by_lang: Per-language thresholds; a `None` value turns the rule off for that language.
+        max_cer_by_dataset: Per-dataset thresholds, which take precedence over the language thresholds; a
+            `None` value turns the rule off for that dataset.
         datasets: Dataset names (the `Dataset:` field of the speaker tag) to check, or `None` for all.
         rejection_weight: Loss weight of rejected rollouts, or `None` to keep their weight.
+        normalize_transcript: Whether to apply the text normalizer of the rollout language to the ASR
+            transcript before computing CER, so that written forms such as digits match the spoken-form
+            reference text.
         router_cfg: `RewardASRRouter` configuration (`language_routes` and `backends`).
     """
 
     max_cer: Optional[float]
     max_cer_by_lang: dict[str, Optional[float]]
+    max_cer_by_dataset: dict[str, Optional[float]]
     datasets: Optional[frozenset[str]]
     rejection_weight: Optional[float]
+    normalize_transcript: bool
     router_cfg: dict[str, Any]
 
     @classmethod
@@ -76,12 +84,20 @@ class ASRRejectionParams:
 
         max_cer = cfg.get("max_cer", 0.0)
         max_cer_by_lang = dict(cfg.get("max_cer_by_lang") or {})
-        for name, value in [("max_cer", max_cer), *((f"max_cer_by_lang.{k}", v) for k, v in max_cer_by_lang.items())]:
+        max_cer_by_dataset = dict(cfg.get("max_cer_by_dataset") or {})
+        thresholds = [
+            ("max_cer", max_cer),
+            *((f"max_cer_by_lang.{k}", v) for k, v in max_cer_by_lang.items()),
+            *((f"max_cer_by_dataset.{k}", v) for k, v in max_cer_by_dataset.items()),
+        ]
+        for name, value in thresholds:
             if value is not None and not (0.0 <= value <= 1.0):
                 raise ValueError(f"`asr_rejection.{name}` must be in the range [0, 1] or `None`.")
 
-        if max_cer is None and all(v is None for v in max_cer_by_lang.values()):
-            raise ValueError("`asr_rejection` sets no CER threshold; set `max_cer` or `max_cer_by_lang`.")
+        if all(value is None for _, value in thresholds):
+            raise ValueError(
+                "`asr_rejection` sets no CER threshold; set `max_cer`, `max_cer_by_lang` or `max_cer_by_dataset`."
+            )
 
         unrouted = sorted(k for k, v in max_cer_by_lang.items() if v is not None and k not in routes)
         if unrouted:
@@ -98,8 +114,10 @@ class ASRRejectionParams:
         return cls(
             max_cer=max_cer,
             max_cer_by_lang=max_cer_by_lang,
+            max_cer_by_dataset=max_cer_by_dataset,
             datasets=frozenset(datasets) if datasets is not None else None,
             rejection_weight=rejection_weight,
+            normalize_transcript=bool(cfg.get("normalize_transcript", False)),
             router_cfg=router_cfg,
         )
 
@@ -109,6 +127,8 @@ class ASRRejectionParams:
             return None
         if language not in self.router_cfg["language_routes"]:
             return None
+        if dataset_name in self.max_cer_by_dataset:
+            return self.max_cer_by_dataset[dataset_name]
         return self.max_cer_by_lang.get(language, self.max_cer)
 
 

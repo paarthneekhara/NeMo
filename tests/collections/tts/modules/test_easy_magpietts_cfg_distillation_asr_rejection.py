@@ -67,6 +67,32 @@ class TestASRRejectionParams:
         params = ASRRejectionParams.create_from_config(cfg, None)
         assert params.threshold_for("en", "x") == 0.02
         assert params.threshold_for("de", "x") == 0.05
+        assert params.normalize_transcript is False
+
+    @pytest.mark.unit
+    def test_per_dataset_override_takes_precedence(self):
+        cfg = {
+            **ROUTER,
+            "max_cer": 0.05,
+            "max_cer_by_lang": {"de": 0.1},
+            "max_cer_by_dataset": {"synthRepeat2611": 0.0, "noisy": None},
+            "normalize_transcript": True,
+        }
+        params = ASRRejectionParams.create_from_config(cfg, 0.01)
+        assert params.threshold_for("en", "synthRepeat2611") == 0.0
+        assert params.threshold_for("de", "synthRepeat2611") == 0.0
+        assert params.threshold_for("en", "libritts") == 0.05
+        assert params.threshold_for("de", "libritts") == 0.1
+        assert params.threshold_for("en", "noisy") is None
+        assert params.threshold_for("hi", "synthRepeat2611") is None
+        assert params.normalize_transcript is True
+
+    @pytest.mark.unit
+    def test_dataset_threshold_alone_is_enough(self):
+        cfg = {**ROUTER, "max_cer": None, "max_cer_by_dataset": {"synthRepeat2611": 0.0}}
+        params = ASRRejectionParams.create_from_config(cfg, 0.01)
+        assert params.threshold_for("en", "synthRepeat2611") == 0.0
+        assert params.threshold_for("en", "libritts") is None
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -76,6 +102,7 @@ class TestASRRejectionParams:
             {**ROUTER, "max_cer": 1.5},
             {**ROUTER, "max_cer": None},
             {**ROUTER, "max_cer_by_lang": {"hi": 0.0}},
+            {**ROUTER, "max_cer_by_dataset": {"synthRepeat2611": -0.1}},
             {**ROUTER, "rejection_weight": 2.0},
         ],
     )

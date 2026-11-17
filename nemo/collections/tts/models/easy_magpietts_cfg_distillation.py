@@ -69,6 +69,14 @@ from nemo.collections.tts.parts.utils.reward_asr import RewardASRRouter
 from nemo.lightning.callback_group import CallbackGroup
 from nemo.utils import logging
 
+try:
+    from nemo_text_processing.text_normalization.normalize import Normalizer
+
+    PYNINI_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    Normalizer = None
+    PYNINI_AVAILABLE = False
+
 __all__ = ["EasyMagpieCFGDistillation"]
 
 
@@ -493,6 +501,8 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             asr_rejection_cfg = OmegaConf.to_container(asr_rejection_cfg, resolve=True)
         self._asr_rejection_params = ASRRejectionParams.create_from_config(asr_rejection_cfg, self.rejection_weight)
         self._asr_rejection_router: Optional[RewardASRRouter] = None
+        self._asr_rejection_normalizers: dict[str, Optional[Normalizer]] = {}
+        self._asr_rejection_unrouted_languages: set[str] = set()
 
     @property
     def use_rollout_rejection(self) -> bool:
@@ -682,6 +692,10 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             self._asr_rejection_router = RewardASRRouter(
                 self._asr_rejection_params.router_cfg, device_getter=lambda: self.device
             )
+            if self._asr_rejection_params.normalize_transcript:
+                # Grammar compilation takes minutes per language; doing it during training stalls one rank.
+                for language in self._asr_rejection_params.router_cfg["language_routes"]:
+                    self._get_asr_rejection_normalizer(language)
             logging.info(f"ASR rollout rejection enabled: {self._asr_rejection_params}.")
 
     def on_fit_end(self) -> None:
@@ -1542,6 +1556,20 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         logging.info(f"Saved {len(rejected_indices)} rejected samples for debugging to {debug_dir}.")
 
+    def _get_asr_rejection_normalizer(self, language: str) -> Optional[Normalizer]:
+        """Return the cached text normalizer of `language`, or `None` when none can be created."""
+        if language not in self._asr_rejection_normalizers:
+            normalizer = None
+            if PYNINI_AVAILABLE:
+                try:
+                    normalizer = Normalizer(input_case="cased", lang=language)
+                except Exception as e:
+                    logging.warning(f"ASR rejection: no text normalizer for language {language!r} ({e}).")
+            else:
+                logging.warning("ASR rejection: nemo_text_processing is unavailable; transcripts are not normalized.")
+            self._asr_rejection_normalizers[language] = normalizer
+        return self._asr_rejection_normalizers[language]
+
     @torch.no_grad()
     def _apply_asr_rejection(
         self,
@@ -1551,7 +1579,8 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         """Transcribe the checked teacher rollouts and reject those above their CER threshold.
 
         Rollouts already rejected by a length rule are not checked. CER is computed as in validation, on
-        `process_text_for_cer` of the transcript and of the batch's `raw_texts`.
+        `process_text_for_cer` of the transcript and of the batch's `raw_texts`; with `normalize_transcript`,
+        the transcript is first passed through the text normalizer of its language.
 
         Args:
             batch: Batch containing `raw_texts` and optional `languages` and `dataset_names`.
@@ -1567,10 +1596,15 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         already_rejected = teacher_output.rejected
 
         item_indices, thresholds = [], []
+        routes = params.router_cfg["language_routes"]
         for idx in range(batch_size):
             if already_rejected is not None and bool(already_rejected[idx]):
                 continue
-            threshold = params.threshold_for(languages[idx], dataset_names[idx])
+            language = languages[idx]
+            if language not in routes and language not in self._asr_rejection_unrouted_languages:
+                self._asr_rejection_unrouted_languages.add(language)
+                logging.warning(f"ASR rejection has no route for language {language!r}; its rollouts are not checked.")
+            threshold = params.threshold_for(language, dataset_names[idx])
             if threshold is not None:
                 item_indices.append(idx)
                 thresholds.append(threshold)
@@ -1593,6 +1627,10 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
                 raw_transcripts = self._asr_rejection_router.transcribe(paths, [languages[i] for i in item_indices])
 
             for idx, raw_transcript in zip(item_indices, raw_transcripts):
+                if params.normalize_transcript:
+                    normalizer = self._get_asr_rejection_normalizer(languages[idx])
+                    if normalizer is not None:
+                        raw_transcript = normalizer.normalize(raw_transcript)
                 transcript = process_text_for_cer(raw_transcript)
                 reference = process_text_for_cer(batch["raw_texts"][idx])
                 cers.append(min(word_error_rate([transcript], [reference], use_cer=True), 1.0))
