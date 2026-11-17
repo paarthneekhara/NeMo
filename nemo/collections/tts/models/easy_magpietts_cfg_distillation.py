@@ -62,6 +62,7 @@ from nemo.collections.tts.modules.easy_magpietts_cfg_distillation import (
     collect_validation_outputs,
     compute_validation_metrics,
     get_loss_key,
+    strip_diacritics,
 )
 from nemo.collections.tts.modules.magpietts_modules import LocalTransformerType, remove_special_tokens
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths, process_text_for_cer
@@ -1640,8 +1641,12 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
                     normalizer = self._get_asr_rejection_normalizer(languages[idx])
                     if normalizer is not None:
                         raw_transcript = normalizer.normalize(raw_transcript)
+                reference = batch["raw_texts"][idx]
+                if languages[idx] in params.strip_diacritics_languages:
+                    raw_transcript = strip_diacritics(raw_transcript)
+                    reference = strip_diacritics(reference)
                 transcript = process_text_for_cer(raw_transcript)
-                reference = process_text_for_cer(batch["raw_texts"][idx])
+                reference = process_text_for_cer(reference)
                 cers.append(min(word_error_rate([transcript], [reference], use_cer=True), 1.0))
                 transcripts.append(transcript)
 

@@ -20,6 +20,7 @@ from nemo.collections.tts.modules.easy_magpietts_cfg_distillation import (
     ASRRejectionParams,
     TeacherOutput,
     apply_asr_rejection,
+    strip_diacritics,
 )
 
 ROUTER = {
@@ -88,6 +89,21 @@ class TestASRRejectionParams:
         assert params.normalize_transcript is True
 
     @pytest.mark.unit
+    def test_strip_diacritics_languages(self):
+        params = ASRRejectionParams.create_from_config({**ROUTER, "strip_diacritics_languages": ["ar"]}, 0.01)
+        assert params.strip_diacritics_languages == frozenset({"ar"})
+        assert ASRRejectionParams.create_from_config(dict(ROUTER), 0.01).strip_diacritics_languages == frozenset()
+
+    @pytest.mark.unit
+    def test_strip_diacritics(self):
+        assert strip_diacritics("كَمَا تَشْهَدُ هَذِهِ الدَّوْرَةُ") == "كما تشهد هذه الدورة"
+        assert strip_diacritics("مـــرحبا") == "مرحبا"
+        assert strip_diacritics("أإآ") == "أإآ"
+        params = ASRRejectionParams.create_from_config({**ROUTER, "strip_diacritics_languages": ["ar"]}, 0.01)
+        assert params.strip_diacritics_languages == frozenset({"ar"})
+        assert ASRRejectionParams.create_from_config(dict(ROUTER), 0.01).strip_diacritics_languages == frozenset()
+
+    @pytest.mark.unit
     def test_dataset_threshold_alone_is_enough(self):
         cfg = {**ROUTER, "max_cer": None, "max_cer_by_dataset": {"synthRepeat2611": 0.0}}
         params = ASRRejectionParams.create_from_config(cfg, 0.01)
@@ -143,3 +159,16 @@ class TestApplyASRRejection:
         )
         assert out.sample_weights is weights
         assert out.rejected.tolist() == [True, False]
+
+
+class TestStripDiacritics:
+    @pytest.mark.unit
+    def test_vocalized_arabic_matches_unvocalized(self):
+        vocalized = "مُسَبِّبَةً خَسَائِرَ بَشَرِيَّةً وَاقْتِصَادِيَّةً"
+        assert strip_diacritics(vocalized) == "مسببة خسائر بشرية واقتصادية"
+        assert strip_diacritics("كـــتاب") == "كتاب"
+
+    @pytest.mark.unit
+    def test_keeps_precomposed_letters(self):
+        assert strip_diacritics("أإآ") == "أإآ"
+        assert strip_diacritics("é ü") == "é ü"

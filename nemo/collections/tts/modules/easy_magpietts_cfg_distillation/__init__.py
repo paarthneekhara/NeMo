@@ -18,6 +18,7 @@
 from nemo.collections.tts.modules.easy_magpietts_cfg_distillation.asr_rejection import (
     ASRRejectionParams,
     apply_asr_rejection,
+    strip_diacritics,
 )
 from nemo.collections.tts.modules.easy_magpietts_cfg_distillation.distillation_types import (
     StudentOutput,
@@ -50,6 +51,7 @@ from nemo.collections.tts.modules.easy_magpietts_cfg_distillation.validation_met
 __all__ = [
     "ASRRejectionParams",
     "apply_asr_rejection",
+    "strip_diacritics",
     "StudentOutput",
     "TeacherOutput",
     "LossKey",

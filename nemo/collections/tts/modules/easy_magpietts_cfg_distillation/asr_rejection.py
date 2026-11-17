@@ -15,6 +15,7 @@
 
 """ASR-based rejection of teacher rollouts for EasyMagpieTTS CFG distillation."""
 
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -44,6 +45,9 @@ class ASRRejectionParams:
         normalize_transcript: Whether to apply the text normalizer of the rollout language to the ASR
             transcript before computing CER, so that written forms such as digits match the spoken-form
             reference text.
+        strip_diacritics_languages: Languages whose transcript and reference lose their nonspacing marks
+            (and the Arabic tatweel) before computing CER, e.g. Arabic, whose references may be vocalized
+            while ASR transcripts are not.
         router_cfg: `RewardASRRouter` configuration (`language_routes` and `backends`).
     """
 
@@ -53,6 +57,7 @@ class ASRRejectionParams:
     datasets: Optional[frozenset[str]]
     rejection_weight: Optional[float]
     normalize_transcript: bool
+    strip_diacritics_languages: frozenset[str]
     router_cfg: dict[str, Any]
 
     @classmethod
@@ -118,6 +123,7 @@ class ASRRejectionParams:
             datasets=frozenset(datasets) if datasets is not None else None,
             rejection_weight=rejection_weight,
             normalize_transcript=bool(cfg.get("normalize_transcript", False)),
+            strip_diacritics_languages=frozenset(cfg.get("strip_diacritics_languages") or ()),
             router_cfg=router_cfg,
         )
 
@@ -130,6 +136,12 @@ class ASRRejectionParams:
         if dataset_name in self.max_cer_by_dataset:
             return self.max_cer_by_dataset[dataset_name]
         return self.max_cer_by_lang.get(language, self.max_cer)
+
+
+def strip_diacritics(text: str) -> str:
+    """Remove nonspacing marks and the Arabic tatweel from NFC-normalized text."""
+    text = unicodedata.normalize("NFC", text)
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Mn" and ch != "\u0640")
 
 
 def apply_asr_rejection(
