@@ -217,8 +217,10 @@ class TeacherInferenceEngine:
     def __init__(
         self,
         model: EasyMagpieTTSModel,
+        rollout_use_lt_codes: bool = False,
     ) -> None:
         self.model = model
+        self.rollout_use_lt_codes = rollout_use_lt_codes
 
     @property
     def phoneme_stacking_factor(self) -> int:
@@ -756,6 +758,9 @@ class TeacherInferenceEngine:
             codes_t_lt = codes_t_lt.reshape(bs, -1)
             # As in the pre-training stage, we do not use greedy sampling for LT.
             codes_t_argmax_lt = codes_t_lt
+            if self.rollout_use_lt_codes:
+                # The rollout continues from and detects EOS on the LT samples, as in LT inference.
+                codes_t, codes_t_argmax = codes_t_lt, codes_t_lt
 
         return AudioCodesStep(
             codes_t=codes_t,

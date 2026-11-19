@@ -117,6 +117,9 @@ class _DefaultParams:
     lt_distillation_start_step: int = 1000
     # Number of steps used to linearly ramp the local-transformer loss weight from 0 to `lt_loss_weight`.
     lt_distillation_ramp_len: int = 2000
+    # Whether teacher rollouts feed back and end on local-transformer codes, as local-transformer inference does,
+    # instead of backbone codes while local-transformer distillation is active.
+    rollout_use_lt_codes: bool = False
     # Weight coefficient for the phoneme-channel loss contribution in the final total loss.
     phoneme_ce_loss_weight: float = 0.01
     # Whether to save rejected teacher rollouts for debugging.
@@ -180,6 +183,11 @@ def _validate_configuration(cfg: DictConfig) -> None:
 
     if hasattr(cfg, "lt_distillation_ramp_len") and cfg.get("lt_distillation_ramp_len") < 0:
         raise ValueError("`lt_distillation_ramp_len` must be non-negative.")
+
+    if cfg.get("rollout_use_lt_codes", False) and not cfg.get(
+        "distill_local_transformer", _DEFAULT_PARAMS.distill_local_transformer
+    ):
+        raise ValueError("`rollout_use_lt_codes` requires `distill_local_transformer`.")
 
     if hasattr(cfg, "phoneme_ce_loss_weight") and cfg.get("phoneme_ce_loss_weight") < 0:
         raise ValueError("`phoneme_ce_loss_weight` must be non-negative.")
@@ -661,7 +669,10 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         if self._teacher_model is None:
             logging.info("Loading teacher model from checkpoint.")
             self._teacher_model = _get_teacher_model(self.cfg).to(self.device)
-            self._teacher_inference_engine = TeacherInferenceEngine(model=self._teacher_model)
+            self._teacher_inference_engine = TeacherInferenceEngine(
+                model=self._teacher_model,
+                rollout_use_lt_codes=self.rollout_use_lt_codes,
+            )
             logging.info("Teacher model loaded and frozen.")
 
     def _configure_rejection_debug_attributes(self) -> None:
