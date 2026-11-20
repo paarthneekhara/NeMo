@@ -120,6 +120,10 @@ class _DefaultParams:
     # Whether teacher rollouts feed back and end on local-transformer codes, as local-transformer inference does,
     # instead of backbone codes while local-transformer distillation is active.
     rollout_use_lt_codes: bool = False
+    # Whether the local-transformer distillation loss also trains the backbone, as the local-transformer loss does in
+    # pre-training. By default the local transformer reads detached decoder outputs, so only the backbone loss and the
+    # phoneme loss reach the backbone.
+    lt_loss_trains_backbone: bool = False
     # Weight coefficient for the phoneme-channel loss contribution in the final total loss.
     phoneme_ce_loss_weight: float = 0.01
     # Whether to save rejected teacher rollouts for debugging.
@@ -1080,7 +1084,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         if use_lt:
             logits_lt = self._lt_helper.compute_logits(
-                dec_out=pred_embeddings.detach(),
+                dec_out=pred_embeddings if self.lt_loss_trains_backbone else pred_embeddings.detach(),
                 audio_codes_target=batch_combined.audio_codes_gt_lt,
                 targets_offset_by_one=False,
             )
